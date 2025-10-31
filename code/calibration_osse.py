@@ -12,8 +12,8 @@ import numpy as np
 import scipy.stats as st
 from sklearn.neighbors import KernelDensity
 
-import huxt as H
-import huxt_analysis as HA
+import huxt.huxt as H
+import huxt.huxt_analysis as HA
 import sir_huxt_mono_obs as sir
 
 def calibration_osse(params):
@@ -88,7 +88,7 @@ def calibration_osse(params):
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn')
     
-    lons = [-90, -80, -70, -60, -50, -40, -30, -20]
+    lons = [-90]#, -80, -70, -60, -50, -40, -30, -20]
     scenarios = sir.load_cme_scenarios()
     
     ###############

@@ -11,9 +11,9 @@ import pandas as pd
 import sunpy.coordinates.sun as sn
 import scipy.stats as st
 # Local packages
-import huxt as H
-import huxt_inputs as Hin
-import huxt_analysis as Ha
+import huxt.huxt as H
+import huxt.huxt_inputs as Hin
+import huxt.huxt_analysis as Ha
 
 
 def plot_huxt_multi(ax, time, model):
@@ -34,7 +34,7 @@ def plot_huxt_multi(ax, time, model):
     v_sub = model.v_grid.value[id_t, :, :].copy()
     # Insert into full array
     if lon_arr.size != model.lon.size:
-        v = np.zeros((model.nr, nlon)) * np.NaN
+        v = np.zeros((model.nr, nlon)) * np.nan
         if model.lon.size != 1:
             for i, lo in enumerate(model.lon):
                 id_match = np.argwhere(lon_arr == lo)[0][0]
@@ -100,7 +100,7 @@ def plot_huxt_multi(ax, time, model):
     return
 
 
-def plot_huxt_with_observer(model, time, observer_list, fighandle=np.NaN, axhandle=np.NaN, add_flank=False, add_fov=False):
+def plot_huxt_with_observer(model, time, observer_list, fighandle=np.nan, axhandle=np.nan, add_flank=False, add_fov=False):
     """
     Plot the HUXt solution at a specified time, and (optionally) overlay the modelled flank location and field of view
     of a specified observer.
@@ -126,7 +126,7 @@ def plot_huxt_with_observer(model, time, observer_list, fighandle=np.NaN, axhand
     v_sub = model.v_grid.value[id_t, :, :].copy()
     # Insert into full array
     if lon_arr.size != model.lon.size:
-        v = np.zeros((model.nr, nlon)) * np.NaN
+        v = np.zeros((model.nr, nlon)) * np.nan
         if model.lon.size != 1:
             for i, lo in enumerate(model.lon):
                 id_match = np.argwhere(lon_arr == lo)[0][0]

@@ -13,9 +13,9 @@ import scipy.stats as st
 from sklearn.neighbors import KernelDensity
 
 
-import huxt as H
-import huxt_inputs as Hin
-import huxt_analysis as Ha
+import huxt.huxt as H
+import huxt.huxt_inputs as Hin
+import huxt.huxt_analysis as Ha
 import sir_huxt_plots as sirplt
 
 
@@ -71,7 +71,7 @@ class Observer:
         for i, coord in cme.coords.items():
 
             if len(coord['r']) == 0:
-                flank.loc[i, ['lon', 'r', 'el']] = np.NaN
+                flank.loc[i, ['lon', 'r', 'el']] = np.nan
                 continue
 
             r_obs = self.r[i]

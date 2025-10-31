@@ -16,3 +16,6 @@
 /.ipynb*
 
 /code/.ipynb*
+
+# Ignore data file
+data/**
