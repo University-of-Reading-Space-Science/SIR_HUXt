@@ -67,8 +67,8 @@ def calibration_osse(params):
         os.mkdir(output_dir)
     
     # Run the SIR scheme on this event many times to see how the performance is
-    n_ens = 50
-    n_runs = 100
+    n_ens = 5
+    n_runs = 1
     for i in range(n_runs):
     
         # Make a guess at the CME initial values 
@@ -77,7 +77,12 @@ def calibration_osse(params):
         # Low observational error
         observed_cme_flank = Obs.compute_synthetic_obs(el_spread=0.1, cadence=1, el_min=4.0, el_max=35.0)
     
-        observations = {'observer_lon':observer_lon*u.deg, 'observed_cme_flank':observed_cme_flank, 'truth_cme_params':cme_truth.parameter_array(), 't_transit':t_transit, 'v_hit':v_hit}
+        observations = {
+            'observer_lon':observer_lon*u.deg,
+            'observed_cme_flank':observed_cme_flank,
+            'truth_cme_params':cme_truth.parameter_array(),
+            't_transit':t_transit, 'v_hit':v_hit
+        }
 
         tag = "run_{:03d}".format(i)
         sir.SIR(model, model1d, cme_guess, observations, n_ens, output_dir, tag)

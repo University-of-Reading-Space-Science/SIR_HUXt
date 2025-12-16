@@ -1,6 +1,7 @@
 import errno
 import glob
 import os
+os.environ['IMAGEIO_FFMPEG_EXE'] = "C:\\FFmpeg\\bin\\ffmpeg.exe"
 
 from astropy.time import Time
 import astropy.units as u
@@ -37,11 +38,13 @@ class Observer:
         self.lat = ert_ephem.lat
         self.el_min = el_min
         self.el_max = el_max
+
         # Force longitude into 0-360 domain
         id_over = self.lon > 360*u.deg
         id_under = self.lon < 0*u.deg
         if np.any(id_over):
             self.lon[id_over] = self.lon[id_over] - 360*u.deg
+
         if np.any(id_under):
             self.lon[id_under] = self.lon[id_under] + 360*u.deg
         
@@ -50,7 +53,7 @@ class Observer:
         
     def compute_flank_profile(self, cme):
         """
-        Compute the time elongation profile of the flank of a ConeCME in HUXt. The observer longtidue is specified
+        Compute the time elongation profile of the flank of a ConeCME in HUXt. The observer longtiude is specified
         relative to Earth but otherwise matches Earth's coords.
 
         Parameters
@@ -86,9 +89,9 @@ class Observer:
             x_cme = r_cme * np.cos(lat_cme) * np.cos(lon_cme)
             y_cme = r_cme * np.cos(lat_cme) * np.sin(lon_cme)
             z_cme = r_cme * np.sin(lat_cme)
+
             #############
             # Compute the observer CME distance, S, and elongation
-
             x_cme_s = x_cme - x_obs
             y_cme_s = y_cme - y_obs
             z_cme_s = z_cme - z_obs
@@ -121,6 +124,7 @@ class Observer:
         # Force values to be floats.
         keys = ['lon', 'r', 'el']
         flank[keys] = flank[keys].astype(np.float64)
+
         return flank
     
     
@@ -141,7 +145,7 @@ class Observer:
 
         # Add observation noise.
         obs_flank = model_flank.loc[:, ['time', 'el']].copy()
-        obs_flank['el'] = obs_flank['el'] + el_spread*np.random.randn(obs_flank.shape[0])
+        obs_flank['el'] = obs_flank['el'] +  (el_spread * np.random.randn(obs_flank.shape[0]))
 
         # Only keep every dt_scale'th observation and reindex - dt_scale=5 corrsponds to ~2hr
         obs_flank = obs_flank[::cadence]
@@ -150,8 +154,10 @@ class Observer:
         # Only return up to el_max ~ (approx HI1 FOV is 25deg)
         id_fov = (obs_flank['el'] >= el_min) & (obs_flank['el'] <= el_max)
         obs_flank = obs_flank[id_fov]
+
         # Reindex to start from 0, or loops misbehave.
         obs_flank.set_index(np.arange(0, obs_flank.shape[0]), inplace=True)
+
         return obs_flank
     
 
@@ -450,7 +456,10 @@ def compute_resampling(parameter_array):
     lon_z, lon_avg, lon_std = zscore(lon)
 
     data = np.array([v_z, width_z, lon_z]).T
-
+    print(weights)
+    print("a")
+    print(weights.ravel())
+    sys.exit()
     kde = KernelDensity(kernel='gaussian', bandwidth=0.2).fit(data, sample_weight=weights.ravel())
 
     # Resample the particles, and convert back to parameter space from zscore
@@ -496,9 +505,60 @@ def compute_resampling(parameter_array):
         conecme = H.ConeCME(t_launch=t_launch, longitude=lon_new, latitude=lat_new, width=width_new, v=v_new, thickness=thickness)
         resampled_cmes.append(conecme)
 
-    return resampled_cmes    
-    
-    
+    return resampled_cmes
+
+
+def kernel_resample(particles, weights, num_samples=None):
+    """
+    Particle filter resampling with kernel smoothing using optimal covariance (vectorized).
+
+    Parameters:
+    -----------
+    particles : ndarray of shape (N, d)
+        Original particle set.
+    weights : ndarray of shape (N,)
+        Particle weights (will be normalized).
+    num_samples : int, optional
+        Number of resampled particles. Defaults to N.
+
+    Returns:
+    --------
+    new_particles : ndarray of shape (num_samples, d)
+        Resampled particles with kernel smoothing.
+    new_weights : ndarray of shape (num_samples,)
+        Uniform weights after resampling.
+    """
+    N, d = particles.shape
+    if num_samples is None:
+        num_samples = N
+
+    # Normalize weights
+    weights = weights / np.sum(weights)
+
+    # Compute sample covariance
+    cov_matrix = np.cov(particles, rowvar=False)
+
+    # Silverman's bandwidth rule
+    #h = (4 / (d + 2)) ** (1 / (d + 4)) * N ** (-1 / (d + 4))
+    #kernel_cov = h ** 2 * cov_matrix
+    kernel_cov = 2 * cov_matrix
+
+    # Multinomial resampling: choose indices based on weights
+    indices = np.random.choice(N, size=num_samples, p=weights)
+    chosen_particles = particles[indices]
+
+    # Vectorized Gaussian noise addition
+    # Cholesky decomposition for sampling
+    L = np.linalg.cholesky(kernel_cov)
+    noise = np.random.randn(num_samples, d) @ L.T
+    new_particles = chosen_particles + noise
+
+    # Reset weights to uniform
+    new_weights = np.full(num_samples, 1.0 / num_samples)
+
+    return new_particles, new_weights
+
+
 def SIR(model, model1d, cme, observations, n_ens, output_path, tag):
     """
     Function implementing the Sequential Importance Resampling of initial CME parameters in HUXt
@@ -535,7 +595,6 @@ def SIR(model, model1d, cme, observations, n_ens, output_path, tag):
     
     # Loop through the observations for each analysis step
     for i in range(n_analysis_steps):
-        
         # Set up group to store this analysis step
         analysis_key = "analysis_{:02d}".format(i)
         analysis_group = out_file.create_group(analysis_key)
@@ -602,7 +661,8 @@ def SIR(model, model1d, cme, observations, n_ens, output_path, tag):
         
         # Resample the particles based on the current weights.
         cme_ensemble = compute_resampling(parameter_array)
-        
+        #cme_ensemble, weights = kernel_resample(particles, parameter_array['weight'], num_samples=None)
+
         # Push data to the file
         out_file.flush()
         
@@ -681,7 +741,6 @@ def build_cme_scenarios():
             dset.attrs['unit'] = (u.km/u.s).to_string()
             dset = cme_group.create_dataset('width', data=width)
             dset.attrs['unit'] = u.deg.to_string()
-
 
     out_file.close()
     return
