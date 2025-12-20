@@ -6,6 +6,7 @@ import datetime
 
 import huxt.huxt as H
 import sir_huxt_mono_obs as shmo
+import astropy.units as u
 
 def setup_huxt(
         start_datetime=datetime.datetime(2008, 1, 1, 0, 0, 0),
@@ -28,7 +29,7 @@ def setup_huxt(
     :return model: HUXt model object with required ambient wind conditions at required
                     longitudes and latitude
     """
-    np.assert(type(start_datetime) == datetime.datetime)
+    assert(type(start_datetime) == datetime.datetime)
 
     start_time = Time(start_datetime, scale='utc')
     cr_num = np.fix(sn.carrington_rotation_number(start_time))
@@ -341,8 +342,53 @@ def likelihood_function(
 
     return likelihood
 
+
+def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon):
+    """
+    log_likelihood_function: The purpose of this definition is to calculate the logarithm of the likelihood
+    :param obs: Observation of the CME flank
+    :param obs_cov: Observation error covariance matrix of the CME flank
+    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param cme_par: CME parameters with following keys:
+      ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+    :param obs_lon: Observation longitude
+
+    :return: log_likelihood: The logarithm of the likelihood function
+    """
+
+    # Call the likelihood function and then taken its logarithm
+    likelihood = likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon)
+    log_likelihood = np.log(likelihood)
+
+    return log_likelihood
+
+
+def jacob_log(x_list):
+    """
+    Function to calculate the Jacobian logarithm, given by the sum:
+       Jacob_log = log( \sum_{j=1}^{N}[exp{x_list_j}] )
+    :param x_list: List of exponents to be used in Jacobian logarithm
+
+    :return: jacob_log: Value of Jacobian logarithm
+    """
+
+    # Initialise Jacobian logarithm as first exponent
+    jacob_log = x_list[0]
+
+    for i in range(1, len(x_list)):
+        # Calculate the components
+        term1 = np.max(jacob_log, x_list[i])
+
+        t2exp = -np.abs(x_list[i] - jacob_log)
+        term2 = np.log(1 + np.exp(t2exp))
+
+        jacob_log = term1 + term2
+
+    return jacob_log
+
+
 def auxPf(
-        pars, obs, obs_cov, obs_lon, obs_time, weights,
+        pars, obs, obs_cov, obs_lon, obs_time, log_weights,
         fixed_ambient=True, pars_in_state=['v', 'lon', 'width'],
         hux_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
@@ -352,12 +398,34 @@ def auxPf(
         dt_scale=20,
         delta=0.98, rng=None
 ):
+    """
+    Function to run the auxillary particle filter
+    :param pars:
+    :param obs:
+    :param obs_cov:
+    :param obs_lon:
+    :param obs_time:
+    :param log_weights: Unnormalised logarithm of the weights
+    :param fixed_ambient:
+    :param pars_in_state:
+    :param hux_init_time:
+    :param vr_in:
+    :param lon_start:
+    :param lon_stop:
+    :param time_tolerance:
+    :param dt_scale:
+    :param delta:
+    :param rng:
+    :return:
+    """
 
     pars = np.asarray(pars)   # Array containing all parameters as required
     obs = np.asarray(obs)
     sim_time = obs_time + time_tolerance
     nEns, nPar = pars.shape
 
+    # Initialise unnormalised probability list
+    log_unnorm_prob = []
     for j in range(nEns):
         if fixed_ambient:
             if j == 0:
@@ -381,8 +449,8 @@ def auxPf(
                 dt_scale=dt_scale
             )
 
-        # Calculate the likelihood for this ensemble member
-        likelihood_ens = likelihood_function(
+        # Calculate the log-likelihood for this ensemble member
+        log_likelihood_ens = log_likelihood_function(
             obs,
             obs_cov,
             model,
@@ -390,10 +458,46 @@ def auxPf(
             obs_lon
         )
 
+        # Calculate the unnormalised logarithm of the probability of choosing this ensemble member
+        log_unnorm_prob.append(log_weights + log_likelihood_ens)
 
+    # Calculate the normalisation factor
+    norm_factor = jacob_log(log_unnorm_prob)
 
+    # Normalise the logarithm of the probabilities
+    log_norm_prob = log_unnorm_prob - norm_factor
 
+    # Generate the logCDF with the Jacobian logarithm
+    logCDF = np.zeros(nEns)
+    for j in range(nEns):
+        if j==0:
+            logCDF[j] = log_norm_prob[j]
+        else:
+            term1 = np.max(logCDF[j-1], log_norm_prob[j])
+            t2exp = -np.abs(logCDF[j-1] - log_norm_prob[j])
+            term2 = np.log(1 + np.exp(t2exp))
 
+            logCDF[j] = term1 + term2
+
+    # Stochastic resampling step
+    resampPar = np.zeros_like(pars)
+    resampWeights = np.zeros_like(log_weights)
+    for j in range(nEns):
+        # Draw random value between 0 and 1 (can't be equal to 0 as we will take the logarithm)
+        rand_value = 0
+        while rand_value == 0:
+            rand_value = rng.uniform(0, 1)
+
+        # Find the index i, such that logCDF[i-1] < log(rand_value) \leq logCDF[i]
+        if rand_value <= logCDF[0]:
+            indReq = 0
+        elif rand_value > logCDF[-1]:
+            indReq = nEns - 1
+        else:
+            indReq = [ n for n,i in enumerate(logCDF) if i > rand_value ][0]
+
+        resampPar[j, :] = pars[indReq, :]
+        resampWeights[j] = -np.log(nEns)
 
     return None
 
