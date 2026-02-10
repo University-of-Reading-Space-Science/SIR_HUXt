@@ -5,8 +5,16 @@ import numpy as np
 import datetime
 
 import huxt.huxt as H
+import huxt.huxt_analysis as HA
+from scipy.special.cython_special import log_wright_bessel
+
 import sir_huxt_mono_obs as shmo
+import sunpy.coordinates.sun as sn
 import astropy.units as u
+from astropy.time import Time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import colorcet as cc
 
 def setup_huxt(
         start_datetime=datetime.datetime(2008, 1, 1, 0, 0, 0),
@@ -35,11 +43,11 @@ def setup_huxt(
     cr_num = np.fix(sn.carrington_rotation_number(start_time))
     ert = H.Observer('EARTH', start_time)
 
-    vr_in = np.asarray(vr_in)
-
+    #vr_in = np.asarray(vr_in)
+    #print(sim_time)
     # Set up HUXt for a sim_time-day simulation, outputting every dt_scale
-    model = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
-                   lon_start=lon_start, lon_stop=lon_stop, simtime=sim_time, dt_scale=dt_scale)
+    model = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c.to(u.deg), latitude=ert.lat.to(u.deg),
+                   lon_start=lon_start.to(u.rad), lon_stop=lon_stop.to(u.rad), simtime=sim_time, dt_scale=dt_scale)
 
     # model1d = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
     #                  lon_out=0 * u.deg, simtime=5 * u.day, dt_scale=4)
@@ -47,17 +55,35 @@ def setup_huxt(
     return model
 
 
-def initialise_cme_parameter_ensemble_arrays(n_ensemble):
+def initialise_cme_parameter_ensemble_arrays(
+        n_ensemble,
+        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0)
+):
     """
     Function to initialise empty arrays for storing the CME parameters for each ensemble member at each analysis step
     :param n_ensemble: The number of ensemble members in the SIR analysis
     :return parameter_arrays: A dictionary of parameter keys and an empty array for storing each ensemble member value
     """
-    keys = ['t_init', 'v', 'width', 'lon', 'lat', 'thick', 't_transit', 'v_hit', 'likelihood', 'weight']
-    parameter_arrays = {k:np.zeros(n_ensemble) for k in keys}
-    parameter_arrays['n_members'] = n_ensemble
+    keys = [
+        't_init', 'v', 'width', 'lon', 'lat', 'thick',
+        'huxt_init_time', 't_transit', 'v_hit',
+        'likelihood', 'weight'
+    ]
+    if n_ensemble > 1:
+        parameter_arrays = {k:np.zeros(n_ensemble) for k in keys}
+        parameter_arrays['n_members'] = n_ensemble
+        parameter_arrays['huxt_init_time'] = huxt_init_time
+
+        #Initialise the weights in log-space
+        parameter_arrays['weight'] = -np.log(n_ensemble) * np.ones(n_ensemble)
+        #print(list(parameter_arrays.keys()))
+    else:
+        parameter_arrays = {k: 0 for k in keys}
+        parameter_arrays['n_members'] = 1
+        parameter_arrays['huxt_init_time'] = huxt_init_time
 
     return parameter_arrays
+
 
 def zscore(x):
     """
@@ -88,7 +114,7 @@ def inv_zscore(x_z, x_avg, x_std):
 
     return x
 
-def cme_par_to_state_vector(cme_par_array, par_req):
+def cme_par_to_z_state_vector(cme_par_array, par_req):
     ## Function to convert the CME parameters into a state vector
     #  @param cme_par_array Array that contains all CME parameters required
     #  @param par_req List containing the names of all the required parameters from cme_par_array
@@ -127,7 +153,7 @@ def cme_par_to_state_vector(cme_par_array, par_req):
     return z_ens, x_mean, x_std
 
 
-def state_vector_to_cme_par(z_ens, x_mean, x_std, weights, par_req, cme_par_array):
+def z_state_vector_to_cme_par(z_ens, x_mean, x_std, weights, par_req, cme_par_array):
     ## Function to convert the state vector back into the required CME parameters
     #  @param z_ens (nEns, nPar)-array containing the state ensemble converted to z-scores
     #  @param x_mean (nPar)-array containing the mean of the ensemble parameters
@@ -149,6 +175,191 @@ def state_vector_to_cme_par(z_ens, x_mean, x_std, weights, par_req, cme_par_arra
         if ip == 'lon':
             lonCond = par_temp < 0
             par_temp[lonCond] = par_temp[lonCond] + 360
+
+        cme_par_array[ip] = par_temp
+
+    return cme_par_array
+
+
+def add_units_from_cme_par(
+        cme_par_array,
+        par_names=['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+):
+    """
+    Routine to remove units from the CME parameters
+    :param cme_par_array: Dictionary containing CME parameters with following keys:
+        ['t_init', 'v', 'width', 'lon', 'lat', 'thick', 'weight']
+    :return: CME parameters in appropriate units but with astropy units removed
+    """
+    nPar = len(par_names)
+    nEns = len(cme_par_array['weight'])
+
+    cme_pars = np.zeros((nEns, nPar))
+
+    # Standardise the units and remove the astropy units
+    cme_pars[:, 0] = [
+        cme_par_array['huxt_init_time'] + datetime.timedelta(seconds=cme_par_array['t_init'][i])
+        for i in range(nEns)
+    ]
+    #print(cme_par_array['width'])
+    cme_par_array['v'] = cme_par_array['v'] * u.km / u.s
+    cme_par_array['width'] = cme_par_array['width'] * u.deg
+
+    cme_par_array['lon'] = cme_par_array['lon'] * u.deg
+    lonCond = cme_par_array['lon'] < 0
+    cme_par_array['lon'][lonCond, 3] = cme_par_array['lon'][lonCond, 3] + 360
+
+    cme_par_array['lat'] = cme_par_array['lat'].to(u.deg).value
+    cme_par_array['thick'] = cme_par_array['thick'].to(u.solRad).value
+
+    return cme_par_array
+
+
+def remove_units_from_cme_par(
+        cme_par_array,
+        par_names=['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+):
+    """
+    Routine to remove units from the CME parameters
+    :param cme_par_array: Dictionary containing CME parameters with following keys:
+        ['t_init', 'v', 'width', 'lon', 'lat', 'thick', 'weight']
+    :return: CME parameters in appropriate units but with astropy units removed
+    """
+    nPar = len(par_names)
+    nEns = len(cme_par_array['weight'])
+
+    cme_pars = np.zeros((nEns, nPar))
+
+    # Standardise the units and remove the astropy units
+    cme_pars[:, 0] = [
+        (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
+        for i in range(nEns)
+    ]
+    #print(cme_par_array['width'])
+    cme_pars[:, 1] = cme_par_array['v'].to(u.km / u.s).value
+    cme_pars[:, 2] = cme_par_array['width'].to(u.deg).value
+
+    cme_pars[:, 3] = cme_par_array['lon'].to(u.deg).value
+    lonCond = cme_pars[:, 3] > 180
+    cme_pars[lonCond, 3] = cme_pars[lonCond, 3] - 360
+
+    cme_pars[:, 4] = cme_par_array['lat'].to(u.deg).value
+    cme_pars[:, 5] = cme_par_array['thick'].to(u.solRad).value
+
+    return cme_pars
+
+
+def cme_par_to_state_vector(cme_pars, par_req):
+    ## Function to convert the CME parameters into a state vector
+    #  @param cme_pars Array that contains all CME parameters required
+    #  @param par_req List containing the names of all the required parameters from cme_par_array
+
+    # Extract the ensemble of required parameters
+    nPar = len(par_req)
+
+    """# Extract weights of particles
+    #weights = cme_par_array['weight']
+
+    # If there are non-finite weights, set weight to zero (i.e. discard particle)
+    weightCond = ~np.isfinite(weights)
+    if np.sum(weightCond) > 0:
+        weights[weightCond] = 0
+"""
+    #Extract number of ensemble members from length of weights array and initialise variables
+    nEns = len(cme_pars[:, 0])
+
+    state_ens = np.zeros((nEns, nPar))
+
+    # Extract all required parameters, put them in an ensemble matrix
+    for i, ip in enumerate(par_req):
+        #par_temp = cme_par_array[ip]
+        """if ip == 'v':
+            par_temp = par_temp#.to(u.km/u.s).value
+        elif ip == 'lon':
+            lonCond = par_temp > 180 # * u.deg
+            par_temp[lonCond] = par_temp[lonCond] - 360 #.to(u.deg).value - 360
+        elif ip == 'lat':
+            par_temp = par_temp#.to(u.deg).value
+        elif ip == 'width':
+            par_temp = par_temp#.to(u.deg).value
+        elif ip == 'thick':
+            par_temp = par_temp#.to(u.solRad).value
+        elif ip == 't_init':
+            par_temp = (
+                cme_par_array['t_init'] - cme_par_array['huxt_init_time']
+            ).total_seconds() # * u.s"""
+        if ip == 't_init':
+            indReq = 0
+        elif ip == 'v':
+            indReq = 1
+        elif ip == 'width':
+            indReq = 2
+        elif ip == 'lon':
+            indReq = 3
+        elif ip == 'lat':
+            indReq = 4
+        elif ip == 'thick':
+            indReq = 5
+        else:
+            #print("Invalid parameter requested. Exiting.")
+            sys.exit()
+
+        state_ens[:, i] = cme_pars[:, indReq]
+
+    return state_ens
+
+
+def get_particle_weights(cme_par_array):
+    ## Function to convert the CME parameters into a state vector
+    #  @param cme_pars Dictionary that contains all CME parameters required, including weights
+
+    # Extract weights of particles
+    weights = cme_par_array['weight']
+
+    # If there are non-finite weights, set weight to zero (i.e. discard particle)
+    weightCond = ~np.isfinite(weights)
+    if np.sum(weightCond) > 0:
+        weights[weightCond] = 0
+
+    return weights
+
+
+def state_vector_to_cme_par(state_ens, weights, par_req, cme_par_array):
+    ## Function to convert the state vector back into the required CME parameters
+    #  @param z_ens (nEns, nPar)-array containing the state ensemble converted to z-scores
+    #  @param x_mean (nPar)-array containing the mean of the ensemble parameters
+    #  @param x_std (nPar)-array containing the standard deviation of the ensemble parameters
+    #  @param par_req List containing the names of all the required parameters from cme_par_array
+    #  @param cme_par_array Array that contains all CME parameters required
+    #  @return cme_par_array Updated parameter dictionary
+
+    # Extract the ensemble of required parameters
+    nEns, nPar = np.shape(state_ens)
+
+    # Put weights of particles into cme_par_array
+    cme_par_array['weight'] = weights
+
+    # Extract all required parameters, put them in an ensemble matrix, then calculate the zscores for output
+    for i, ip in enumerate(par_req):
+        par_temp = state_ens[:, i]
+
+        if ip == 't_init':
+            par_temp = (
+                    cme_par_array['huxt_init_time']
+                    + datetime.timedelta(seconds=par_temp)
+            )
+        elif ip == 'v':
+            par_temp = par_temp * u.km/u.s
+        elif ip == 'width':
+            par_temp = par_temp * u.deg
+        elif ip == 'lon':
+            lonCond = par_temp < 0
+            par_temp[lonCond] = par_temp[lonCond] + 360
+            par_temp[lonCond] = par_temp[lonCond] * u.deg
+        elif ip == 'lat':
+            par_temp = par_temp * u.deg
+        elif ip == 'thick':
+            par_temp = par_temp * u.solRad
 
         cme_par_array[ip] = par_temp
 
@@ -186,7 +397,7 @@ def systematic_resampling(weights, rng=None):
     return resampInd
 
 
-def shrink_par(pars, weights, delta=0.98):
+def shrink_par(pars, log_weights=None, delta=0.98):
     ## Liu-West shrinkage of the parameters towards the weighted mean
     #  @param pars (nEns, nPar) array containing parameters for each particle
     #  @param weights (nEns) array containing the weights of the particles
@@ -196,28 +407,38 @@ def shrink_par(pars, weights, delta=0.98):
     #   Smaller delta (e.g., 0.95–0.97) adds more diversity when particle degeneracy is a risk.
     #  @return shrunk_pars (nEns, nPar) array containing parameters shrunk to mean
 
-    pars = np.asarray(pars)
-    weights = np.asarray(weights)
+    #pars = pars
     nEns, nPar = pars.shape
-    print(np.shape(pars))
+    #print((pars))
 
-    # Normalise weights
-    weights = weights / weights.sum()
+    if log_weights is None:
+        # If no weights are provided, calculate an arithmetic mean
+        meanPar = np.mean(pars, axis=0)
+    else:
+        # If weights are provided, calculate weighted mean
 
-    # Compute weighted mean parameter
-    meanPar = np.average(pars, axis=0, weights=weights)
+        # Transform from log-space and normalise weights
+        weights = np.asarray(np.exp(log_weights))
+        weights = weights / weights.sum()
+
+        # Compute weighted mean parameter
+        meanPar = np.average(pars, axis=0, weights=weights)
 
     # Calculate shrinkage factor required
     a = ((3 * delta) - 1) / (2 * delta)
 
+    print(f"meanPar = {meanPar}")
+    #print(f"a = {a}")
+    #print(f"1-a = {1 - a}")
+
     # Shrink towards the mean
-    shrunk_pars = (a * pars) - ((1 - a) * meanPar)
+    shrunk_pars = (a * pars) + ((1 - a) * meanPar)
 
     return shrunk_pars
 
 
 def obs_op(
-        huxtObject, cme_par, obs_lon
+        huxtObject, cme_par, obs_lon, obs_time_in_jd
 ):
     """
     obs_op: The purpose of this definition is to perform the observation operator
@@ -227,21 +448,22 @@ def obs_op(
     :param cme_par: Dictionary containing CME parameters with following keys:
     #  ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param huxt_start_time: Initial time of huxt object
-    :param obs_time: Observation time that CME needs to be run to
+    :param obs_timein_jd: Observation time that CME needs to be run to
 
     :return: hx: CME flank estimated by model
     """
 
     # Extract CME parameters from list
-    cme_launch_time = cme_par['t_init']
-    cme_speed = cme_par['v']
-    cme_lat = cme_par['lat']
-    cme_lon = cme_par['lon']
-    cme_width = cme_par['width']
-    cme_thickness = cme_par['thick']
+    cme_launch_time = cme_par[0] * u.s
+    cme_speed = cme_par[1] * u.km/u.s
+    cme_width = cme_par[2] * u.deg
+    cme_lon = cme_par[3] * u.deg
+    cme_lat = cme_par[4] * u.deg
+    cme_thickness = cme_par[5] * u.solRad
+    #print(cme_lat)
 
     # Generate CME object
-    cme = huxtObject.ConeCME(
+    cme = H.ConeCME(
         t_launch=cme_launch_time,
         longitude=cme_lon,
         latitude=cme_lat,
@@ -249,55 +471,27 @@ def obs_op(
         v=cme_speed,
         thickness=cme_thickness
     )
-
+    #print(cme.coords.items())
     # Run CME through HUXt
-    model.solve([cme])
+    huxtObject.solve([cme])
+    cme_member = huxtObject.cmes[0]
+    # Plot this out
+    t_interest = obs_time_in_jd
+    #fig, ax = HA.plot(huxtObject, t_interest)
+    #plt.show()
 
     # Calculate CME flank
-    obsObject = shmo.Observer(huxtObject, cme, obs_lon)
+    obsObject = shmo.Observer(huxtObject, cme_member, obs_lon)
+    cme_flank = obsObject.compute_flank_profile(cme_member)
 
-    hx = obsObject.compute_synthetic_obs(cme)
+    # Get the CME elongation at the required observation time
+    indReq = np.argmin(abs(cme_flank['time'].values - obs_time_in_jd))
+    hx = cme_flank['el'].values[indReq]
 
     return hx
 
 
-def log_likelihood_function_gaussian(
-        obs, obs_cov, huxtObject, cme_par, obs_lon
-):
-    """
-    log_likelihood_function_gaussian: The purpose of this definition is to calculate the
-      logarithm of the likelihood function
-    :param obs: Observation of the CME flank
-    :param obs_cov: Observation error covariance matrix of the CME flank
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
-    :param cme_par: cme parameters with following keys:
-       ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
-    :param obs_lon: Observation longitude
-
-    :return: loglik: The logarithm of the likelihood function
-    """
-
-    # Calculate the observation operator (what the model thinks the observation should be)
-    hx = obs_op(huxtObject, cme_par, obs_lon)
-
-    # Calculate the innovation (difference between the observations and the observation operator)
-    innov = obs - hx
-
-    # Calculate the inverse of the observation error covariance and calculate the logarithm
-    #  of the likelihood function
-    if np.shape(obs_cov)[0] > 1:
-        obs_cov_1 = np.linalg.pinv(obs_cov)
-
-        loglik = np.transpose(innov).dot( obs_cov_1.dot(innov) )
-    else:
-        obs_cov_1 = 1.0 / obs_cov
-
-        loglik = obs_cov_1 * innov * innov
-
-    return loglik
-
-
-def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon):
+def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd):
     """
     likelihood_function_gaussian: The purpose of this definition is to calculate the
       likelihood function
@@ -313,7 +507,7 @@ def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon):
 
     # Calculate the log likelihood function
     loglik = log_likelihood_function_gaussian(
-        obs, obs_cov, huxtObject, cme_par, obs_lon
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
     )
 
     # Calculate the likelihood function by taking the exponent
@@ -323,7 +517,7 @@ def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon):
 
 
 def likelihood_function(
-        obs, obs_cov, huxtObject, cme_par, obs_lon
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
 ):
     """
     likelihood_function: The purpose of this definition is to calculate the likelihood function with no assumptions
@@ -338,12 +532,57 @@ def likelihood_function(
     """
 
     # Call the required likelihood function to get the likelihood
-    likelihood = likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon)
+    likelihood = likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd)
 
     return likelihood
 
 
-def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon):
+def log_likelihood_function_gaussian(
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+):
+    """
+    log_likelihood_function_gaussian: The purpose of this definition is to calculate the
+      logarithm of the likelihood function
+    :param obs: Observation of the CME flank
+    :param obs_cov: Observation error covariance matrix of the CME flank
+    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param cme_par: cme parameters with following keys:
+       ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+    :param obs_lon: Observation longitude
+
+    :return: loglik: The logarithm of the likelihood function
+    """
+
+    # Calculate the observation operator (what the model thinks the observation should be)
+    hx = obs_op(huxtObject, cme_par, obs_lon, obs_time_in_jd)
+    """print(f"obs={obs}")
+    print("hx: ", hx)"""
+
+    # Calculate the innovation (difference between the observations and the observation operator)
+    innov = obs - hx
+    #print(innov)
+    # Calculate the inverse of the observation error covariance and calculate the logarithm
+    #  of the likelihood function
+    #print(np.ndim(obs_cov))
+    if np.ndim(obs_cov) == 0:
+        obs_cov_1 = 1.0 / obs_cov
+
+        loglik = -obs_cov_1 * innov * innov
+
+        #print("loglik: ", loglik)
+        return loglik
+    else:
+        obs_cov_1 = np.linalg.pinv(obs_cov)
+
+        loglik = -np.transpose(innov).dot(
+            obs_cov_1.dot(innov)
+        )
+
+        #print("loglik: ", loglik)
+        return loglik
+
+
+def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd):
     """
     log_likelihood_function: The purpose of this definition is to calculate the logarithm of the likelihood
     :param obs: Observation of the CME flank
@@ -357,8 +596,10 @@ def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon):
     """
 
     # Call the likelihood function and then taken its logarithm
-    likelihood = likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon)
-    log_likelihood = np.log(likelihood)
+    log_likelihood = log_likelihood_function_gaussian(
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+    )
+    #log_likelihood = np.log(likelihood)
 
     return log_likelihood
 
@@ -366,7 +607,7 @@ def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon):
 def jacob_log(x_list):
     """
     Function to calculate the Jacobian logarithm, given by the sum:
-       Jacob_log = log( \sum_{j=1}^{N}[exp{x_list_j}] )
+       Jacob_log = log( sum_{j=1}^{N}[exp{x_list_j}] )
     :param x_list: List of exponents to be used in Jacobian logarithm
 
     :return: jacob_log: Value of Jacobian logarithm
@@ -377,7 +618,7 @@ def jacob_log(x_list):
 
     for i in range(1, len(x_list)):
         # Calculate the components
-        term1 = np.max(jacob_log, x_list[i])
+        term1 = np.max([jacob_log, x_list[i]])
 
         t2exp = -np.abs(x_list[i] - jacob_log)
         term2 = np.log(1 + np.exp(t2exp))
@@ -387,10 +628,115 @@ def jacob_log(x_list):
     return jacob_log
 
 
+def make_synthetic_obs(
+        true_cme_par_array, obs_lon, obs_cov, obs_times_in_datetime,
+        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        vr_in=np.zeros(128) + 400 * u.km / u.s,
+        lon_start=290*u.deg,
+        lon_stop=380*u.deg,
+        sim_time=5*u.day,
+        dt_scale=20
+):
+    """
+    Function to create synthetic observations
+    :param true_cme_par_array:
+    :param obs_lon:
+    :param obs_cov:
+    :param obs_times_in_datetime:
+    :param huxt_init_time:
+    :param vr_in:
+    :param lon_start:
+    :param lon_stop:
+    :param time_tolerance:
+    :param dt_scale:
+    :return:
+    """
+
+    initAstroTime = Time(huxt_init_time, format='datetime', scale='utc')
+    obs_time_in_jd = [
+        Time(obs_t_i, format='datetime', scale='utc').jd
+        for obs_t_i in obs_times_in_datetime
+    ]
+    #sim_time = (obs_astroTime - initAstroTime).to(u.day) + time_tolerance
+    #obs_time_in_jd = obs_astroTime.jd  # - initAstroTime.jd
+
+    # Initialise HUXt model object for each ensemble member
+    model = setup_huxt(
+        start_datetime=huxt_init_time,
+        vr_in=vr_in,
+        lon_start=lon_start,
+        lon_stop=lon_stop,
+        sim_time=sim_time,
+        dt_scale=dt_scale
+    )
+
+    # Extract CME parameters from list
+    cme_launch_time = (true_cme_par_array['t_init'] - true_cme_par_array['huxt_init_time']).total_seconds() * u.s
+    cme_speed = true_cme_par_array['v'].to(u.km / u.s)
+    cme_width = true_cme_par_array['width'].to(u.deg)
+
+    cme_lon = true_cme_par_array['lon'].to(u.deg)
+    if cme_lon > (180 * u.deg):
+        cme_lon = cme_lon - (360 * u.deg)
+
+    cme_lat = true_cme_par_array['lat'].to(u.deg)
+    cme_thickness = true_cme_par_array['thick'].to(u.solRad)
+
+    # Generate CME object
+    cme = H.ConeCME(
+        t_launch=cme_launch_time,
+        longitude=cme_lon,
+        latitude=cme_lat,
+        width=cme_width,
+        v=cme_speed,
+        thickness=cme_thickness
+    )
+    #print(cme.coords.items())
+
+    # Run CME through HUXt
+    model.solve([cme])
+    cme_member = model.cmes[0]
+
+    # Calculate CME flank
+    obsObject = shmo.Observer(model, cme_member, obs_lon)
+    cme_flank = obsObject.compute_flank_profile(cme_member)
+
+    synth_obs = []
+    for it, obs_t in enumerate(obs_time_in_jd):
+        # Get the CME elongation at the required observation time
+        indReq = np.argmin(abs(cme_flank['time'].values - obs_t))
+        obs_pert = 0#np.random.normal(loc=0, scale=obs_cov)
+        synth_obs.append(cme_flank['el'].values[indReq] + obs_pert)
+
+        # Plot this out
+        #print(obs_times_in_datetime[it])
+        t_interest = (obs_times_in_datetime[it] - huxt_init_time).total_seconds() * u.s
+        #print(t_interest.value)
+        fig, ax = HA.plot(model, t_interest)
+        ax.set_title(f"Synth obs CME at {obs_times_in_datetime[it]}")
+        plt.show()
+    return synth_obs
+
+
+def calc_eff_sample_size(log_weights):
+    """
+    Definition to calculate the effective sample size using
+    log(N_eff) = 2*Jacob_log(log_weights) - Jacob_log(2*log_weights)
+    :param weights: Weights of particles
+    :return: n_eff_ens
+    """
+
+    log_n_eff = 2 * jacob_log(log_weights) - jacob_log(2 * log_weights)
+    #print(f"log(N_eff) = ", log_n_eff)
+    n_eff_ens = np.exp(log_n_eff)
+
+    return n_eff_ens
+
+
 def auxPf(
-        pars, obs, obs_cov, obs_lon, obs_time, log_weights,
+        cme_par_array, obs, obs_cov, obs_lon, obs_time,
         fixed_ambient=True, pars_in_state=['v', 'lon', 'width'],
-        hux_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
         lon_start=290*u.deg,
         lon_stop=380*u.deg,
@@ -419,12 +765,50 @@ def auxPf(
     :return:
     """
 
-    pars = np.asarray(pars)   # Array containing all parameters as required
+    if rng is None:
+        rng = np.random.default_rng()
+
+    #pars, x_mean, x_std = cme_par_to_state_vector(cme_par_array, pars_in_state)
+    #print(cme_par_array['lon'])
+    parsNoUnits = remove_units_from_cme_par(cme_par_array)
+    log_weights = get_particle_weights(cme_par_array)
+    pars = cme_par_to_state_vector(parsNoUnits, pars_in_state)
+    #print(pars)
+    #pars = np.asarray(pars)   # Array containing all parameters as required
+
     obs = np.asarray(obs)
-    sim_time = obs_time + time_tolerance
+    initAstroTime = Time(huxt_init_time, format='datetime', scale='utc')
+    obs_astroTime = Time(obs_time, format='datetime', scale='utc')
+    sim_time = (obs_astroTime - initAstroTime).to(u.day)  + time_tolerance
+    obs_time_in_jd = obs_astroTime.jd# - initAstroTime.jd
+
     nEns, nPar = pars.shape
 
+    # Shrink the parameters to the mean
+    shrunk_pars = shrink_par(
+        pars=pars,
+        log_weights=log_weights,
+        delta=delta
+    )
+    #print(f"shrunk_pars={shrunk_pars}")
+    # Calculate the covariance of the ensemble of parameters
+    cov_pars = np.cov(pars, rowvar=False)
+
+    if cov_pars.ndim == 0:
+        cov_pars = np.array([[cov_pars]])
+    print(cov_pars)
+    #print(f"3*delta - 1= {3 * delta - 1}")
+    #print(f"2 * delta = {2 * delta}")
+
+    # Calculate covariance scaling factor h, from the delta quantity input into function
+    h2 = 1 - ( ((3 * delta) - 1) / (2 * delta) ) ** 2
+    #print(h2)
+    stoch_weight_cov = h2 * cov_pars
+    #print(f"stoch_weight_cov: {stoch_weight_cov}")
+    #print(np.shape(cov_pars))
+
     # Initialise unnormalised probability list
+    log_likelihood_list = []
     log_unnorm_prob = []
     for j in range(nEns):
         if fixed_ambient:
@@ -448,24 +832,53 @@ def auxPf(
                 sim_time=sim_time,
                 dt_scale=dt_scale
             )
-
         # Calculate the log-likelihood for this ensemble member
+        cmeReqPar = ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+        par_arr_j = []
+
+        for ip, parVal in enumerate(cmeReqPar):
+            if parVal in pars_in_state:
+                # Get index of parVal in pars_in_state
+                indReq = pars_in_state.index(parVal)
+                par_arr_j.append(shrunk_pars[j, indReq])
+            else:
+                par_arr_j.append(parsNoUnits[j, ip])
+
+            # if parVal == 't_init':
+            #     if type(par_arr_j[ip]) is datetime.datetime:
+            #         par_arr_j[ip] = (
+            #             par_arr_j[ip] - cme_par_array['huxt_init_time']
+            #         ).total_seconds()
+
         log_likelihood_ens = log_likelihood_function(
             obs,
             obs_cov,
             model,
-            pars,
-            obs_lon
+            par_arr_j,
+            obs_lon,
+            obs_time_in_jd
         )
 
-        # Calculate the unnormalised logarithm of the probability of choosing this ensemble member
-        log_unnorm_prob.append(log_weights + log_likelihood_ens)
+        # Store log-likelihood ensemble in list
+        log_likelihood_list.append(log_likelihood_ens)
 
-    # Calculate the normalisation factor
-    norm_factor = jacob_log(log_unnorm_prob)
+        #print("log_weights_j: ", log_weights[j])
+        #print("log_likelihood_ens: ", log_likelihood_ens)
+
+        # Calculate the unnormalised logarithm of the probability of choosing this ensemble member
+        log_unnorm_prob.append(log_weights[j] + log_likelihood_ens)
+
+    # Calculate the normalisation factors for log_unnorm_probability and log_likelihood
+    norm_factor_lik = jacob_log(log_likelihood_list)
+    norm_factor_prob = jacob_log(log_unnorm_prob)
 
     # Normalise the logarithm of the probabilities
-    log_norm_prob = log_unnorm_prob - norm_factor
+    log_likelihood_normed = log_likelihood_list - norm_factor_lik
+    log_norm_prob = log_unnorm_prob - norm_factor_prob
+
+    cme_poste_par = np.zeros((n_ens, len(cmeReqPar)))
+    #print("Log unnormalized probability", log_unnorm_prob)
+    #print("Log norm probability: ", log_norm_prob)
 
     # Generate the logCDF with the Jacobian logarithm
     logCDF = np.zeros(nEns)
@@ -473,12 +886,13 @@ def auxPf(
         if j==0:
             logCDF[j] = log_norm_prob[j]
         else:
-            term1 = np.max(logCDF[j-1], log_norm_prob[j])
+            term1 = np.max([logCDF[j-1], log_norm_prob[j]])
             t2exp = -np.abs(logCDF[j-1] - log_norm_prob[j])
             term2 = np.log(1 + np.exp(t2exp))
 
             logCDF[j] = term1 + term2
 
+    #print(f'logCDF: {logCDF}')
     # Stochastic resampling step
     resampPar = np.zeros_like(pars)
     resampWeights = np.zeros_like(log_weights)
@@ -488,174 +902,59 @@ def auxPf(
         while rand_value == 0:
             rand_value = rng.uniform(0, 1)
 
+        log_rand_value = np.log(rand_value)
+
+        #print(f'log_rand_value: {log_rand_value}')
         # Find the index i, such that logCDF[i-1] < log(rand_value) \leq logCDF[i]
-        if rand_value <= logCDF[0]:
+        if log_rand_value <= logCDF[0]:
             indReq = 0
-        elif rand_value > logCDF[-1]:
+        elif log_rand_value > logCDF[-1]:
             indReq = nEns - 1
         else:
-            indReq = [ n for n,i in enumerate(logCDF) if i > rand_value ][0]
+            indReq = [ n for n, i in enumerate(logCDF) if i > log_rand_value ][0]
 
-        resampPar[j, :] = pars[indReq, :]
-        resampWeights[j] = -np.log(nEns)
+        #print(f'indReq: {indReq}')
+        #print(f"shrunk_pars[indReq, :]: {shrunk_pars[indReq, :]}")
+#        sys.exit()
+        resampPar[j, :] = (
+            np.random.multivariate_normal(
+                mean=shrunk_pars[indReq, :], cov=stoch_weight_cov
+            )
+        )
 
-    return None
+        # Calculate the log-likelihood for this ensemble member
+        cmeReqPar = ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
+        par_arr_j = []
 
-def liu_west_resample_pars(pars, weights, delta=0.98, rng=None):
-    ## Liu-West resampling for parameters
-    #  @param pars (nEns, nPar) array containing parameters to update
-    #  @param weights (n_Ens) array contain each particle's weight
-    #  @param delta Discount factor in (0, 1] that determines the shrinkage factor, a=((3 * delta) - 1)/(2 * delta)
-    #   typically between 0.95-0.99.
-    #   Larger delta (e.g., 0.99) gives less jitter and more shrinkage, suitable when posterior is well-identified.
-    #   Smaller delta (e.g., 0.95–0.97) adds more diversity when particle degeneracy is a risk.
-    #  @param rng Seed for random generator
-    #  @return new_pars Resampled particles
+        for ip, parVal in enumerate(cmeReqPar):
+            if parVal in pars_in_state:
+                # Get index of parVal in pars_in_state
+                indReq = pars_in_state.index(parVal)
+                par_arr_j.append(resampPar[j, indReq])
+            else:
+                par_arr_j.append(parsNoUnits[j, ip])
 
-    pars = np.asarray(pars)
-    weights = np.asarray(weights)
-    nEns, nPar = pars.shape
+        cme_poste_par[j, :] = par_arr_j
+        # Get the likelihood of the resampled parameters
+        resamp_log_likelihood = log_likelihood_function(
+            obs,
+            obs_cov,
+            model,
+            par_arr_j,
+            obs_lon,
+            obs_time_in_jd
+        )
+        resampWeights[j] = resamp_log_likelihood - log_likelihood_normed[j]
 
-    #Normalise weights
-    weights = weights / weights.sum()
+    resampWeightNorm = jacob_log(resampWeights)
+    resampWeights = resampWeights - resampWeightNorm
 
-    # Compute weighted mean parameter
-    meanPar = np.average(pars, axis=0, weights=weights)
+    print(f"n_eff_sample_size: {calc_eff_sample_size(resampWeights)}")
+    #print(f"resampWeights: {resampWeights}")
 
-    # Estimate particle covariance from the particles and the weights
-    pertPar = pars - meanPar
-    particleCov = (pertPar.T * weights) @ pertPar
+    cme_par_array = state_vector_to_cme_par(resampPar, resampWeights, pars_in_state, cme_par_array)
 
-    # Calculate shrinkage factors and variance adjustment required
-    a = ((3 * delta) - 1) / (2 * delta)
-    h2 = 1.0 - (a ** 2)
-
-    if rng is None:
-        rng = np.random.default_rng()
-
-    # Resample from particle distribution
-    resampInd = systematic_resampling(weights, rng)
-    pars_resampled = pars[resampInd, :]
-
-    # Shrink particles to the mean parameter
-    shrunkParticles = a * pars_resampled + (1 - a) * meanPar
-
-    # Perform Cholesky decomposition to get square-root of particle covariance matrix
-    #  then draw random samples from a standard normal and transform to normal distributed sample
-    #  with mean 0 and covariance particleCov (Transformation is Y=0+sqrt(particleCov)X
-    mp = 1e-12
-    # Add mp*I onto particleCov to ensure machine precision doesn't affect positive-definiteness
-    L = np.linalg.cholesky(particleCov + (mp * np.eye(nPar)))
-    noises = rng.normal(size=(nEns, nPar)) @ L.T
-
-    # Calculate the jitter term to perturb the particles away from one another
-    jitter = np.sqrt(h2) * noises
-
-    # Combine the shrunkParticles with the jitter to get the newly resampled particles with target mean and variance
-    new_pars = shrunkParticles + jitter
-
-    return new_pars
-
-# --- General APF for N-Dimensional State ---
-def apf_nd_state(y, f, h, nParticles=1000, state_dim=3, param_dim=2,
-                 delta=0.98, priors=None, q=0.05, r=0.2,
-                 x0_mean=None, x0_std=None, rng=None):
-    """
-    Auxiliary Particle Filter for N-Dimensional State and Parameter Estimation.
-
-    Parameters
-    ----------
-    y : array (T,)
-        Observations.
-    f : callable
-        State transition function: f(x, theta) -> next state (shape: state_dim).
-    h : callable
-        Observation function: h(x) -> predicted observation.
-    nParticles : int
-        Number of particles.
-    state_dim : int
-        Dimension of state vector.
-    param_dim : int
-        Dimension of parameter vector.
-    delta : float
-        Liu–West discount factor.
-    priors : dict or None
-        Parameter priors: {'mean': array(param_dim), 'std': array(param_dim)}.
-    q : float
-        Process noise variance (applied to each state dimension).
-    r : float
-        Observation noise variance.
-    x0_mean, x0_std : array-like
-        Initial state mean and std (length = state_dim).
-    rng : np.random.Generator
-        Random number generator.
-
-    Returns
-    -------
-    x_mean : (T, state_dim)
-        Filtered state means.
-    theta_mean : (T, param_dim)
-        Filtered parameter means.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    T = len(y)
-    if x0_mean is None:
-        x0_mean = np.zeros(state_dim)
-    if x0_std is None:
-        x0_std = np.ones(state_dim)
-
-    # Initialize state particles
-    x = rng.normal(loc=x0_mean, scale=x0_std, size=(nParticles, state_dim))
-
-    # Initialize parameter particles
-    if priors is None:
-        theta = rng.normal(loc=np.ones(param_dim), scale=0.5, size=(nParticles, param_dim))
-    else:
-        theta = rng.normal(loc=priors['mean'], scale=priors['std'], size=(nParticles, param_dim))
-
-    weights = np.full(nParticles, 1.0 / nParticles)
-    x_mean = np.zeros((T, state_dim))
-    theta_mean = np.zeros((T, param_dim))
-
-    for t in range(T):
-        # Predict next state for auxiliary weights
-        x_pred = np.array([f(x[i], theta[i]) for i in range(nParticles)])
-        y_pred = np.array([h(x_pred[i]) for i in range(nParticles)])
-
-        # Auxiliary weights
-        aux_loglik = -0.5 * ((y[t] - y_pred)**2 / (r + q) + np.log(2*np.pi*(r+q)))
-        aux_w = np.exp(aux_loglik - np.max(aux_loglik))
-        aux_w /= aux_w.sum()
-
-        # Resample based on auxiliary weights
-        idx = systematic_resampling(aux_w, rng)
-        x = x[idx]
-        theta = theta[idx]
-
-        # Propagate states with process noise
-        x_next = np.array([f(x[i], theta[i]) for i in range(nParticles)])
-        x = x_next + rng.normal(scale=np.sqrt(q), size=(nParticles, state_dim))
-
-        # Compute observation likelihood
-        y_pred = np.array([h(x[i]) for i in range(nParticles)])
-        innov = y[t] - y_pred
-        loglik = -0.5 * (innov**2 / r + np.log(2*np.pi*r))
-        logw = loglik - np.max(loglik)
-        w = np.exp(logw)
-        w /= w.sum()
-
-        # Compute means
-        x_mean[t] = np.sum(w[:, None] * x, axis=0)
-        theta_mean[t] = np.average(theta, axis=0, weights=w)
-
-        # Liu–West resample parameters
-        theta = liu_west_resample_thetas(theta, w, delta=delta, rng=rng)
-
-        weights = np.full(nParticles, 1.0 / nParticles)
-
-    return x_mean, theta_mean
-
+    return resampPar, resampWeights, cme_par_array
 
 
 #####################################################################
@@ -699,53 +998,226 @@ def test_cme_par_to_state(nEns, seed=np.nan):
     return
 
 
-def test_PF_out():
-    # --- Example Usage ---
-    rng = np.random.default_rng(123)
-    T = 50
-    state_dim = 4
-    param_dim = 2
-    theta_true = np.array([0.9, 0.6])
-
-    # Define transition and observation functions
-    def f(x, theta):
-        # Example nonlinear dynamics for N-D state
-        x_next = np.zeros_like(x)
-        x_next[0] = theta[0] * x[0] + 0.5 * x[1]
-        x_next[1] = theta[1] * x[1] + 0.3 * x[2]
-        x_next[2] = 0.8 * x[2] + np.sin(x[0])
-        x_next[3] = 0.5 * x[3] + np.cos(x[1])
-
-        return x_next
-
-    def h(x):
-        hx = x.sum()
-        return hx  # observation = sum of state components
-
-    # Simulate data
-    x_true = np.zeros((T, state_dim))
-    y = np.zeros(T)
-    x_true[0] = np.array([0.5, -0.3, 0.2, 0.1])
-    q, r = 0.05, 0.1
-    for t in range(T):
-        y[t] = h(x_true[t]) + rng.normal(scale=np.sqrt(r))
-        if t < T - 1:
-            x_true[t + 1] = f(x_true[t], theta_true) + rng.normal(scale=np.sqrt(q), size=state_dim)
-
-    # Run APF
-    priors = {'mean': np.array([1.0, 0.5]), 'std': np.array([0.3, 0.3])}
-    x_mean, theta_mean = apf_nd_state(y, f, h, nParticles=2000, state_dim=state_dim,
-                                      param_dim=param_dim, delta=0.98, priors=priors,
-                                      q=q, r=r, x0_mean=np.zeros(state_dim),
-                                      x0_std=np.ones(state_dim), rng=rng)
-
-    print("True theta:", theta_true)
-    print("Estimated theta (final mean):", theta_mean[-1])
-    rmse_state = np.sqrt(np.mean((x_mean - x_true) ** 2))
-    print("State RMSE:", rmse_state)
-
-    return
-
 if __name__ == "__main__":
+    plt.close('all')
+    huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
+    n_ens = 100
+    cme_par_array = initialise_cme_parameter_ensemble_arrays(n_ens, huxt_init_time)
+    true_cme_par_array = initialise_cme_parameter_ensemble_arrays(1, huxt_init_time)
 
-    test_cme_par_to_state(nEns=10, seed=123)
+    # Initialise true CME parameters
+    true_cme_par_array['t_init'] = datetime.datetime(2008, 1, 1, 1, 0, 0)
+    true_cme_par_array['v'] = 800 * u.km / u.s
+    true_cme_par_array['width'] = 60 * u.deg
+    true_cme_par_array['lon'] = 5 * u.deg
+    true_cme_par_array['lat'] = 5 * u.deg
+    true_cme_par_array['thick'] = 5 * u.solRad
+
+
+    # Initialise CME parameters
+    cme_par_array['t_init'] = np.array(
+        [
+            datetime.datetime(2008, 1, 1, 1, 0, 0)
+            for i in range(n_ens)
+        ]
+    )
+    cme_par_array['v'] = np.array(
+        [(500 + np.random.normal(loc=0, scale=50, size=None)) for i in range(n_ens)]
+    ) * u.km / u.s
+    cme_par_array['width'] = np.array(
+        [50
+        + np.random.normal(loc=0, scale=3, size=None)
+        for _ in range(n_ens)]
+    ) * u.deg
+    cme_par_array['lon'] = np.array(
+        [0 for _ in range(n_ens)]
+    ) * u.deg
+    cme_par_array['lat'] = np.array(
+        [0 for _ in range(n_ens)]
+    ) * u.deg
+    cme_par_array['thick'] = np.array(
+        [5 for _ in range(n_ens)]
+    ) * u.solRad
+    """np.array([
+        datetime.datetime(2008, 1, 1, 1, 0, 0),
+        datetime.datetime(2008, 1, 1, 1, 0, 0),
+        datetime.datetime(2008, 1, 1, 1, 0, 0),
+#        datetime.datetime(2008, 1, 1, 1, 0, 0),
+        datetime.datetime(2008, 1, 1, 1, 0, 0)
+    ]))"""
+    """cme_par_array['v'] = np.array([500, 600, 400, 550]) * u.km / u.s
+    print(np.mean(cme_par_array['v']))
+    cme_par_array['width'] = np.array([60, 60, 60, 60]) * u.deg
+    cme_par_array['lon'] = np.array([5, 5, 5, 5]) * u.deg
+    cme_par_array['lat'] = np.array([5, 5, 5, 5]) * u.deg
+    cme_par_array['thick'] = np.array([5, 5, 5, 5]) * u.solRad"""
+    #pars_req = ['v', 'lon', 'width']
+    #pars, weights = cme_par_to_state_vector(cme_par_array, pars_req)
+    #obs = [23]
+    obs_cov = 5# * np.eye(len(obs))
+
+    obs_lon = 300 * u.deg
+    obs_lat = 0 * u.deg
+    obs_times = [
+        datetime.datetime(2008, 1, 1, 2, 0, 0)
+        + datetime.timedelta(hours=i) for i in range(24)
+    ]
+    synth_obs = make_synthetic_obs(
+        true_cme_par_array, obs_lon, obs_cov, obs_times,
+        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        vr_in=np.zeros(128) + 400 * u.km / u.s,
+        lon_start=290*u.deg,
+        lon_stop=430*u.deg,
+        sim_time=3*u.day,
+        dt_scale=1
+    )
+    print(synth_obs)
+    fig, ax = plt.subplots(1, 1)
+    ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs')
+    plt.show()
+
+    cme_v_values = np.zeros((n_ens, len(synth_obs)))
+    cme_width_values = np.zeros((n_ens, len(synth_obs)))
+
+    cme_saved_pars = np.zeros((len(synth_obs) + 1, n_ens, 6))
+    cme_elon = np.zeros((len(synth_obs) + 1, n_ens, 37))
+    cme_times = np.zeros((len(synth_obs) + 1, n_ens, 37))
+
+    cme_saved_pars[0, :, 0] = [
+        (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
+        for i in range(n_ens)
+    ]
+    # print(cme_par_array['width'])
+    cme_saved_pars[0, :, 1] = cme_par_array['v'].to(u.km / u.s).value
+    cme_saved_pars[0, :, 2] = cme_par_array['width'].to(u.deg).value
+
+    cme_saved_pars[0, :, 3] = cme_par_array['lon'].to(u.deg).value
+    lonCond = cme_saved_pars[0, :, 3] > 180
+    cme_saved_pars[0, lonCond, 3] = cme_saved_pars[0, lonCond, 3] - 360
+
+    cme_saved_pars[0, :, 4] = cme_par_array['lat'].to(u.deg).value
+    cme_saved_pars[0, :, 5] = cme_par_array['thick'].to(u.solRad).value
+
+    for yi, y_obs in enumerate(synth_obs):
+        print(yi, y_obs)
+        resampPar, resampWeights, cme_par_array = auxPf(
+            cme_par_array, y_obs, obs_cov, obs_lon, obs_times[yi],# log_weights,
+            fixed_ambient=True, pars_in_state=['v', 'width'], #'lon', 'width'],
+            huxt_init_time=huxt_init_time,
+            vr_in=np.zeros(128) + 400 * u.km / u.s,
+            lon_start=290 * u.deg,
+            lon_stop=430 * u.deg,
+            time_tolerance=0.5 * u.day,
+            dt_scale=20,
+            delta=0.98, rng=None
+        )
+        #print(f"resamp par: {resampPar}")
+        print(f"mean resamp par: {np.mean(resampPar)}")
+        #cme_v_values[yi, :] = resampPar
+        #print(f"sum(resampWeights): {sum(np.exp(resampWeights))}")
+
+        # Standardise the units and remove the astropy units
+        cme_saved_pars[yi + 1, :, 0] = [
+            (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
+            for i in range(n_ens)
+        ]
+        # print(cme_par_array['width'])
+        cme_saved_pars[yi + 1, :, 1] = cme_par_array['v'].to(u.km / u.s).value
+        cme_saved_pars[yi + 1, :, 2] = cme_par_array['width'].to(u.deg).value
+
+        cme_saved_pars[yi + 1, :, 3] = cme_par_array['lon'].to(u.deg).value
+        lonCond = cme_saved_pars[yi + 1, :, 3] > 180
+        cme_saved_pars[yi + 1, lonCond, 3] = cme_saved_pars[yi + 1, lonCond, 3] - 360
+
+        cme_saved_pars[yi + 1, :, 4] = cme_par_array['lat'].to(u.deg).value
+        cme_saved_pars[yi + 1, :, 5] = cme_par_array['thick'].to(u.solRad).value
+
+        cme_v_values[:, yi] = resampPar[:, 0]
+        cme_width_values[:, yi] = resampPar[:, 1]
+        #print(cme_par_array)
+
+    for yi, y_obs in enumerate(synth_obs):
+        # Calculate the elongation profile for the current observation for the next three days
+        # Initialise HUXt model object for each ensemble member
+        model3 = setup_huxt(
+            start_datetime=huxt_init_time,
+            vr_in=np.zeros(128) + 400 * u.km / u.s,
+            lon_start=290 * u.deg,
+            lon_stop=430 * u.deg,
+            sim_time=3 * u.day,
+            dt_scale=20
+        )
+
+        for m in range(n_ens):
+            # Extract CME parameters from list
+            cme_launch_time = cme_saved_pars[yi, m, 0] * u.s
+            cme_speed = cme_saved_pars[yi, m, 1] * u.km / u.s
+            cme_width = cme_saved_pars[yi, m, 2] * u.deg
+
+            cme_lon = cme_saved_pars[yi, m, 3] * u.deg
+            cme_lat = cme_saved_pars[yi, m, 4] * u.deg
+            cme_thickness = cme_saved_pars[yi, m, 5] * u.solRad
+
+            # Generate CME object
+            cme = H.ConeCME(
+                t_launch=cme_launch_time,
+                longitude=cme_lon,
+                latitude=cme_lat,
+                width=cme_width,
+                v=cme_speed,
+                thickness=cme_thickness
+            )
+            # print(cme.coords.items())
+
+            # Run CME through HUXt
+            model3.solve([cme])
+            cme_member = model3.cmes[0]
+
+            # # Plot this out
+            # t_interest = (obs_times[yi] - huxt_init_time).total_seconds() * u.s
+            # fig, ax = HA.plot(model3, t_interest)
+            # ax.set_title(f"CME at {obs_times[yi]} for ensemble member {m}")
+            # plt.show()
+
+            # Calculate CME flank
+            obsObject = shmo.Observer(model3, cme_member, obs_lon)
+            #print(f"len={len(obsObject.compute_flank_profile(cme_member)['el'].values)}")
+            #sys.exit()
+            cme_times[yi, m, :] = obsObject.compute_flank_profile(cme_member)['time'].values
+            cme_elon[yi, m, :] = obsObject.compute_flank_profile(cme_member)['el'].values
+        #print(cme_times[yi, 0, :])
+        #print([Time(cme_times[yi, 0, k], format='jd').to_datetime() for k in range(37)])
+        # fig, ax = plt.subplots(1, 1)
+        # ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs')
+        # ax.plot()
+        # plt.show()
+
+    for yi, y_obs in enumerate(synth_obs):
+        fig, ax = plt.subplots(1, 1)
+        for m in range(n_ens):
+            plot_cme_times=[
+                Time(cme_times[yi, m, k], format='jd').to_datetime() for k in range(37)
+            ]
+            ax.plot(plot_cme_times, cme_elon[yi, m, :], color='salmon')
+        ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs', color='b')
+        ax.plot(obs_times[yi], synth_obs[yi], '-', marker='^', label='Current obs assim.', color='c')
+        ax.legend()
+        ax.set_xlim((obs_times[0] - datetime.timedelta(hours=1), obs_times[-1] + datetime.timedelta(hours=1)))
+        ax.set_ylim((0, 30))
+        plt.show()
+
+    colours_for_hist = sns.color_palette(cc.glasbey, n_colors=len(synth_obs))
+    fig, ax = plt.subplots(1, 1)
+    for yi, y_obs in enumerate(synth_obs):
+        ax.hist(
+            cme_v_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
+        )
+        ax.legend(fontsize='x-small')
+    plt.show()
+    fig, ax = plt.subplots(1, 1)
+    for yi, y_obs in enumerate(synth_obs):
+        ax.hist(
+            cme_width_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
+        )
+        ax.legend()
+    plt.show()

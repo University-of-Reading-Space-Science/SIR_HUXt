@@ -459,7 +459,7 @@ def compute_resampling(parameter_array):
     print(weights)
     print("a")
     print(weights.ravel())
-    sys.exit()
+
     kde = KernelDensity(kernel='gaussian', bandwidth=0.2).fit(data, sample_weight=weights.ravel())
 
     # Resample the particles, and convert back to parameter space from zscore
