@@ -3,6 +3,11 @@
 #  generate an updated set of weights and particles
 import numpy as np
 import datetime
+import os
+import sys
+import pandas as pd
+import xarray as xr
+import json
 
 import huxt.huxt as H
 import huxt.huxt_analysis as HA
@@ -22,7 +27,8 @@ def setup_huxt(
         lon_start=290*u.deg,
         lon_stop=380*u.deg,
         sim_time=2*u.day,
-        dt_scale=20
+        dt_scale=20,
+        r_min=30 * u.solRad
 ):
     """
     Initialise HUXt with some predetermined boundary/initial conditions
@@ -46,8 +52,18 @@ def setup_huxt(
     #vr_in = np.asarray(vr_in)
     #print(sim_time)
     # Set up HUXt for a sim_time-day simulation, outputting every dt_scale
-    model = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c.to(u.deg), latitude=ert.lat.to(u.deg),
-                   lon_start=lon_start.to(u.rad), lon_stop=lon_stop.to(u.rad), simtime=sim_time, dt_scale=dt_scale)
+    model = H.HUXt(
+        v_boundary=vr_in,
+        cr_num=cr_num,
+        cr_lon_init=ert.lon_c.to(u.deg),
+        latitude=ert.lat.to(u.deg),
+        lon_start=lon_start.to(u.rad),
+        lon_stop=lon_stop.to(u.rad),
+        simtime=sim_time,
+        dt_scale=dt_scale,
+        r_min=r_min,
+        accel_limit=False
+    )
 
     # model1d = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
     #                  lon_out=0 * u.deg, simtime=5 * u.day, dt_scale=4)
@@ -353,9 +369,9 @@ def state_vector_to_cme_par(state_ens, weights, par_req, cme_par_array):
         elif ip == 'width':
             par_temp = par_temp * u.deg
         elif ip == 'lon':
-            lonCond = par_temp < 0
-            par_temp[lonCond] = par_temp[lonCond] + 360
-            par_temp[lonCond] = par_temp[lonCond] * u.deg
+            par_temp = par_temp * u.deg
+            lonCond = par_temp < 0 * u.deg
+            par_temp[lonCond] = par_temp[lonCond] + (360  * u.deg)
         elif ip == 'lat':
             par_temp = par_temp * u.deg
         elif ip == 'thick':
@@ -438,7 +454,7 @@ def shrink_par(pars, log_weights=None, delta=0.98):
 
 
 def obs_op(
-        huxtObject, cme_par, obs_lon, obs_time_in_jd
+        huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=30 * u.solRad, cme_init_rad=12 * u.solRad
 ):
     """
     obs_op: The purpose of this definition is to perform the observation operator
@@ -454,8 +470,11 @@ def obs_op(
     """
 
     # Extract CME parameters from list
-    cme_launch_time = cme_par[0] * u.s
     cme_speed = cme_par[1] * u.km/u.s
+
+    dist_to_inner_rad = (r_min.to(u.solRad) - cme_init_rad.to(u.solRad)).to(u.km)
+    cme_transit_time = (dist_to_inner_rad / cme_speed).to(u.s)
+    cme_launch_time = cme_par[0] * u.s + cme_transit_time
     cme_width = cme_par[2] * u.deg
     cme_lon = cme_par[3] * u.deg
     cme_lat = cme_par[4] * u.deg
@@ -469,7 +488,9 @@ def obs_op(
         latitude=cme_lat,
         width=cme_width,
         v=cme_speed,
-        thickness=cme_thickness
+        thickness=cme_thickness#,
+#        cme_fixed_duration=True,
+#        fixed_duration=12 * 60 * 60 * u.s
     )
     #print(cme.coords.items())
     # Run CME through HUXt
@@ -491,7 +512,16 @@ def obs_op(
     return hx
 
 
-def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd):
+def likelihood_function_gaussian(
+        obs,
+        obs_cov,
+        huxtObject,
+        cme_par,
+        obs_lon,
+        obs_time_in_jd,
+        r_min=30 * u.solRad,
+        cme_init_rad=12 * u.solRad
+):
     """
     likelihood_function_gaussian: The purpose of this definition is to calculate the
       likelihood function
@@ -507,7 +537,7 @@ def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs
 
     # Calculate the log likelihood function
     loglik = log_likelihood_function_gaussian(
-        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=r_min, cme_init_rad=cme_init_rad
     )
 
     # Calculate the likelihood function by taking the exponent
@@ -517,7 +547,7 @@ def likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs
 
 
 def likelihood_function(
-        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=30 * u.solRad, cme_init_rad=12 * u.solRad
 ):
     """
     likelihood_function: The purpose of this definition is to calculate the likelihood function with no assumptions
@@ -532,13 +562,13 @@ def likelihood_function(
     """
 
     # Call the required likelihood function to get the likelihood
-    likelihood = likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd)
+    likelihood = likelihood_function_gaussian(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=r_min, cme_init_rad=cme_init_rad)
 
     return likelihood
 
 
 def log_likelihood_function_gaussian(
-        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=30 * u.solRad, cme_init_rad=12 * u.solRad
 ):
     """
     log_likelihood_function_gaussian: The purpose of this definition is to calculate the
@@ -554,7 +584,7 @@ def log_likelihood_function_gaussian(
     """
 
     # Calculate the observation operator (what the model thinks the observation should be)
-    hx = obs_op(huxtObject, cme_par, obs_lon, obs_time_in_jd)
+    hx = obs_op(huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=r_min, cme_init_rad=cme_init_rad)
     """print(f"obs={obs}")
     print("hx: ", hx)"""
 
@@ -582,7 +612,7 @@ def log_likelihood_function_gaussian(
         return loglik
 
 
-def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd):
+def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=30*u.solRad, cme_init_rad=12*u.solRad):
     """
     log_likelihood_function: The purpose of this definition is to calculate the logarithm of the likelihood
     :param obs: Observation of the CME flank
@@ -597,7 +627,7 @@ def log_likelihood_function(obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time
 
     # Call the likelihood function and then taken its logarithm
     log_likelihood = log_likelihood_function_gaussian(
-        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd
+        obs, obs_cov, huxtObject, cme_par, obs_lon, obs_time_in_jd, r_min=r_min, cme_init_rad=cme_init_rad
     )
     #log_likelihood = np.log(likelihood)
 
@@ -635,7 +665,9 @@ def make_synthetic_obs(
         lon_start=290*u.deg,
         lon_stop=380*u.deg,
         sim_time=5*u.day,
-        dt_scale=20
+        dt_scale=20,
+        r_min=30 * u.solRad,
+        cme_init_rad=12 * u.solRad
 ):
     """
     Function to create synthetic observations
@@ -667,14 +699,21 @@ def make_synthetic_obs(
         lon_start=lon_start,
         lon_stop=lon_stop,
         sim_time=sim_time,
-        dt_scale=dt_scale
+        dt_scale=dt_scale,
+        r_min=r_min
     )
 
     # Extract CME parameters from list
-    cme_launch_time = (true_cme_par_array['t_init'] - true_cme_par_array['huxt_init_time']).total_seconds() * u.s
+    # Calculate time taken to go from cme's initial radius to huxt inner boundary
     cme_speed = true_cme_par_array['v'].to(u.km / u.s)
-    cme_width = true_cme_par_array['width'].to(u.deg)
 
+    dist_to_inner_rad = (r_min.to(u.solRad) - cme_init_rad.to(u.solRad)).to(u.km)
+    cme_transit_time = dist_to_inner_rad / cme_speed
+    cme_launch_time = (
+        true_cme_par_array['t_init'] - true_cme_par_array['huxt_init_time']
+    ).total_seconds() * u.s + cme_transit_time
+    print(true_cme_par_array['t_init'] + datetime.timedelta(seconds=cme_launch_time.value))
+    cme_width = true_cme_par_array['width'].to(u.deg)
     cme_lon = true_cme_par_array['lon'].to(u.deg)
     if cme_lon > (180 * u.deg):
         cme_lon = cme_lon - (360 * u.deg)
@@ -689,7 +728,9 @@ def make_synthetic_obs(
         latitude=cme_lat,
         width=cme_width,
         v=cme_speed,
-        thickness=cme_thickness
+        thickness=cme_thickness#,
+        # cme_fixed_duration=True,
+        # fixed_duration=12 * 60 * 60 * u.s
     )
     #print(cme.coords.items())
 
@@ -705,7 +746,7 @@ def make_synthetic_obs(
     for it, obs_t in enumerate(obs_time_in_jd):
         # Get the CME elongation at the required observation time
         indReq = np.argmin(abs(cme_flank['time'].values - obs_t))
-        obs_pert = 0#np.random.normal(loc=0, scale=obs_cov)
+        obs_pert = 0 #np.random.normal(loc=0, scale=obs_cov)
         synth_obs.append(cme_flank['el'].values[indReq] + obs_pert)
 
         # Plot this out
@@ -734,7 +775,7 @@ def calc_eff_sample_size(log_weights):
 
 
 def auxPf(
-        cme_par_array, obs, obs_cov, obs_lon, obs_time,
+        cme_par_array, obs, obs_cov, obs_lon, obs_time, inflFact,
         fixed_ambient=True, pars_in_state=['v', 'lon', 'width'],
         huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
@@ -742,7 +783,10 @@ def auxPf(
         lon_stop=380*u.deg,
         time_tolerance=0.5*u.day,
         dt_scale=20,
-        delta=0.98, rng=None
+        delta=0.98,
+        r_min=30*u.solRad,
+        cme_init_rad=12 * u.solRad,
+        rng=None
 ):
     """
     Function to run the auxillary particle filter
@@ -803,7 +847,8 @@ def auxPf(
     # Calculate covariance scaling factor h, from the delta quantity input into function
     h2 = 1 - ( ((3 * delta) - 1) / (2 * delta) ) ** 2
     #print(h2)
-    stoch_weight_cov = h2 * cov_pars
+
+    stoch_weight_cov = h2 * inflationFact * cov_pars
     #print(f"stoch_weight_cov: {stoch_weight_cov}")
     #print(np.shape(cov_pars))
 
@@ -820,7 +865,8 @@ def auxPf(
                     lon_start=lon_start,
                     lon_stop=lon_stop,
                     sim_time=sim_time,
-                    dt_scale=dt_scale
+                    dt_scale=dt_scale,
+                    r_min=r_min
                 )
         else:
             # Initialise HUXt model object for each ensemble member
@@ -830,7 +876,8 @@ def auxPf(
                 lon_start=lon_start,
                 lon_stop=lon_stop,
                 sim_time=sim_time,
-                dt_scale=dt_scale
+                dt_scale=dt_scale,
+                r_min=r_min
             )
         # Calculate the log-likelihood for this ensemble member
         cmeReqPar = ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
@@ -856,7 +903,9 @@ def auxPf(
             model,
             par_arr_j,
             obs_lon,
-            obs_time_in_jd
+            obs_time_in_jd,
+            r_min=r_min,
+            cme_init_rad=cme_init_rad
         )
 
         # Store log-likelihood ensemble in list
@@ -942,7 +991,9 @@ def auxPf(
             model,
             par_arr_j,
             obs_lon,
-            obs_time_in_jd
+            obs_time_in_jd,
+            r_min=r_min,
+            cme_init_rad=cme_init_rad
         )
         resampWeights[j] = resamp_log_likelihood - log_likelihood_normed[j]
 
@@ -955,6 +1006,34 @@ def auxPf(
     cme_par_array = state_vector_to_cme_par(resampPar, resampWeights, pars_in_state, cme_par_array)
 
     return resampPar, resampWeights, cme_par_array
+
+
+#
+def generateCovInitCMEPar(file_path, vars_req):
+    """
+    Generate the covariance matrix for the initial parameters using Blair's CME list
+    provided in file_path
+    :param file_path: File path to CME list to estimate covariance from
+    :param vars_req: List of variables to estimate covariance of
+        Accepted inputd = ['v', 'width', 'lon', 'lat', 'thick']
+    :return: initCovPar: Covariance matrix for the initial parameters
+    """
+
+    # Open and read in CME list
+    dfCMEpar = pd.read_csv(file_path)
+
+    # Rename column headers to be consistent with SIR-HUXt and then delete columns that aren't in vars_req
+    dfCMEpar.rename({'V': 'v', 'Ang_rad': 'width'}, axis=1, inplace=True)
+    dfCMEpar.drop(
+        columns=[col for col in dfCMEpar if col not in vars_req],
+        inplace=True
+    )
+
+    # Calculate covariance matrix from dfCMEpar
+    initCovPar = dfCMEpar.cov(numeric_only=True)
+    print(initCovPar)
+
+    return initCovPar
 
 
 #####################################################################
@@ -1000,44 +1079,47 @@ def test_cme_par_to_state(nEns, seed=np.nan):
 
 if __name__ == "__main__":
     plt.close('all')
+
+    outBaseDir = os.path.join(
+        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "figures", "highSpread"
+    )
+    if not os.path.isdir(outBaseDir):
+        os.makedirs(outBaseDir)
+    file_path = os.path.join(
+        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "blairCMElistSingle.csv"
+    )
+    vars_req = ['v', 'width', 'lon']
+    initCMEparCov = generateCovInitCMEPar(file_path, vars_req)
+
     huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
-    n_ens = 100
+    n_ens = 25
+
     cme_par_array = initialise_cme_parameter_ensemble_arrays(n_ens, huxt_init_time)
     true_cme_par_array = initialise_cme_parameter_ensemble_arrays(1, huxt_init_time)
 
     # Initialise true CME parameters
-    true_cme_par_array['t_init'] = datetime.datetime(2008, 1, 1, 1, 0, 0)
-    true_cme_par_array['v'] = 800 * u.km / u.s
-    true_cme_par_array['width'] = 60 * u.deg
-    true_cme_par_array['lon'] = 5 * u.deg
-    true_cme_par_array['lat'] = 5 * u.deg
-    true_cme_par_array['thick'] = 5 * u.solRad
+    true_cme_t_init = datetime.datetime(2008, 1, 1, 0, 0, 0)
+    true_cme_speed = 495
+    true_cme_width = 37.4
+    true_cme_lon = 0
+    true_cme_lat = 0
+    true_cme_thick = 0
 
+    true_cme_par_array['t_init'] = true_cme_t_init
+    true_t_init_str = true_cme_par_array['t_init'].strftime("%Y%m%d-%H%M")
 
-    # Initialise CME parameters
-    cme_par_array['t_init'] = np.array(
-        [
-            datetime.datetime(2008, 1, 1, 1, 0, 0)
-            for i in range(n_ens)
-        ]
+    true_cme_par_array['v'] = true_cme_speed * u.km / u.s
+    true_cme_par_array['width'] = true_cme_width * u.deg
+    true_cme_par_array['lon'] = true_cme_lon * u.deg
+    true_cme_par_array['lat'] = true_cme_lat * u.deg
+    true_cme_par_array['thick'] = true_cme_thick * u.solRad
+
+    outputObsDir = os.path.join(
+        outBaseDir,
+        f"truth_{true_t_init_str}_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}_{true_cme_thick}"
     )
-    cme_par_array['v'] = np.array(
-        [(500 + np.random.normal(loc=0, scale=50, size=None)) for i in range(n_ens)]
-    ) * u.km / u.s
-    cme_par_array['width'] = np.array(
-        [50
-        + np.random.normal(loc=0, scale=3, size=None)
-        for _ in range(n_ens)]
-    ) * u.deg
-    cme_par_array['lon'] = np.array(
-        [0 for _ in range(n_ens)]
-    ) * u.deg
-    cme_par_array['lat'] = np.array(
-        [0 for _ in range(n_ens)]
-    ) * u.deg
-    cme_par_array['thick'] = np.array(
-        [5 for _ in range(n_ens)]
-    ) * u.solRad
+    cme_init_rad = 12 * u.solRad
+    r_min = 30 * u.solRad
     """np.array([
         datetime.datetime(2008, 1, 1, 1, 0, 0),
         datetime.datetime(2008, 1, 1, 1, 0, 0),
@@ -1054,13 +1136,14 @@ if __name__ == "__main__":
     #pars_req = ['v', 'lon', 'width']
     #pars, weights = cme_par_to_state_vector(cme_par_array, pars_req)
     #obs = [23]
-    obs_cov = 5# * np.eye(len(obs))
+    obs_cov = 0.3# * np.eye(len(obs))
 
+    nObs = 8
     obs_lon = 300 * u.deg
     obs_lat = 0 * u.deg
     obs_times = [
-        datetime.datetime(2008, 1, 1, 2, 0, 0)
-        + datetime.timedelta(hours=i) for i in range(24)
+        datetime.datetime(2008, 1, 1, 9, 0, 0)
+        + datetime.timedelta(hours=3 * i) for i in range(1, 1 + nObs)
     ]
     synth_obs = make_synthetic_obs(
         true_cme_par_array, obs_lon, obs_cov, obs_times,
@@ -1069,155 +1152,267 @@ if __name__ == "__main__":
         lon_start=290*u.deg,
         lon_stop=430*u.deg,
         sim_time=3*u.day,
-        dt_scale=1
+        dt_scale=1,
+        r_min=r_min,
+        cme_init_rad=cme_init_rad
     )
     print(synth_obs)
+
+    #######################################################################
+    outTruthDir = os.path.join(
+        outBaseDir,
+        f"truth_{true_t_init_str}_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}_{true_cme_thick}"
+    )
+    if not os.path.isdir(outTruthDir):
+        os.makedirs(outTruthDir)
+
     fig, ax = plt.subplots(1, 1)
     ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs')
-    plt.show()
+    plt.savefig(os.path.join(outputObsDir, 'synth_obs.png'))
 
-    cme_v_values = np.zeros((n_ens, len(synth_obs)))
-    cme_width_values = np.zeros((n_ens, len(synth_obs)))
+    #######################################################################
+    # Initialise CME parameters
+    mean_cme_t_init = datetime.datetime(2008, 1, 1, 1, 0, 0)
+    mean_cme_t_init_str = mean_cme_t_init.strftime("%Y%m%d-%H%M")
+    mean_cme_speed = 477
+    mean_cme_width = 37
+    mean_cme_lon = -4
+    mean_cme_lat = 0
+    mean_cme_thick = 0
 
-    cme_saved_pars = np.zeros((len(synth_obs) + 1, n_ens, 6))
-    cme_elon = np.zeros((len(synth_obs) + 1, n_ens, 37))
-    cme_times = np.zeros((len(synth_obs) + 1, n_ens, 37))
+    n_runs = 100
 
-    cme_saved_pars[0, :, 0] = [
-        (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
-        for i in range(n_ens)
-    ]
-    # print(cme_par_array['width'])
-    cme_saved_pars[0, :, 1] = cme_par_array['v'].to(u.km / u.s).value
-    cme_saved_pars[0, :, 2] = cme_par_array['width'].to(u.deg).value
-
-    cme_saved_pars[0, :, 3] = cme_par_array['lon'].to(u.deg).value
-    lonCond = cme_saved_pars[0, :, 3] > 180
-    cme_saved_pars[0, lonCond, 3] = cme_saved_pars[0, lonCond, 3] - 360
-
-    cme_saved_pars[0, :, 4] = cme_par_array['lat'].to(u.deg).value
-    cme_saved_pars[0, :, 5] = cme_par_array['thick'].to(u.solRad).value
-
-    for yi, y_obs in enumerate(synth_obs):
-        print(yi, y_obs)
-        resampPar, resampWeights, cme_par_array = auxPf(
-            cme_par_array, y_obs, obs_cov, obs_lon, obs_times[yi],# log_weights,
-            fixed_ambient=True, pars_in_state=['v', 'width'], #'lon', 'width'],
-            huxt_init_time=huxt_init_time,
-            vr_in=np.zeros(128) + 400 * u.km / u.s,
-            lon_start=290 * u.deg,
-            lon_stop=430 * u.deg,
-            time_tolerance=0.5 * u.day,
-            dt_scale=20,
-            delta=0.98, rng=None
+    for runNo in range(n_runs):
+        cme_par_array['t_init'] = np.array(
+            [mean_cme_t_init for _ in range(n_ens)]
         )
-        #print(f"resamp par: {resampPar}")
-        print(f"mean resamp par: {np.mean(resampPar)}")
-        #cme_v_values[yi, :] = resampPar
-        #print(f"sum(resampWeights): {sum(np.exp(resampWeights))}")
+        cme_par_array['v'] = np.array(
+            [
+                np.random.uniform(low=0.7 * mean_cme_speed, high=1.3 * mean_cme_speed) for _ in range(n_ens)
+                # mean_cme_speed + np.random.normal(loc=0, scale=50, size=None)) for _ in range(n_ens)
+            ]
+        ) * u.km / u.s
+        cme_par_array['width'] = np.array(
+            [
+                np.random.uniform(low=mean_cme_width - 15, high=mean_cme_width + 15) for _ in range(n_ens)
+                # mean_cme_width + np.random.normal(loc=0, scale=5, size=None) for _ in range(n_ens)
+            ]
+        ) * u.deg
+        cme_par_array['lon'] = np.array(
+            [
+                np.random.uniform(low=mean_cme_lon - 15, high=mean_cme_lon + 15) for _ in range(n_ens)
+                # mean_cme_lon + np.random.normal(loc=0, scale=5, size=None) for _ in range(n_ens)
+            ]
+        ) * u.deg
+        # cme_par_array['lon'] = np.array(
+        #     [mean_cme_lon
+        #      for _ in range(n_ens)]
+        # ) * u.deg
+        cme_par_array['lat'] = np.array(
+            [mean_cme_lat for _ in range(n_ens)]
+        ) * u.deg
+        cme_par_array['thick'] = np.array(
+            [mean_cme_thick for _ in range(n_ens)]
+        ) * u.solRad
 
-        # Standardise the units and remove the astropy units
-        cme_saved_pars[yi + 1, :, 0] = [
+        outputDir = os.path.join(
+            outBaseDir,
+            f"truth_{true_t_init_str}_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}_{true_cme_thick}",
+            f"prior_{mean_cme_t_init_str}_{mean_cme_speed}_{mean_cme_width}_{mean_cme_lon}_{mean_cme_lat}_{mean_cme_thick}",
+            f"nEns-{n_ens}_{nObs}_{obs_lon}_{obs_lat}",
+            f"run_{runNo:03d}"
+        )
+        if not os.path.isdir(outputDir):
+            os.makedirs(outputDir)
+
+        cme_v_values = np.zeros((n_ens, len(synth_obs)))
+        cme_width_values = np.zeros((n_ens, len(synth_obs)))
+
+        cme_saved_pars = np.zeros((len(synth_obs) + 1, n_ens, 6))
+        cme_elon = np.zeros((len(synth_obs) + 1, n_ens, 37))
+        cme_times = np.zeros((len(synth_obs) + 1, n_ens, 37))
+
+        # Save prior parameters in an array
+        cme_saved_pars[0, :, 0] = [
             (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
             for i in range(n_ens)
         ]
         # print(cme_par_array['width'])
-        cme_saved_pars[yi + 1, :, 1] = cme_par_array['v'].to(u.km / u.s).value
-        cme_saved_pars[yi + 1, :, 2] = cme_par_array['width'].to(u.deg).value
+        cme_saved_pars[0, :, 1] = cme_par_array['v'].to(u.km / u.s).value
+        cme_saved_pars[0, :, 2] = cme_par_array['width'].to(u.deg).value
 
-        cme_saved_pars[yi + 1, :, 3] = cme_par_array['lon'].to(u.deg).value
-        lonCond = cme_saved_pars[yi + 1, :, 3] > 180
-        cme_saved_pars[yi + 1, lonCond, 3] = cme_saved_pars[yi + 1, lonCond, 3] - 360
+        cme_saved_pars[0, :, 3] = cme_par_array['lon'].to(u.deg).value
+        lonCond = cme_saved_pars[0, :, 3] > 180
+        cme_saved_pars[0, lonCond, 3] = cme_saved_pars[0, lonCond, 3] - 360
 
-        cme_saved_pars[yi + 1, :, 4] = cme_par_array['lat'].to(u.deg).value
-        cme_saved_pars[yi + 1, :, 5] = cme_par_array['thick'].to(u.solRad).value
+        cme_saved_pars[0, :, 4] = cme_par_array['lat'].to(u.deg).value
+        cme_saved_pars[0, :, 5] = cme_par_array['thick'].to(u.solRad).value
+        ###############################################################################
 
-        cme_v_values[:, yi] = resampPar[:, 0]
-        cme_width_values[:, yi] = resampPar[:, 1]
-        #print(cme_par_array)
+        for yi, y_obs in enumerate(synth_obs):
+            print(yi, y_obs)
+            inflatAt15Rs = 4
+            inflTerm1 = ((1 - inflatAt15Rs) / 15.0) * y_obs
+            inflTerm2 = (2 * inflatAt15Rs) - 1
+            inflationFact = inflTerm1 + inflTerm2
+            #-(7.0 * y_obs / 15.0) + 15.0
 
-    for yi, y_obs in enumerate(synth_obs):
-        # Calculate the elongation profile for the current observation for the next three days
-        # Initialise HUXt model object for each ensemble member
-        model3 = setup_huxt(
-            start_datetime=huxt_init_time,
-            vr_in=np.zeros(128) + 400 * u.km / u.s,
-            lon_start=290 * u.deg,
-            lon_stop=430 * u.deg,
-            sim_time=3 * u.day,
-            dt_scale=20
-        )
-
-        for m in range(n_ens):
-            # Extract CME parameters from list
-            cme_launch_time = cme_saved_pars[yi, m, 0] * u.s
-            cme_speed = cme_saved_pars[yi, m, 1] * u.km / u.s
-            cme_width = cme_saved_pars[yi, m, 2] * u.deg
-
-            cme_lon = cme_saved_pars[yi, m, 3] * u.deg
-            cme_lat = cme_saved_pars[yi, m, 4] * u.deg
-            cme_thickness = cme_saved_pars[yi, m, 5] * u.solRad
-
-            # Generate CME object
-            cme = H.ConeCME(
-                t_launch=cme_launch_time,
-                longitude=cme_lon,
-                latitude=cme_lat,
-                width=cme_width,
-                v=cme_speed,
-                thickness=cme_thickness
+            inflExp = -(yi / 5.0) + 6
+            #inflationFact = 2 ** inflExp
+            print(f"inflation factor: {inflationFact}")
+            resampPar, resampWeights, cme_par_array = auxPf(
+                cme_par_array, y_obs, obs_cov, obs_lon, obs_times[yi], inflFact=inflationFact,# log_weights,
+                fixed_ambient=True, pars_in_state=['v', 'width', 'lon'], #'lon', 'width'],
+                huxt_init_time=huxt_init_time,
+                vr_in=np.zeros(128) + 400 * u.km / u.s,
+                lon_start=290 * u.deg,
+                lon_stop=430 * u.deg,
+                time_tolerance=0.5 * u.day,
+                dt_scale=20,
+                delta=0.9,
+                r_min=r_min,
+                cme_init_rad = cme_init_rad,
+                rng=None
             )
-            # print(cme.coords.items())
+            print(f"cme_par_array: {cme_par_array}")
+            print(f"mean resamp par: {np.mean(resampPar)}")
+            #cme_v_values[yi, :] = resampPar
+            #print(f"sum(resampWeights): {sum(np.exp(resampWeights))}")
 
-            # Run CME through HUXt
-            model3.solve([cme])
-            cme_member = model3.cmes[0]
-
-            # # Plot this out
-            # t_interest = (obs_times[yi] - huxt_init_time).total_seconds() * u.s
-            # fig, ax = HA.plot(model3, t_interest)
-            # ax.set_title(f"CME at {obs_times[yi]} for ensemble member {m}")
-            # plt.show()
-
-            # Calculate CME flank
-            obsObject = shmo.Observer(model3, cme_member, obs_lon)
-            #print(f"len={len(obsObject.compute_flank_profile(cme_member)['el'].values)}")
-            #sys.exit()
-            cme_times[yi, m, :] = obsObject.compute_flank_profile(cme_member)['time'].values
-            cme_elon[yi, m, :] = obsObject.compute_flank_profile(cme_member)['el'].values
-        #print(cme_times[yi, 0, :])
-        #print([Time(cme_times[yi, 0, k], format='jd').to_datetime() for k in range(37)])
-        # fig, ax = plt.subplots(1, 1)
-        # ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs')
-        # ax.plot()
-        # plt.show()
-
-    for yi, y_obs in enumerate(synth_obs):
-        fig, ax = plt.subplots(1, 1)
-        for m in range(n_ens):
-            plot_cme_times=[
-                Time(cme_times[yi, m, k], format='jd').to_datetime() for k in range(37)
+            # Standardise the units and remove the astropy units
+            cme_saved_pars[yi + 1, :, 0] = [
+                (cme_par_array['t_init'][i] - cme_par_array['huxt_init_time']).total_seconds()
+                for i in range(n_ens)
             ]
-            ax.plot(plot_cme_times, cme_elon[yi, m, :], color='salmon')
-        ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs', color='b')
-        ax.plot(obs_times[yi], synth_obs[yi], '-', marker='^', label='Current obs assim.', color='c')
-        ax.legend()
-        ax.set_xlim((obs_times[0] - datetime.timedelta(hours=1), obs_times[-1] + datetime.timedelta(hours=1)))
-        ax.set_ylim((0, 30))
-        plt.show()
+            # print(cme_par_array['width'])
+            cme_saved_pars[yi + 1, :, 1] = cme_par_array['v'].to(u.km / u.s).value
+            cme_saved_pars[yi + 1, :, 2] = cme_par_array['width'].to(u.deg).value
 
-    colours_for_hist = sns.color_palette(cc.glasbey, n_colors=len(synth_obs))
-    fig, ax = plt.subplots(1, 1)
-    for yi, y_obs in enumerate(synth_obs):
-        ax.hist(
-            cme_v_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
+            cme_saved_pars[yi + 1, :, 3] = cme_par_array['lon'].to(u.deg).value
+            lonCond = cme_saved_pars[yi + 1, :, 3] > 180
+            cme_saved_pars[yi + 1, lonCond, 3] = cme_saved_pars[yi + 1, lonCond, 3] - 360
+
+            cme_saved_pars[yi + 1, :, 4] = cme_par_array['lat'].to(u.deg).value
+            cme_saved_pars[yi + 1, :, 5] = cme_par_array['thick'].to(u.solRad).value
+
+            cme_v_values[:, yi] = cme_par_array['v'].to(u.km / u.s).value
+            cme_width_values[:, yi] = cme_par_array['width'].to(u.deg).value
+            #print(cme_par_array)
+
+        # Save cme_parameters into a .nc file
+        # Make an xarray object
+        cme_par_ds = xr.Dataset(
+            data_vars=dict(
+                model_init_time=huxt_init_time,
+                cme_init_rad=cme_init_rad,
+                r_min=r_min,
+                ambient_vr=(["n_lon"], np.zeros(128) + 400 * u.km / u.s),
+                t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
+                v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
+                width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
+                lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
+                lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
+                thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5])
+            ),
+            coords=dict(
+                obs_no=("n_obs", range(len(synth_obs) + 1)),
+                ens_no=("n_ens", range(n_ens)),
+                huxt_lon=("n_lon", (2 * np.pi / 128.) * np.arange(128))
+            ),
         )
-        ax.legend(fontsize='x-small')
-    plt.show()
-    fig, ax = plt.subplots(1, 1)
-    for yi, y_obs in enumerate(synth_obs):
-        ax.hist(
-            cme_width_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
-        )
-        ax.legend()
-    plt.show()
+        print(cme_par_ds)
+        outParFile = os.path.join(outputDir, "cme_pars.nc")
+        cme_par_ds.to_netcdf(outParFile)
+        #
+        # for yi, y_obs in enumerate(synth_obs):
+        #     # Calculate the elongation profile for the current observation for the next three days
+        #     # Initialise HUXt model object for each ensemble member
+        #     model3 = setup_huxt(
+        #         start_datetime=huxt_init_time,
+        #         vr_in=np.zeros(128) + 400 * u.km / u.s,
+        #         lon_start=290 * u.deg,
+        #         lon_stop=430 * u.deg,
+        #         sim_time=3 * u.day,
+        #         dt_scale=20,
+        #         r_min=30 * u.solRad
+        #     )
+        #
+        #     for m in range(n_ens):
+        #         # Extract CME parameters from list
+        #         cme_speed = cme_saved_pars[yi, m, 1] * u.km / u.s
+        #
+        #         dist_to_inner_rad = (r_min.to(u.solRad) - cme_init_rad.to(u.solRad)).to(u.km)
+        #         cme_transit_time = dist_to_inner_rad / cme_speed
+        #         cme_launch_time = (
+        #             cme_saved_pars[yi, m, 0] * u.s + cme_transit_time
+        #         )
+        #         cme_width = cme_saved_pars[yi, m, 2] * u.deg
+        #
+        #         cme_lon = cme_saved_pars[yi, m, 3] * u.deg
+        #         cme_lat = cme_saved_pars[yi, m, 4] * u.deg
+        #         cme_thickness = cme_saved_pars[yi, m, 5] * u.solRad
+        #
+        #         # Generate CME object
+        #         cme = H.ConeCME(
+        #             t_launch=cme_launch_time,
+        #             longitude=cme_lon,
+        #             latitude=cme_lat,
+        #             width=cme_width,
+        #             v=cme_speed,
+        #             thickness=cme_thickness
+        #         )
+        #         # print(cme.coords.items())
+        #
+        #         # Run CME through HUXt
+        #         model3.solve([cme])
+        #         cme_member = model3.cmes[0]
+        #
+        #         # # Plot this out
+        #         # t_interest = (obs_times[yi] - huxt_init_time).total_seconds() * u.s
+        #         # fig, ax = HA.plot(model3, t_interest)
+        #         # ax.set_title(f"CME at {obs_times[yi]} for ensemble member {m}")
+        #         # plt.show()
+        #
+        #         # Calculate CME flank
+        #         obsObject = shmo.Observer(model3, cme_member, obs_lon)
+        #         #print(f"len={len(obsObject.compute_flank_profile(cme_member)['el'].values)}")
+        #         #sys.exit()
+        #         cme_times[yi, m, :] = obsObject.compute_flank_profile(cme_member)['time'].values
+        #         cme_elon[yi, m, :] = obsObject.compute_flank_profile(cme_member)['el'].values
+        #     #print(cme_times[yi, 0, :])
+        #     #print([Time(cme_times[yi, 0, k], format='jd').to_datetime() for k in range(37)])
+        #     # fig, ax = plt.subplots(1, 1)
+        #     # ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs')
+        #     # ax.plot()
+        #     # plt.show()
+        #
+        # for yi, y_obs in enumerate(synth_obs):
+        #     fig, ax = plt.subplots(1, 1)
+        #     for m in range(n_ens):
+        #         plot_cme_times=[
+        #             Time(cme_times[yi, m, k], format='jd').to_datetime() for k in range(37)
+        #         ]
+        #         ax.plot(plot_cme_times, cme_elon[yi, m, :], color='salmon')
+        #     ax.plot(obs_times, synth_obs, '-', marker='^', label='Obs', color='b')
+        #     ax.plot(obs_times[yi], synth_obs[yi], '-', marker='^', label='Current obs assim.', color='c')
+        #     ax.legend()
+        #     ax.set_xlim((obs_times[0] - datetime.timedelta(hours=1), obs_times[-1] + datetime.timedelta(hours=1)))
+        #     ax.set_ylim((0, 30))
+        #     plt.savefig(os.path.join(outputDir, f"obsNo{yi}_elonEns.png"))
+        #
+        # colours_for_hist = sns.color_palette(cc.glasbey, n_colors=len(synth_obs))
+        # fig, ax = plt.subplots(1, 1)
+        # for yi, y_obs in enumerate(synth_obs):
+        #     ax.hist(
+        #         cme_v_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
+        #     )
+        #     ax.legend(fontsize='x-small')
+        # plt.savefig(os.path.join(outputDir, f"cme_speed_hist.png"))
+        #
+        # fig, ax = plt.subplots(1, 1)
+        # for yi, y_obs in enumerate(synth_obs):
+        #     ax.hist(
+        #         cme_width_values[:, yi], bins=20, color=colours_for_hist[yi], weights=resampWeights, density=True, alpha=0.7, label=f"Obs_no: {yi + 1}"
+        #     )
+        #     ax.legend()
+        # plt.savefig(os.path.join(outputDir, f"cme_width_hist.png"))
