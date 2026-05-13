@@ -122,21 +122,22 @@ def plot_par_histograms_over_mult_runs(
 
 
 def main():
-    nRuns = 25
+    nRuns = 100
     vTruth = 495
     widthTruth = 37.4
     lonTruth = 0
 
+    #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
     baseFilePath = os.path.join(
-        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "figures",# "highSpread",
-        "truth_20080101-0000_495_37.4_0_0_0", "prior_20080101-0100_477_37_-4_0_0", "nEns-1000_8_300.0 deg_0.0 deg"
+        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "figures", "indep_cov",
+        "truth_20080101-0000_495_37.4_0_0_0", "prior_20080101-0100_495_37.4_0_0_0", "nEns-50_8_300.0 deg_0.0 deg"
     )
 
     # Read in all nc files and concatenate them into a single xarray object
     for runNo in range(nRuns):
         print(runNo)
         filePath = os.path.join(
-            baseFilePath, f"run_{runNo:03d}", "cme_pars.nc"
+            baseFilePath, f"runNo_{runNo:04d}", "cme_pars.nc"
         )
         with xr.load_dataset(filePath) as dsTemp:
             dsTemp.expand_dims(dim={"run": 1})
