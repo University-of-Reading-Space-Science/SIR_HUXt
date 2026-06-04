@@ -10,13 +10,13 @@ from astropy.units import Quantity
 from astropy.time import Time
 
 # sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-from SIR_HUXt.code.sir_observation_operator import ObservationOperator
-from SIR_HUXt.code.to_state_vector import ToStateVector
-from SIR_HUXt.code.from_state_vector import FromStateVector
+from sir_observation_operator import ObservationOperator
+from to_state_vector import ToStateVector
+from from_state_vector import FromStateVector
 
 # sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests')
-from SIR_HUXt.tests.cme_par_array import CmeParArray
-from SIR_HUXt.tests.cme_par_dict import CmeParDict
+from tests.cme_par_array import CmeParArray
+from tests.cme_par_dict import CmeParDict
 
 #from SIR_HUXt.tests.fixtures.fixture_state_trans import par_dict
 import huxt.huxt as H

@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from SIR_HUXt.code.sir_likelihood import LikelihoodFunction
+from sir_likelihood import LikelihoodFunction
 
 class TestSirLikelihood:
     @pytest.fixture

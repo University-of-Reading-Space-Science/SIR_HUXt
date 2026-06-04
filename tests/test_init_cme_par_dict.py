@@ -2,7 +2,7 @@ import datetime
 import sys
 
 #sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-import SIR_HUXt.code.init_sir as init_sir
+import init_sir as init_sir
 
 class TestInitCmeParDict:
     def test_initialise_cme_parameter_ensemble_dict(self) -> None:

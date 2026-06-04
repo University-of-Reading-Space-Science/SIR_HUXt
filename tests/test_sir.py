@@ -10,7 +10,8 @@
 
 #from SIR_HUXt.tests.test_sir_likelihood import TestSirLikelihood
 
-from SIR_HUXt.tests.test_sir_observation_operator import TestObservationOperator
+#from tests.test_sir_observation_operator import TestObservationOperator
+from tests.test_aux_pf import TestAuxPF
 
 
 def test_sir() -> None:
@@ -22,7 +23,10 @@ def test_sir() -> None:
     # TestResamplingLinear()
     # TestResamplingLog()
     # TestSirLikelihood()
-    TestObservationOperator()
+    #TestObservationOperator()
+    TestAuxPF()
+
+    return None
 
 def main():
 

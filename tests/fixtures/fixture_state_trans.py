@@ -8,14 +8,14 @@ import sys
 import numpy.typing as npt
 from astropy.units import Quantity
 
-# sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-from SIR_HUXt.code.cme_par_ens import CmeParEns
-from SIR_HUXt.code.to_state_vector import ToStateVector
-from SIR_HUXt.code.from_state_vector import FromStateVector
+sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
+from cme_par_ens import CmeParEns
+from to_state_vector import ToStateVector
+from from_state_vector import FromStateVector
 
-# sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests')
-from SIR_HUXt.tests.cme_par_array import CmeParArray
-from SIR_HUXt.tests.cme_par_dict import CmeParDict
+#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests')
+from cme_par_array import CmeParArray
+from cme_par_dict import CmeParDict
 
 @pytest.fixture
 def get_n_members() -> int:

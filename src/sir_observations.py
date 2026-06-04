@@ -30,7 +30,7 @@ class Observations:
             cme_fixed_duration:bool = None,
             fixed_duration: Quantity[u.s] = None,
             plot_huxt_output: bool=False,
-            rng: int=None
+            obs_rng_seed: int=None
     ) -> None:
         """
         Class to get observations for DA from
@@ -55,7 +55,7 @@ class Observations:
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
         :param plot_huxt_output: Boolean to determine whether to plot HUXt output at observation time
-        :param rng: Seed to use for random number generator
+        :param rng_seed: Seed to use for random number generator
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: Change such that observations are downloaded if need be
@@ -139,8 +139,13 @@ class Observations:
             else:
                 self.fixed_duration = fixed_duration
 
+            if obs_rng_seed is None:
+                self.rng: Generator = np.random.default_rng()
+            else:
+                self.rng: Generator = np.random.default_rng(obs_rng_seed)
+
             self.plot_huxt_output = plot_huxt_output
-            self.rng = rng
+
 
             self.observations = self.make_synthetic_obs()
 
@@ -156,10 +161,10 @@ class Observations:
         :return: synth_obs: List of synthetic observations
         """
 
-        if self.rng is None:
-            rng = np.random.default_rng()
-        else:
-            rng = self.rng
+        # if self.rng is None:
+        #     rng = np.random.default_rng()
+        # else:
+        #     rng = self.rng
 
         # Initialise an observation operator instance
         obs_op_obj = ObservationOperator(
@@ -181,11 +186,12 @@ class Observations:
         )
 
         unpert_obs = obs_op_obj.make_obs_op()
-
+        print(f"unpert_obs: {unpert_obs}")
         synth_obs = [
-            uo + rng.normal(loc=0, scale=self.obs_cov) for uo in unpert_obs
+            uo + self.rng.normal(loc=0, scale=self.obs_cov)
+            for uo in unpert_obs[0, :]
         ]
-
+        print(f"synth_obs: {synth_obs}")
         return synth_obs
 
     def read_obs_from_file(self) -> list[float]:

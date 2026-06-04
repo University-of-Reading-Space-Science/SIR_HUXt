@@ -14,7 +14,7 @@ from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
 
 from sir_observation_operator import ObservationOperator
-
+from sir_likelihood import LikelihoodFunction
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
 import seaborn as sns
@@ -116,14 +116,15 @@ class AuxPF:
         :return: cov_state: Covariance of the state vector
         :return: scaled_cov_state: Covariance of the state vector scaled by cov_shrink_fact2
         """
+
         cov_state: float | npt.NDArray = np.cov(self.state_vector, rowvar=False)
 
         if cov_state.ndim == 0:
             cov_state: npt.NDArray[float] = np.array([[cov_state]])
-        print(cov_state)
+        #print(cov_state)
 
         scaled_cov_state = cov_state * self.cov_shrink_fact2
-
+        #print(scaled_cov_state)
         return cov_state, scaled_cov_state
 
 
@@ -173,7 +174,7 @@ class AuxPF:
             # Compute weighted mean parameter
             mean_par: npt.NDArray[float] = np.average(self.state_vector, axis=0, weights=weights)
 
-        print(f"mean_par = {mean_par}")
+        #print(f"mean_par = {mean_par}")
 
         # Shrink towards the mean
         shrunk_pars = np.array([
@@ -226,8 +227,8 @@ class AuxPF:
         """
         init_astro_time = Time(self.huxt_init_time, format="datetime", scale="utc")
         obs_astro_time = Time(self.obs_time, format="datetime", scale="utc")
-
-        sim_time = (init_astro_time - obs_astro_time).to(u.day) + self.time_tolerance
+        #print(f"init_astro_time={init_astro_time}, obs_astro_time={obs_astro_time}")
+        sim_time = (obs_astro_time - init_astro_time).to(u.day) + self.time_tolerance
 
         return sim_time
 
@@ -246,6 +247,7 @@ class AuxPF:
 
         # If there are non-finite weights, set weight to zero (i.e. discard particle)
         weight_cond = ~np.isfinite(weights)
+        print(weight_cond)
         if np.sum(weight_cond) > 0:
             weights[weight_cond] = 0
 
@@ -295,7 +297,7 @@ class AuxPF:
         )
 
         hx = obs_op_class.make_obs_op()
-        print(f"hx={hx}")
+        #print(f"hx={hx}")
         return hx
 
 
@@ -305,7 +307,7 @@ class AuxPF:
         :param hx: Observation operator for a single ensemble member
         :return: likelihood: Likelihood valuefor a single ensemble member
         """
-        likelihood_class = Likelihood(
+        likelihood_class = LikelihoodFunction(
             obs=self.obs,
             obs_cov=self.obs_cov,
             hx=hx
@@ -321,7 +323,7 @@ class AuxPF:
         :param hx: Observation operator for a single ensemble member
         :return: likelihood: Likelihood valuefor a single ensemble member
         """
-        likelihood_class = Likelihood(
+        likelihood_class = LikelihoodFunction(
             obs=self.obs,
             obs_cov=self.obs_cov,
             hx=hx
@@ -365,7 +367,9 @@ class AuxPF:
 
 
     def resample_pars(self, ind_req: int) -> list[float]:
-        resampled_par = rng.normal(loc=self.shrunk_pars[ind_req, :], scale=self.scaled_cov_state)
+        resampled_par = self.rng.multivariate_normal(mean=self.shrunk_pars[ind_req, :], cov=self.scaled_cov_state)#[:, 0]
+        #print(resampled_par)
+#        sys.exit()
 
         return resampled_par
 
@@ -376,7 +380,7 @@ class AuxPF:
         :return: Updated cme_par_dict with parameters changed by Auxillary PF
         """
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
-        print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
+        #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
         obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
 
         # Calculate likelihoods for all ensemble members
@@ -384,9 +388,14 @@ class AuxPF:
             self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
             for i in range(self.n_members)
         ]
+        print(f"weights = {self.weights}")
+        print(f"max_weights = {np.max(self.weights)}")
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob(log_likelihood_shrunk_ens)
+        log_aux_prob = [
+            x if ~np.isnan(x) else -1e31 for x in log_aux_prob
+        ]
 
         # Get indices to resample
         resample_class = ResampleParsLogWeights(
@@ -394,7 +403,8 @@ class AuxPF:
             n_ensemble=self.n_members,
             rng=self.rng
         )
-        resample_ind: list[int] = resample_class.resample_ind()
+        resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
+        print(f"resample_ind = {resample_ind}")
 
         # Draw random samples from normal(shrunk_par, h^2 * cov_state)
         resample_pars: npt.NDArray[float] = np.array(
@@ -412,21 +422,31 @@ class AuxPF:
         self.cme_par_dict = from_state_class.cme_par_array_to_cme_par_dict()
 
         # Calculate the observation operator, hx, to calculate the posterior log likelihoods for each ensemble member
-        obs_op_post = self.get_observation_operator(self.state_vector_shrunk_dict)
+        obs_op_post = self.get_observation_operator(self.cme_par_dict)
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_post = [
             self.calculate_log_likelihood_single_ens(obs_op_post[i, :])
             for i in range(self.n_members)
         ]
-
-        weights_post = [
-            log_likelihood_post[i, :] - log_likelihood_shrunk_ens[j, :]
-            for i, j in enumerate(resample_ind)
+        log_weights_post = [
+            log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
+            for i in range(len(resample_ind))
         ]
 
+        # Normalise the log_weights
+        resamp_par_class = ResampleParsLogWeights(log_weights=log_weights_post, n_ensemble=self.n_members)
+        log_weights_post = resamp_par_class.norm_log_weights()
+        weights_post = [np.exp(w) for w in log_weights_post]
+
+        #print(f"log_weights_post = {log_weights_post}")
+        print(f"weights_post = {weights_post}")
+        print(f"max_weights_post = {np.max(weights_post)}")
+        print(sum(weights_post))
+
         # Update weights in cme_par_dict
-        self.cme_par_dict["log_weights"] = weights_post
+        self.cme_par_dict["weight"] = weights_post
+        self.cme_par_dict["log_weight"] = log_weights_post
 
         return self.cme_par_dict
 
@@ -617,7 +637,7 @@ class AuxPF:
             log_rand_value = np.log(rand_value)
 
             # print(f'log_rand_value: {log_rand_value}')
-            # Find the index i, such that logCDF[i-1] < log(rand_value) \leq logCDF[i]
+            # Find the index i, such that logCDF[i-1] < log(rand_value) <= logCDF[i]
             if log_rand_value <= logCDF[0]:
                 indReq = 0
             elif log_rand_value > logCDF[-1]:

@@ -1,7 +1,7 @@
 import pytest
 import sys
 
-sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
+#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
 from cme_par_ens import CmeParEns
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector

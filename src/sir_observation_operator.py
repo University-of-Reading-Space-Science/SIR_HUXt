@@ -188,7 +188,7 @@ class ObservationOperator:
         self.obs_time_in_jd = Time(self.obs_time_in_datetime, format='datetime').jd
 
         # Define all variables required to initialise HUXt are provided
-        print(cme_par_dict)
+        #print(cme_par_dict)
         assert (all([cme_par_dict, obs_cov]) is not None)
         assert all(p in cme_par_dict.keys() for p in required_dict_keys())
 
@@ -196,7 +196,7 @@ class ObservationOperator:
         self.obs_cov = obs_cov
 
         self.n_members = self.cme_par_dict["n_members"]
-        print(f"self.n_members = {self.n_members}")
+        #print(f"self.n_members = {self.n_members}")
         # Initialise default huxt setup
         if huxt_init_time is None:
             self.huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
@@ -293,7 +293,7 @@ class ObservationOperator:
         ]
 
         cme_speed: list[Quantity[u.km / u.s]] = cme_speed * u.km / u.s
-        print(f"len(cme_time_to_rmin) = {len(cme_time_to_rmin)}")
+        #print(f"len(cme_time_to_rmin) = {len(cme_time_to_rmin)}")
         cme_launch_time: list[Quantity[u.s]] = [
             cme_time_to_rmin[i] + seconds_to_cme[i]
             for i in range(self.n_members)
@@ -470,7 +470,6 @@ class ObservationOperator:
         )
 
         # Run CME through HUXt
-        cme.v = 495 * u.km / u.s
         model.solve([cme])
 
         cme_member: H.ConeCME = model.cmes[0]
@@ -536,7 +535,7 @@ class ObservationOperator:
                 ind_req: int = np.argmin(
                     abs(cme_flank["time"].values - Time(self.obs_time_in_datetime).jd)
                 )
-                print(f"ind_req={ind_req}")
+                #print(f"ind_req={ind_req}")
                 obs_op[i, :] = [cme_flank["el"].values[ind_req]]
 
             elif type_list_datetime:
@@ -550,7 +549,7 @@ class ObservationOperator:
                     int(np.argmin(np.round(abs(cme_flank["time"].values - obs_time), 9)))
                     for obs_time in obs_times_in_jd
                 ]
-                print(f"inds_req={inds_req}")
+                #print(f"inds_req={inds_req}")
                 obs_op[i, :] = [
                     cme_flank["el"].values[j] for j in inds_req
                 ]

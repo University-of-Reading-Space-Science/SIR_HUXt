@@ -17,19 +17,55 @@ class LikelihoodFunction:
            should be precomputed previous to calculating the likelihood function
         """
 
-        # If a list is providedto the class, convert it to an array
-        if type(obs) is list:
-            self.obs: npt.NDArray[float] = np.array(obs)
+        # If a list is provided to the class, convert it to an array
+        if isinstance(obs, list):
+            if len(obs) == 1:
+                try:
+                    obs[0].item()
+                except:
+                    self.obs: float = obs[0]
+                else:
+                    self.obs: float = obs[0].item()
+            else:
+                self.obs: npt.NDArray[float] = np.array(obs)
+        elif (isinstance(obs, np.ndarray)) and (np.ndim(obs) == 1):
+            self.obs: float = obs.item()
+        elif isinstance(obs, np.float64):
+            self.obs: float = obs.item()
         else:
             self.obs: npt.NDArray[float] | float = obs
 
-        if type(obs_cov) is list:
-            self.obs_cov: npt.NDArray[float] = np.array(obs_cov)
+        if isinstance(obs_cov, list):
+            if len(obs_cov) == 1:
+                try:
+                    obs_cov[0].item()
+                except:
+                    self.obs_cov: float = obs_cov[0]
+                else:
+                    self.obs_cov: float = obs_cov[0].item()
+            else:
+                self.obs_cov: npt.NDArray[float] = np.array(obs_cov)
+        elif (isinstance(obs_cov, np.ndarray)) and (np.ndim(obs_cov) == 1):
+            self.obs_cov: float = obs_cov.item().astype(float)
+        elif isinstance(obs_cov, np.float64):
+            self.obs_cov: float = obs_cov.item()
         else:
             self.obs_cov: npt.NDArray[float] | float = obs_cov
 
-        if type(hx) is list:
-            self.hx: npt.NDArray[float] = np.array(hx)
+        if isinstance(hx, list):
+            if len(hx) == 1:
+                try:
+                    hx[0].item()
+                except:
+                    self.hx: float = hx[0]
+                else:
+                    self.hx: float = hx[0].item()
+            else:
+                self.hx: npt.NDArray[float] = np.array(hx)
+        elif (isinstance(hx, np.ndarray)) and (np.ndim(hx) == 1):
+            self.hx: float = hx.item()
+        elif isinstance(hx, np.float64):
+            self.hx: float = hx.item()
         else:
             self.hx: npt.NDArray[float] | float = hx
 
@@ -52,15 +88,15 @@ class LikelihoodFunction:
 
             # If we only have 1 dimension arrays, set hx, obs and obs_cov to floats
             if np.ndim(self.hx) == 1:
-                print(f"hx={self.hx}")
+                #print(f"hx={self.hx}")
                 self.hx: float = hx[0]
 
             if np.ndim(self.obs) == 1:
-                print(f"obs={self.obs}")
+                #print(f"obs={self.obs}")
                 self.obs: float = obs[0]
 
             if np.ndim(self.obs_cov) == 1:
-                print(f"obs_cov={self.obs_cov}")
+                #print(f"obs_cov={self.obs_cov}")
                 self.obs_cov: float = obs_cov[0]
 
     def log_likelihood_gaussian(self) -> float:
@@ -102,6 +138,26 @@ class LikelihoodFunction:
 
         # Calculate the likelihood function by taking the exponent
         likelihood: float = np.exp(log_likelihood)
+
+        return likelihood
+
+    def make_log_likelihood(self) -> float:
+        """
+        make_log_likelihood: The purpose of this definition is to calculate the logarithm
+         of the likelihood function
+        :return: log_likelihood: The logarithm of the likelihood function
+        """
+        log_likelihood: float = self.log_likelihood_gaussian()
+
+        return log_likelihood
+
+
+    def make_likelihood(self) -> float:
+        """
+        make_likelihood: The purpose of this definition is to calculate the likelihood function
+        :return: likelihood: The likelihood function
+        """
+        likelihood: float = self.likelihood_gaussian()
 
         return likelihood
 

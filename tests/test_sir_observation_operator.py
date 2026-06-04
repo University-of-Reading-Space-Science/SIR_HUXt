@@ -22,8 +22,8 @@ from astropy.units import Quantity
 from astropy.tests.helper import assert_quantity_allclose
 
 from astropy.time import Time
-from SIR_HUXt.code.sir_observation_operator import ObservationOperator
-from SIR_HUXt.tests.expected_obs_op import ExpectedObservationOperator, ExpectedCMEFlankSingle
+from sir_observation_operator import ObservationOperator
+from tests.expected_obs_op import ExpectedObservationOperator, ExpectedCMEFlankSingle
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
 import seaborn as sns
@@ -280,7 +280,7 @@ class TestObservationOperator:
             return mock_cme_values[np.mod(mock_cme.call_count - 1, len(mock_cme_values))]
         mock_cme.side_effect = mock_cme_side_effect
 
-        mock_flank = mocker.patch("SIR_HUXt.code.sir_observation_operator.Observer.compute_flank_profile")
+        mock_flank = mocker.patch("sir_observation_operator.Observer.compute_flank_profile")
         mock_flank_values = [init_test_cme_flanks[i] for i in range(n_ensemble)]
 
         def mock_flank_side_effect(*args, **kwargs):

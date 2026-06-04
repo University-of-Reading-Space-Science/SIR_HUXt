@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from SIR_HUXt.code.sir_resampling_log_weights import ResampleParsLogWeights, jacobian_log
+from sir_resampling_log_weights import ResampleParsLogWeights, jacobian_log
 
 
 def list_log(list):

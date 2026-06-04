@@ -31,7 +31,12 @@ def plot_par_values_over_single_run(
     xPlot = ds[xVarName][:].values
 
     yTrue = yTruth
-    yPlot = ds[yVarName][runNo, :, :].values
+    try:
+        ds[yVarName][runNo, :, :].values
+    except:
+        yPlot = ds[yVarName][:, :].values
+    else:
+        yPlot = ds[yVarName][runNo, :, :].values
     yMean = np.median(yPlot, axis=1)
 
     nEns = len(ds["ens_no"].values)
@@ -43,6 +48,8 @@ def plot_par_values_over_single_run(
     ax.plot(xPlot, yMean, color='red', label=f"Median {parNameLegend} over model runs")
     ax.plot([xPlot.min(), xPlot.max()], [yTrue, yTrue], color='k', linestyle='dashed', label=f"True {parNameLegend}")
     ax.legend()
+    ax.set_title(f"Run_no = {runNo}")
+    ax.set_xlim(0, 24)
     ax.set_xlabel(f"{xLabel}")
     ax.set_ylabel(f"{parNameLegend} ({parUnits})")
     plt.show()
@@ -122,35 +129,37 @@ def plot_par_histograms_over_mult_runs(
 
 
 def main():
-    nRuns = 100
+    nRuns = 41
     vTruth = 495
     widthTruth = 37.4
     lonTruth = 0
 
     #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
+
     baseFilePath = os.path.join(
-        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "figures", "indep_cov",
-        "truth_20080101-0000_495_37.4_0_0_0", "prior_20080101-0100_495_37.4_0_0_0", "nEns-50_8_300.0 deg_0.0 deg"
+        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "24_obs",# "New folder",
+        "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     )
 
     # Read in all nc files and concatenate them into a single xarray object
-    for runNo in range(nRuns):
+    for ir, runNo in enumerate([14]):#range(nRuns)):
         print(runNo)
         filePath = os.path.join(
-            baseFilePath, f"runNo_{runNo:04d}", "cme_pars.nc"
+            baseFilePath, f"run_{runNo:03d}", "cme_pars.nc"
         )
         with xr.load_dataset(filePath) as dsTemp:
             dsTemp.expand_dims(dim={"run": 1})
             dsTemp["run"] = (("run",), [runNo])
 
-            if runNo == 0:
+            if ir == 0:
                 ds = dsTemp.copy()
             else:
                 ds = xr.concat([ds, dsTemp], "run")
 
-    print(ds)
+        print(ds)
 
-    """for ir in range(nRuns):
+    for ir, runNo in enumerate([14]):#range(nRuns)):
+
         plot_par_values_over_single_run(
             ds,
             "obs_no",
@@ -158,7 +167,7 @@ def main():
             vTruth,
             "Observation number",
             "CME speed",
-            runNo=ir,
+            runNo=runNo,
             parUnits="km/s"
         )
         plot_par_values_over_single_run(
@@ -168,7 +177,7 @@ def main():
             widthTruth,
             "Observation number",
             "CME Width",
-            runNo=ir,
+            runNo=runNo,
             parUnits="$^\circ$"
         )
         plot_par_values_over_single_run(
@@ -178,10 +187,10 @@ def main():
             lonTruth,
             "Observation number",
             "CME Longitude",
-            runNo=ir,
+            runNo=runNo,
             parUnits="$^\circ$"
         )
-"""
+    # sys.exit()
     colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
     plot_par_values_over_mult_runs(
         ds,

@@ -19,7 +19,7 @@ import sunpy.coordinates.sun as sn
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
-from SIR_HUXt.code.sir_observation_operator import ObservationOperator
+from sir_observation_operator import ObservationOperator
 
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns

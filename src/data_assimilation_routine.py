@@ -96,9 +96,9 @@ def initialise_fg_cme_parameters():
     # Initialise CME parameters
     fg_cme_t_init: datetime.datetime = datetime.datetime(2008, 1, 1, 1, 0, 0)
     fg_cme_t_init_str: str = fg_cme_t_init.strftime("%Y%m%d-%H%M")
-    fg_cme_speed: float = 495
-    fg_cme_width: float = 37.4
-    fg_cme_lon: float = 0
+    fg_cme_speed: float = 470
+    fg_cme_width: float = 37.0
+    fg_cme_lon: float = -4
     fg_cme_lat: float = 0
     fg_cme_thick: float = 0
 
@@ -149,19 +149,20 @@ def initialise_prior_cme_sd():
 
 
 def initialise_observation_parameters():
-    n_obs: int = 8
+    n_obs: int = 24
 
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
 
-    obs_cov: float = 0.3  # * np.eye(len(obs))
+    obs_cov: list[float] = [0.15]  # * np.eye(len(obs))
 
     obs_times: list[datetime.datetime] = [
-        datetime.datetime(2008, 1, 1, 9, 0, 0) + datetime.timedelta(hours=3 * i)
+        datetime.datetime(2008, 1, 1, 9, 0, 0) + datetime.timedelta(hours=1 * i)
         for i in range(1, 1 + n_obs)
     ]
 
     use_synthetic_obs: bool = True
+    obs_rng_seed: int = 4096
     obs_filenames: list[str] = None
 
     obs_par_dict = {
@@ -171,29 +172,27 @@ def initialise_observation_parameters():
         "obs_cov": obs_cov,
         "obs_times": obs_times,
         "use_synthetic_obs": use_synthetic_obs,
-        "obs_filenames": obs_filenames
+        "obs_filenames": obs_filenames,
+        "obs_rng_seed": obs_rng_seed,
     }
 
     return obs_par_dict
 
 
 def initialise_da_parameters():
-    n_members: int = 5
+    n_members: int = 50
     n_runs: int = 1
 
     delta_aux_pf: float = 0.98
-    pars_in_state_vector: list[str] = ["v"]
+    pars_in_state_vector: list[str] = ["v", "width", "lon"]
     time_tolerance: Quantity[u.day] = 0.5 * u.day
-
-    rng_seed: int = 42
 
     da_par_dict = {
         "n_members": n_members,
         "n_runs": n_runs,
         "delta_aux_pf": delta_aux_pf,
         "pars_in_state": pars_in_state_vector,
-        "time_tolerance": time_tolerance,
-        "rng_seed": rng_seed
+        "time_tolerance": time_tolerance
     }
 
     return da_par_dict
@@ -223,6 +222,7 @@ class RunDataAssimilationRoutine:
         self.obs_times: list[datetime.datetime] = obs_par_dict["obs_times"]
         self.use_synthetic_obs: bool = obs_par_dict["use_synthetic_obs"]
         self.obs_filenames: list[str] = obs_par_dict["obs_filenames"]
+        self.obs_rng_seed: int = obs_par_dict["obs_rng_seed"]
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
         if self.use_synthetic_obs or (self.obs_filenames is None):
@@ -267,7 +267,31 @@ class RunDataAssimilationRoutine:
         self.delta_aux_pf: float = da_par_dict["delta_aux_pf"]
         self.pars_in_state: list[str] = da_par_dict["pars_in_state"]
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
-        self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
+        #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
+
+
+    def generate_random_seed(
+            self,
+            add_const: int=None,
+            mult_const: int=None,
+            run_no: int=None
+    ):
+        """
+        Function to generate random seed for each model run
+        :return: random_seed: Random seed for each model run
+        """
+        if add_const is None:
+            add_const = 42
+
+        if mult_const is None:
+            mult_const = 10000
+
+        if run_no is None:
+            run_no = 0
+
+        random_seed = add_const + (mult_const * run_no)
+
+        return random_seed
 
 
     def make_output_dir(self, cme_par_dict: CmeParEns, run_no: int):
@@ -277,7 +301,7 @@ class RunDataAssimilationRoutine:
         """
         base_dir = os.path.join(
             "C:\\", "Users", "ss905122",
-            "PycharmProjects", "SIR_HUXt", "output"
+            "PycharmProjects", "SIR_HUXt", "output", "24_obs"
         )
         truth_dir = (
             f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
@@ -292,7 +316,7 @@ class RunDataAssimilationRoutine:
         run_dir = f"run_{run_no:03d}"
 
         output_dir = os.path.join(
-            base_dir, truth_dir, prior_dir, run_dir
+            base_dir, truth_dir, prior_dir, f"{self.delta_aux_pf}", run_dir
         )
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -323,29 +347,30 @@ class RunDataAssimilationRoutine:
             cme_init_rad=self.cme_init_rad,
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
-            plot_huxt_output=False
+            plot_huxt_output=False,
+            obs_rng_seed=self.obs_rng_seed,
         )
 
         return obs_class.observations
 
 
-    def initialise_mean_cme_pars(self):
+    def initialise_mean_cme_pars(self, rng):
         #######################################################################
         # Initialise CME parameters
         mean_cme_t_init = self.fg_mean_cme_t_init + datetime.timedelta(
-            seconds=self.fg_sd_cme_t_init * self.rng.uniform(low=-1, high=1)
+            seconds=self.fg_sd_cme_t_init * rng.uniform(low=-1, high=1)
         )
         mean_cme_t_init_str = mean_cme_t_init.strftime("%Y%m%d-%H%M")
         mean_cme_speed = self.fg_mean_cme_speed + (
-            self.fg_sd_cme_speed * self.rng.uniform(low=-1, high=1)
+            self.fg_sd_cme_speed * rng.uniform(low=-1, high=1)
         )
         mean_cme_width = self.fg_mean_cme_width + (
-                self.fg_sd_cme_width * self.rng.uniform(low=-1, high=1)
+                self.fg_sd_cme_width * rng.uniform(low=-1, high=1)
         )
-        mean_cme_lon = self.fg_mean_cme_lon + (self.fg_sd_cme_lon * self.rng.uniform(low=-1, high=1))
-        mean_cme_lat = self.fg_mean_cme_lat + (self.fg_sd_cme_lat * self.rng.uniform(low=-1, high=1))
+        mean_cme_lon = self.fg_mean_cme_lon + (self.fg_sd_cme_lon * rng.uniform(low=-1, high=1))
+        mean_cme_lat = self.fg_mean_cme_lat + (self.fg_sd_cme_lat * rng.uniform(low=-1, high=1))
         mean_cme_thick = self.fg_mean_cme_thick + (
-                self.fg_sd_cme_thick * self.rng.uniform(low=-1, high=1)
+                self.fg_sd_cme_thick * rng.uniform(low=-1, high=1)
         )
 
         mean_cme_par_dict = {
@@ -360,9 +385,9 @@ class RunDataAssimilationRoutine:
         return mean_cme_par_dict
 
 
-    def make_cme_par_dict(self):
+    def make_cme_par_dict(self, rng):
         # Get mean CME parameters
-        mean_cme_par_dict = self.initialise_mean_cme_pars()
+        mean_cme_par_dict = self.initialise_mean_cme_pars(rng=rng)
         mean_cme_t_init = (
             mean_cme_par_dict["mean_cme_t_init"] - self.huxt_init_time
         ).total_seconds()
@@ -381,52 +406,87 @@ class RunDataAssimilationRoutine:
         high_cme_t_init = mean_cme_t_init + self.prior_sd_t_init
         cme_par_dict["t_init"] = [
             self.huxt_init_time + datetime.timedelta(
-                seconds=self.rng.uniform(low=low_cme_t_init, high=high_cme_t_init)
+                seconds=rng.uniform(low=low_cme_t_init, high=high_cme_t_init)
             ) for _ in range(self.n_members)
         ]
 
         low_cme_speed = (1 - self.prior_sd_speed) * mean_cme_speed
         high_cme_speed = (1 + self.prior_sd_speed) * mean_cme_speed
         cme_par_dict["v"] = [
-            self.rng.uniform(low=low_cme_speed, high=high_cme_speed) for _ in range(self.n_members)
+            rng.uniform(low=low_cme_speed, high=high_cme_speed) for _ in range(self.n_members)
         ] * u.km / u.s
 
         low_cme_width = mean_cme_width - self.prior_sd_width
         high_cme_width = mean_cme_width + self.prior_sd_width
         cme_par_dict["width"] = [
-            self.rng.uniform(low=low_cme_width, high=high_cme_width) for _ in range(self.n_members)
+            rng.uniform(low=low_cme_width, high=high_cme_width) for _ in range(self.n_members)
         ] * u.deg
 
         low_cme_lon = mean_cme_lon - self.prior_sd_lon
         high_cme_lon = mean_cme_lon + self.prior_sd_lon
         cme_par_dict["lon"] = [
-            self.rng.uniform(low=low_cme_lon, high=high_cme_lon) for _ in range(self.n_members)
+            rng.uniform(low=low_cme_lon, high=high_cme_lon) for _ in range(self.n_members)
         ] * u.deg
 
         low_cme_lat = mean_cme_lat - self.prior_sd_lat
         high_cme_lat = mean_cme_lat + self.prior_sd_lat
         cme_par_dict["lat"] = [
-            self.rng.uniform(low=low_cme_lat, high=high_cme_lat) for _ in range(self.n_members)
+            rng.uniform(low=low_cme_lat, high=high_cme_lat) for _ in range(self.n_members)
         ] * u.deg
 
         low_cme_thick = mean_cme_thick - self.prior_sd_thick
         high_cme_thick = mean_cme_thick + self.prior_sd_thick
         cme_par_dict["thick"] = [
-            self.rng.uniform(low=low_cme_thick, high=high_cme_thick) for _ in range(self.n_members)
+            rng.uniform(low=low_cme_thick, high=high_cme_thick) for _ in range(self.n_members)
         ] * u.solRad
 
         return cme_par_dict
 
 
-    def run_data_assimilation(self):
-        for m in range(self.n_runs):
-            cme_par_dict = self.make_cme_par_dict()
+    def run_data_assimilation(self, run_start=0):
+        """
+        Function to run the data assimilation routine
+        :return: None
+        """
+        for run_no in range(run_start, run_start + self.n_runs):
+            print(f"run_no = {run_no}")
+
+            # Initialise random generator
+            rand_seed = self.generate_random_seed(
+                add_const=42,
+                mult_const=10000,
+                run_no=run_no
+            )
+            rng: Generator = np.random.default_rng(rand_seed)
+
+            cme_par_dict = self.make_cme_par_dict(rng=rng)
+            cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
+
+            # Save prior state
+            cme_saved_pars[0, :, 0] = [
+                (
+                        cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
+                ).total_seconds()
+                for i in range(self.n_members)
+            ]
+            cme_saved_pars[0, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
+            cme_saved_pars[0, :, 2] = cme_par_dict["width"].to(u.deg).value
+
+            cme_saved_pars[0, :, 3] = cme_par_dict["lon"].to(u.deg).value
+            lon_cond = cme_saved_pars[0, :, 3] > 180
+            cme_saved_pars[0, lon_cond, 3] = (
+                    cme_saved_pars[0, lon_cond, 3] - 360
+            )
+
+            cme_saved_pars[0, :, 4] = cme_par_dict["lat"].to(u.deg).value
+            cme_saved_pars[0, :, 5] = cme_par_dict["thick"].to(u.solRad).value
+            cme_saved_pars[0, :, 6] = cme_par_dict["log_weight"]
 
             # Make output directory
             output_dir = self.make_output_dir(
-                cme_par_dict=cme_par_dict, run_no=m
+                cme_par_dict=cme_par_dict, run_no=run_no
             )
-
+            #print(f"obs={self.observations}")
             for yi, obs in enumerate(self.observations):
                 aux_pf_class = AuxPF(
                     cme_par_dict=cme_par_dict,
@@ -445,7 +505,7 @@ class RunDataAssimilationRoutine:
                     delta_aux_pf=self.delta_aux_pf,
                     r_min=self.r_min,
                     cme_init_rad=self.cme_init_rad,
-                    rng=self.rng
+                    rng=rng
                 )
 
                 cme_par_dict = aux_pf_class.aux_pf()
@@ -455,7 +515,7 @@ class RunDataAssimilationRoutine:
                     (
                         cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
                     ).total_seconds()
-                    for i in range(n_ens)
+                    for i in range(self.n_members)
                 ]
                 # print(cme_par_dict['width'])
                 cme_saved_pars[yi + 1, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
@@ -469,7 +529,14 @@ class RunDataAssimilationRoutine:
 
                 cme_saved_pars[yi + 1, :, 4] = cme_par_dict["lat"].to(u.deg).value
                 cme_saved_pars[yi + 1, :, 5] = cme_par_dict["thick"].to(u.solRad).value
-                print(cme_saved_pars[yi + 1, :, :])
+                cme_saved_pars[yi + 1, :, 6] = cme_par_dict["log_weight"]
+
+                # for par_ind in [1, 2, 3]:
+                #     print(f"cme_saved_pars[{yi + 1}] = {cme_saved_pars[yi + 1, :, par_ind]}")
+
+            for par_ind in [1, 2, 3]:
+                print(f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}")
+
             # Save cme_parameters into a .nc file
             # Make an xarray object
             cme_par_ds = xr.Dataset(
@@ -495,10 +562,12 @@ class RunDataAssimilationRoutine:
             outParFile = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode='w')
 
+        return None
+
 
 def main():
     run_da_class = RunDataAssimilationRoutine()
-    run_da_class.run_data_assimilation()
+    run_da_class.run_data_assimilation(run_start=14)
 
     return None
 

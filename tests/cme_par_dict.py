@@ -5,7 +5,7 @@ import datetime
 import sys
 from astropy.units import Quantity
 
-sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
+#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
 from init_sir import initialise_cme_parameter_ensemble_dict
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys

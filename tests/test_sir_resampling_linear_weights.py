@@ -1,6 +1,6 @@
 import pytest
 
-from SIR_HUXt.code.sir_resampling_linear_weights import ResampleParsLinearWeights
+from sir_resampling_linear_weights import ResampleParsLinearWeights
 
 
 class TestResamplingLinear:

@@ -41,8 +41,8 @@ class FromStateVector:
         else:
             self.weights = weights
 
-        print(f"np.shape(state_ens) = {np.shape(state_ens)}")
-        print(f"(self.n_ensemble, self.n_pars) = {(self.n_ensemble, self.n_pars)}")
+        #print(f"np.shape(state_ens) = {np.shape(state_ens)}")
+        #print(f"(self.n_ensemble, self.n_pars) = {(self.n_ensemble, self.n_pars)}")
 
         assert np.shape(state_ens) == (self.n_ensemble, self.n_pars)
         self.state_ens: npt.NDArray[float] = state_ens
@@ -66,11 +66,11 @@ class FromStateVector:
         """
         assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
 
-        print(f"state_ens={self.state_ens}")
+        #f"state_ens={self.state_ens}")
         for i, ip in enumerate(self.pars_in_state_vector):
             if ip in required_dict_keys():
                 cme_par_ind_req = cme_par_get_indices(ip)
-                print(f"i={i}, ip={ip}: cme_par_ind_req={cme_par_ind_req}")
+                #print(f"i={i}, ip={ip}: cme_par_ind_req={cme_par_ind_req}")
                 self.cme_par_array[:, cme_par_ind_req] = self.state_ens[:, i]
 
         return self.cme_par_array
