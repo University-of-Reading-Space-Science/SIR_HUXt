@@ -77,7 +77,7 @@ class ResampleParsLinearWeights:
 
         # Calculate CDF all weights
         cdf_val: list[float] = self.make_cdf()
-        print(f"pos={positions}")
+        #print(f"pos={positions}")
         resamp_ind: list[int] = [
             bisect.bisect_left(cdf_val, x) for x in positions
         ]

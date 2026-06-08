@@ -27,7 +27,7 @@ class ToStateVector:
             self.pars_in_state_vector: list[str] = pars_in_state_vector
 
         self.n_ensemble: int = self.cme_par_dict["n_members"]
-        print(self.pars_in_state_vector)
+        #print(self.pars_in_state_vector)
         self.n_pars: int = len(self.pars_in_state_vector)
 
         if cme_par_array is None:

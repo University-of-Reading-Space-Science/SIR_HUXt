@@ -186,12 +186,12 @@ class Observations:
         )
 
         unpert_obs = obs_op_obj.make_obs_op()
-        print(f"unpert_obs: {unpert_obs}")
+        #print(f"unpert_obs: {unpert_obs}")
         synth_obs = [
             uo + self.rng.normal(loc=0, scale=self.obs_cov)
             for uo in unpert_obs[0, :]
         ]
-        print(f"synth_obs: {synth_obs}")
+        #print(f"synth_obs: {synth_obs}")
         return synth_obs
 
     def read_obs_from_file(self) -> list[float]:

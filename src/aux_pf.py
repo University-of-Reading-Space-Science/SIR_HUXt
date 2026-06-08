@@ -247,7 +247,7 @@ class AuxPF:
 
         # If there are non-finite weights, set weight to zero (i.e. discard particle)
         weight_cond = ~np.isfinite(weights)
-        print(weight_cond)
+        #print(weight_cond)
         if np.sum(weight_cond) > 0:
             weights[weight_cond] = 0
 
@@ -374,10 +374,53 @@ class AuxPF:
         return resampled_par
 
 
+    def calc_ess_lin_weights(self, weight_in):
+        """
+        Function to calculate the Effective Sample Size with linear weights
+        :return: ess: Effective Sample Size
+        """
+        numer = np.sum(weight_in) ** 2
+        denom = np.sum([w * w for w in weight_in])
+
+        ess = numer / denom
+
+        return ess
+
+
+    def log_ess_log_weights(self, log_weight_in):
+        """
+        Function to calculate the Effective Sample Size of Aux-PF
+        :return: log_ess: Logarithm of Effective Sample Size
+        """
+        # Calculate the logarithm of the Effective Sample Size
+        term1 = 2 * jacobian_log(log_weight_in)
+        term2 = jacobian_log(2 * log_weight_in)
+
+        log_ess = term1 - term2
+
+        return log_ess
+
+
+    def calc_ess_log_weights(self, log_weight_in):
+        """
+        Function to calculate the Effective Sample Size with logarithmic weights
+        :return: ess: Effective Sample Size
+        """
+        # Normalise weights
+        log_weight_in = log_weight_in - jacobian_log(log_weight_in)
+
+        # Calculate the effective sample size
+        log_ess = self.log_ess_log_weights(log_weight_in=log_weight_in)
+        ess = np.exp(log_ess)
+
+        return ess
+
+
     def aux_pf(self):
         """
         Function to perform the auxillary particle filter routine
         :return: Updated cme_par_dict with parameters changed by Auxillary PF
+        :TODO: Add ESS calculation and print out
         """
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
@@ -388,8 +431,11 @@ class AuxPF:
             self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
             for i in range(self.n_members)
         ]
-        print(f"weights = {self.weights}")
-        print(f"max_weights = {np.max(self.weights)}")
+        #print(f"weights = {self.weights}")
+        #print(f"max_weights = {np.max(self.weights)}")
+        # Calculate the effective sample size from the prior weights
+        ess_prior = self.calc_ess_log_weights(self.log_weights)
+        print(f"ess_prior = {ess_prior}")
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob(log_likelihood_shrunk_ens)
@@ -404,7 +450,7 @@ class AuxPF:
             rng=self.rng
         )
         resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
-        print(f"resample_ind = {resample_ind}")
+        #print(f"resample_ind = {resample_ind}")
 
         # Draw random samples from normal(shrunk_par, h^2 * cov_state)
         resample_pars: npt.NDArray[float] = np.array(
@@ -440,13 +486,17 @@ class AuxPF:
         weights_post = [np.exp(w) for w in log_weights_post]
 
         #print(f"log_weights_post = {log_weights_post}")
-        print(f"weights_post = {weights_post}")
-        print(f"max_weights_post = {np.max(weights_post)}")
-        print(sum(weights_post))
+        #print(f"weights_post = {weights_post}")
+        #print(f"max_weights_post = {np.max(weights_post)}")
+        #print(sum(weights_post))
 
         # Update weights in cme_par_dict
         self.cme_par_dict["weight"] = weights_post
         self.cme_par_dict["log_weight"] = log_weights_post
+
+        # Calculate the effective sample size from the posterior weights
+        ess_post_log = self.calc_ess_log_weights(log_weights_post)
+        print(f"ess_post = {ess_post_log}")
 
         return self.cme_par_dict
 

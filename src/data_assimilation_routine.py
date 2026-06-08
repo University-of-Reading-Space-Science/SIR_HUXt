@@ -149,7 +149,7 @@ def initialise_prior_cme_sd():
 
 
 def initialise_observation_parameters():
-    n_obs: int = 24
+    n_obs: int = 4
 
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
@@ -299,10 +299,12 @@ class RunDataAssimilationRoutine:
         Function to make the output directory
         :return: out_dir: Output directory
         """
-        base_dir = os.path.join(
-            "C:\\", "Users", "ss905122",
-            "PycharmProjects", "SIR_HUXt", "output", "24_obs"
-        )
+        current_dir = os.path.dirname(__file__)
+        parent_dir = os.path.join(current_dir, "..")
+        abs_par_dir = os.path.abspath(parent_dir)
+
+        base_dir = os.path.join(abs_par_dir, "output", "24_obs")
+
         truth_dir = (
             f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
             f"_{self.true_cme_par_dict["lon"].value}_{self.true_cme_par_dict["lat"].value}"
@@ -488,6 +490,7 @@ class RunDataAssimilationRoutine:
             )
             #print(f"obs={self.observations}")
             for yi, obs in enumerate(self.observations):
+                print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
                 aux_pf_class = AuxPF(
                     cme_par_dict=cme_par_dict,
                     obs=obs,
@@ -567,7 +570,7 @@ class RunDataAssimilationRoutine:
 
 def main():
     run_da_class = RunDataAssimilationRoutine()
-    run_da_class.run_data_assimilation(run_start=14)
+    run_da_class.run_data_assimilation(run_start=0)
 
     return None
 
