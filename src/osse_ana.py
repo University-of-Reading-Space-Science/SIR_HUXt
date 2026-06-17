@@ -1,5 +1,6 @@
 import glob
 import os
+import sys
 
 from IPython.core.pylabtools import figsize
 from astropy.time import Time
@@ -15,6 +16,7 @@ import scipy.stats as st
 
 import sunpy.coordinates.sun as sn
 import seaborn as sns
+import pandas as pd
 import holoviews as hv
 import colorcet as cc
 from colorcet.plotting import sine_combs
@@ -128,8 +130,64 @@ def plot_par_histograms_over_mult_runs(
     return None
 
 
+def plot_sample_cov(
+        ds, run_no, obs_no, vars_req=["v", "lon", "width"]
+):
+    # Get number of ensemble members
+    n_runs = len(ds["run"][:])
+    n_ens = len(ds["ens_no"][:])
+    n_var_req = len(vars_req)
+
+    if run_no == "all":
+        # Initialise an array to hold ensemble at run_no and obs_no specified
+        var_array = np.zeros((n_ens * n_runs, n_var_req))
+
+        # Get relevant run and obs_no required
+        for iv, v_name in enumerate(vars_req):
+            try:
+                var_array[:, iv] = ds[v_name][:, obs_no, :].values.flatten()
+            except:
+                var_array[:, iv] = ds[v_name][obs_no, :].values
+            else:
+                var_array[:, iv] = ds[v_name][:, obs_no, :].values.flatten()
+        df = pd.DataFrame(data=var_array, columns=vars_req, index=range(n_ens * n_runs))
+    else:
+        # Initialise an array to hold ensemble at run_no and obs_no specified
+        var_array = np.zeros((n_ens, n_var_req))
+
+        # Get relevant run and obs_no required
+        for iv, v_name in enumerate(vars_req):
+            try:
+                var_array[:, iv] = ds[v_name][run_no, obs_no, :].values
+            except:
+                var_array[:, iv] = ds[v_name][obs_no, :].values
+            else:
+                var_array[:, iv] = ds[v_name][run_no, obs_no, :].values
+
+        df = pd.DataFrame(data=var_array, columns=vars_req, index=range(n_ens))
+
+    # Calculate covariance
+    print(df)
+    # Basic correlogram
+    # sns.pairplot(df)
+    # plt.show()
+
+    fig, ax = plt.subplots(1, 1)
+    sns.heatmap(df.corr(), annot=True, cmap=plt.cm.RdBu_r, vmin=-1, vmax=1, ax=ax)
+    ax.set_title(f"Correlation matrix for obs_no = {obs_no}, run_no = {run_no}")
+    plt.show()
+
+    # sns.heatmap(df.cov(), annot=True, cmap=plt.cm.RdBu_r, vmin=-1600, vmax=1600)
+    # plt.show()
+    #cov_var_array = np.cov(var_array, rowvar=False)
+
+    #print(cov_var_array)
+
+    return None
+
+
 def main():
-    nRuns = 41
+    nRuns = 1
     vTruth = 495
     widthTruth = 37.4
     lonTruth = 0
@@ -137,12 +195,13 @@ def main():
     #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
     baseFilePath = os.path.join(
-        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "24_obs",# "New folder",
+        "C:\\", "Users", "ss905122", "PycharmProjects",# "SIR_HUXt", "output",
+        "24_obs",# "New folder",
         "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     )
 
     # Read in all nc files and concatenate them into a single xarray object
-    for ir, runNo in enumerate([14]):#range(nRuns)):
+    for ir, runNo in enumerate(range(nRuns)):
         print(runNo)
         filePath = os.path.join(
             baseFilePath, f"run_{runNo:03d}", "cme_pars.nc"
@@ -158,7 +217,16 @@ def main():
 
         print(ds)
 
-    for ir, runNo in enumerate([14]):#range(nRuns)):
+    n_obs = len(ds["obs_no"][:])
+    for i in range(n_obs):
+        plot_sample_cov(
+            ds, 0, i, vars_req=["v", "lon", "width"]
+        )
+    # plot_sample_cov(
+    #     ds, "all", -1, vars_req=["v", "lon", "width"]
+    # )
+    sys.exit()
+    for ir, runNo in enumerate(range(nRuns)):
 
         plot_par_values_over_single_run(
             ds,
@@ -190,7 +258,7 @@ def main():
             runNo=runNo,
             parUnits="$^\circ$"
         )
-    # sys.exit()
+    sys.exit()
     colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
     plot_par_values_over_mult_runs(
         ds,
