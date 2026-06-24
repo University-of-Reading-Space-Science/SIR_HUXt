@@ -276,6 +276,7 @@ class ObservationOperator:
                 (t - self.cme_par_dict["huxt_init_time"]).total_seconds()
                 for t in self.cme_par_dict["t_init"]
             ]
+        print(f"seconds_to_cme = {seconds_to_cme}")
 
         # Get CME_speeds
         try:
@@ -291,13 +292,14 @@ class ObservationOperator:
         cme_time_to_rmin: list[float] = [
             (dist_to_inner_rad / v) for v in cme_speed
         ]
-
+        #print(f"cme_speed = {cme_speed}")
         cme_speed: list[Quantity[u.km / u.s]] = cme_speed * u.km / u.s
         #print(f"len(cme_time_to_rmin) = {len(cme_time_to_rmin)}")
         cme_launch_time: list[Quantity[u.s]] = [
             cme_time_to_rmin[i] + seconds_to_cme[i]
             for i in range(self.n_members)
         ] * u.s
+        #print(f"cme_lt = {cme_launch_time}")
 
         return cme_launch_time, cme_speed
 
@@ -424,6 +426,7 @@ class ObservationOperator:
         cme_thickness: list[Quantity[u.solRad]] = cme_pars[5]
 
         # Generate CME object
+        #print(f"cme_launch_time = {cme_launch_time}")
         cme_objects: list[H.ConeCME] = [
             H.ConeCME(
                 t_launch=cme_launch_time[i],

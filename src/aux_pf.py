@@ -424,6 +424,7 @@ class AuxPF:
         """
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
+        print(f"state_vector_shrunk_dict = {self.state_vector_shrunk_dict['t_init']}")
         obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
 
         # Calculate likelihoods for all ensemble members

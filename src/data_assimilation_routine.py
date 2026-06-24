@@ -26,6 +26,7 @@ import seaborn as sns
 import colorcet as cc
 import pytest
 from cme_par_dict_structure import required_dict_keys
+from make_prior_covariance_mat import make_uncorrelated_samples, make_blair_samples, make_donki_samples
 
 # import numpy as np
 # import numpy.typing as npt
@@ -149,7 +150,7 @@ def initialise_prior_cme_sd():
 
 
 def initialise_observation_parameters():
-    n_obs: int = 4
+    n_obs: int = 8
 
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
@@ -181,7 +182,7 @@ def initialise_observation_parameters():
 
 def initialise_da_parameters():
     n_members: int = 50
-    n_runs: int = 1
+    n_runs: int = 2
 
     delta_aux_pf: float = 0.98
     pars_in_state_vector: list[str] = ["v", "width", "lon"]
@@ -404,7 +405,7 @@ class RunDataAssimilationRoutine:
             n_ensemble=self.n_members,huxt_init_time=self.huxt_init_time
         )
 
-        low_cme_t_init = mean_cme_t_init - self.prior_sd_t_init
+        """low_cme_t_init = mean_cme_t_init - self.prior_sd_t_init
         high_cme_t_init = mean_cme_t_init + self.prior_sd_t_init
         cme_par_dict["t_init"] = [
             self.huxt_init_time + datetime.timedelta(
@@ -440,7 +441,44 @@ class RunDataAssimilationRoutine:
         high_cme_thick = mean_cme_thick + self.prior_sd_thick
         cme_par_dict["thick"] = [
             rng.uniform(low=low_cme_thick, high=high_cme_thick) for _ in range(self.n_members)
-        ] * u.solRad
+        ] * u.solRad"""
+        mean_cme_par_array = [
+            mean_cme_t_init,
+            mean_cme_speed,
+            mean_cme_width,
+            mean_cme_lon,
+            mean_cme_lat,
+            mean_cme_thick
+        ]
+
+        start_time_donki = datetime.datetime(2024, 1, 1, 0, 0, 0)
+        end_time_donki = datetime.datetime(2025, 1, 1, 0, 0, 0)
+
+        donki_samp = make_donki_samples(
+            n_ens=self.n_members,
+            mean_cme_pars=mean_cme_par_array,
+            rng=rng,
+            start_time=start_time_donki,
+            end_time=end_time_donki,
+            vars_req=np.array(self.pars_in_state),
+            sd_t_init = self.prior_sd_t_init,
+            sd_thick = self.prior_sd_thick,
+            most_acc_only = "true",
+            catalog = "ALL",
+            feature = "LE"
+        )
+        #print(f"donki_samp[0, :] = {donki_samp[0, :]}")
+        cme_par_dict["t_init"] = [
+            self.huxt_init_time + datetime.timedelta(seconds=donki_samp[0, i])
+            for i in range(self.n_members)
+        ]
+        print(cme_par_dict["t_init"])
+        cme_par_dict["v"] = list(donki_samp[1, :]) * u.km / u.s
+        cme_par_dict["width"] = list(donki_samp[2, :]) * u.deg
+        cme_par_dict["lon"] = list(donki_samp[3, :]) * u.deg
+        cme_par_dict["lat"] = list(donki_samp[4, :]) * u.deg
+        cme_par_dict["thick"] = list(donki_samp[5, :]) * u.solRad
+
 
         return cme_par_dict
 

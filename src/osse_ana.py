@@ -27,7 +27,7 @@ from sunpy.coordinates.sun import orientation
 
 
 def plot_par_values_over_single_run(
-    ds, xVarName, yVarName, yTruth, xLabel, parNameLegend, runNo=0, parUnits=''
+    ds, xVarName, yVarName, yTruth, xLabel, parNameLegend, runNo=0, parUnits='', n_obs=24
 ):
     fig, ax = plt.subplots(1, 1)
     xPlot = ds[xVarName][:].values
@@ -51,7 +51,7 @@ def plot_par_values_over_single_run(
     ax.plot([xPlot.min(), xPlot.max()], [yTrue, yTrue], color='k', linestyle='dashed', label=f"True {parNameLegend}")
     ax.legend()
     ax.set_title(f"Run_no = {runNo}")
-    ax.set_xlim(0, 24)
+    ax.set_xlim(0, n_obs)
     ax.set_xlabel(f"{xLabel}")
     ax.set_ylabel(f"{parNameLegend} ({parUnits})")
     plt.show()
@@ -195,7 +195,7 @@ def main():
     #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
     baseFilePath = os.path.join(
-        "C:\\", "Users", "ss905122", "PycharmProjects",# "SIR_HUXt", "output",
+        "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
         "24_obs",# "New folder",
         "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     )
@@ -225,7 +225,7 @@ def main():
     # plot_sample_cov(
     #     ds, "all", -1, vars_req=["v", "lon", "width"]
     # )
-    sys.exit()
+
     for ir, runNo in enumerate(range(nRuns)):
 
         plot_par_values_over_single_run(
@@ -236,7 +236,8 @@ def main():
             "Observation number",
             "CME speed",
             runNo=runNo,
-            parUnits="km/s"
+            parUnits="km/s",
+            n_obs=n_obs
         )
         plot_par_values_over_single_run(
             ds,
@@ -246,7 +247,8 @@ def main():
             "Observation number",
             "CME Width",
             runNo=runNo,
-            parUnits="$^\circ$"
+            parUnits="$^\circ$",
+            n_obs=n_obs
         )
         plot_par_values_over_single_run(
             ds,
@@ -256,9 +258,10 @@ def main():
             "Observation number",
             "CME Longitude",
             runNo=runNo,
-            parUnits="$^\circ$"
+            parUnits="$^\circ$",
+            n_obs=n_obs
         )
-    sys.exit()
+
     colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
     plot_par_values_over_mult_runs(
         ds,
