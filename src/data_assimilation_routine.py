@@ -21,6 +21,8 @@ import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 
+from dotenv import load_dotenv, dotenv_values
+from pathlib import Path
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
 import seaborn as sns
@@ -38,6 +40,19 @@ from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
+
+env_path = Path('.', '.env')
+load_dotenv(dotenv_path=env_path, override=True)
+
+
+def print_environment_variables():
+    print(f"obs_dir = {os.getenv('OBS_DIR')}")
+    print(f"mo_cone_cov_dir = {os.getenv('MO_CONE_COV_DIR')}")
+    print(f"donki_cov_dir = {os.getenv('DONKI_COV_DIR')}")
+    print(f"mo_cme_cone_file_dir = {os.getenv('MO_CME_CONE_FILE_DIR')}")
+    print(f"out_base_dir = {os.getenv('OUT_BASE_DIR')}")
+
+    return None
 
 
 def allowed_cov_types():
@@ -258,8 +273,7 @@ def initialise_observation_parameters():
     obs_rng_seed: int = 4096
     obs_filenames: list[str] = [
         os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects",
-            "SIR_HUXt", "SSW_cme_classifications.hdf5"
+            os.environ.get("obs_dir"), "SSW_cme_classifications.hdf5"
         )
     ]
 
@@ -428,12 +442,8 @@ class RunDataAssimilationRoutine:
         Function to make the output directory
         :return: out_dir: Output directory
         """
-        current_dir = os.path.dirname(__file__)
-        parent_dir = os.path.join(current_dir, "..")
-        abs_par_dir = os.path.abspath(parent_dir)
-
         base_dir = os.path.join(
-            abs_par_dir, "output3", "MAS_v",
+            os.environ.get("out_base_dir"),
             f"ens_{self.n_members}", self.cme_cov_type
         )
 
@@ -607,15 +617,17 @@ class RunDataAssimilationRoutine:
             )
 
         elif self.cme_cov_type == "mo_cone":
-            mo_cone_cov_dir = os.path.join(
-                "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "moConeCMECov"
-            )
+            mo_cone_cov_dir = os.environ.get("mo_cone_cov_dir")
+            #os.path.join(
+            #     "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "moConeCMECov"
+            # )
             if not os.path.exists(mo_cone_cov_dir):
                 os.makedirs(mo_cone_cov_dir)
 
-            mo_cme_cone_file_dir = os.path.join(
-                "C:\\", "Users", "ss905122", "PycharmProjects", "moswoc_cone"
-            )
+            mo_cme_cone_file_dir = os.environ.get("mo_cme_cone_file_dir")
+            # os.path.join(
+            #    "C:\\", "Users", "ss905122", "PycharmProjects", "moswoc_cone"
+            # )
             start_time_mo_cone = datetime.datetime(2017, 1, 1, 0, 0, 0)
             end_time_mo_cone = datetime.datetime(2026, 2, 1, 0, 0, 0)
 
@@ -798,6 +810,7 @@ class RunDataAssimilationRoutine:
 
 
 def main():
+    print_environment_variables()
     run_da_class = RunDataAssimilationRoutine()
     run_da_class.run_data_assimilation(run_start=-1)
 

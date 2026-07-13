@@ -17,5 +17,8 @@
 
 /code/.ipynb*
 
+# Ignore .env files
+*.env
+
 # Ignore data file
 data/**

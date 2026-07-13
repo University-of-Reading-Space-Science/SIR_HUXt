@@ -34,4 +34,5 @@ dependencies:
       - pandas-stubs==3.0.0.260204
       - netcdf4==1.7.4
       - huxt==5.0.2
+      - python-dotenv==1.2.2
 prefix: C:\Users\ss905122\.conda\envs\msl_sir_huxt_man_env
