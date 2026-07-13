@@ -441,7 +441,8 @@ class AuxPF:
         if ess_prior < (self.n_members / 2.0):
             self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]#weights_post
             self.cme_par_dict["log_weight"] = [-np.log(self.n_members) for _ in range(self.n_members)]
-        print(f"ess_prior = {ess_prior}")
+        ess_prior2 = self.calc_ess_log_weights(self.log_weights)
+        print(f"ess_prior = {ess_prior2}")
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob(log_likelihood_shrunk_ens)

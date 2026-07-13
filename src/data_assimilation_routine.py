@@ -264,7 +264,7 @@ def initialise_observation_parameters():
     ]
 
     ssw_event = "ssw_007"
-    craft = "sta"
+    craft = "stb"
     img = "norm"
 
     obs_par_dict = {
