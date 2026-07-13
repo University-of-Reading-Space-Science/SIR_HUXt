@@ -276,7 +276,7 @@ class ObservationOperator:
                 (t - self.cme_par_dict["huxt_init_time"]).total_seconds()
                 for t in self.cme_par_dict["t_init"]
             ]
-        print(f"seconds_to_cme = {seconds_to_cme}")
+        #print(f"seconds_to_cme = {seconds_to_cme}")
 
         # Get CME_speeds
         try:

@@ -367,7 +367,9 @@ class AuxPF:
 
 
     def resample_pars(self, ind_req: int) -> list[float]:
-        resampled_par = self.rng.multivariate_normal(mean=self.shrunk_pars[ind_req, :], cov=self.scaled_cov_state)#[:, 0]
+        resampled_par = self.rng.multivariate_normal(
+            mean=self.shrunk_pars[ind_req, :], cov=self.scaled_cov_state
+        )#[:, 0]
         #print(resampled_par)
 #        sys.exit()
 
@@ -424,7 +426,7 @@ class AuxPF:
         """
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
-        print(f"state_vector_shrunk_dict = {self.state_vector_shrunk_dict['t_init']}")
+        #print(f"state_vector_shrunk_dict = {self.state_vector_shrunk_dict['t_init']}")
         obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
 
         # Calculate likelihoods for all ensemble members
@@ -436,6 +438,9 @@ class AuxPF:
         #print(f"max_weights = {np.max(self.weights)}")
         # Calculate the effective sample size from the prior weights
         ess_prior = self.calc_ess_log_weights(self.log_weights)
+        if ess_prior < (self.n_members / 2.0):
+            self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]#weights_post
+            self.cme_par_dict["log_weight"] = [-np.log(self.n_members) for _ in range(self.n_members)]
         print(f"ess_prior = {ess_prior}")
 
         # Calculate the auxillary probabilities for selecting the new particles
@@ -478,6 +483,7 @@ class AuxPF:
         ]
         log_weights_post = [
             log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
+        #    - self.cme_par_dict["log_weight"][resample_ind[i]]
             for i in range(len(resample_ind))
         ]
 
@@ -496,8 +502,10 @@ class AuxPF:
         self.cme_par_dict["log_weight"] = log_weights_post
 
         # Calculate the effective sample size from the posterior weights
+        ess_post = self.calc_ess_lin_weights(weights_post)
+        print(f"ess_post = {ess_post}")
         ess_post_log = self.calc_ess_log_weights(log_weights_post)
-        print(f"ess_post = {ess_post_log}")
+        print(f"ess_post_log = {ess_post_log}")
 
         return self.cme_par_dict
 

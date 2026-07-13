@@ -70,7 +70,10 @@ class LikelihoodFunction:
             self.hx: npt.NDArray[float] | float = hx
 
         # Assert that the input variables are all the same type
-        assert (type(self.hx) == type(self.obs_cov) == type(self.obs))
+        assert (
+            (type(self.hx) == type(self.obs_cov) == type(self.obs)),
+            f"type(self.hx) = {self.hx}, type(self.obs_cov) = {type(self.obs_cov)}, type(self.obs) = {type(self.obs)}"
+        )
 
 
         # If scalars and matrices are involved, check they are properly specified

@@ -9,6 +9,7 @@ from typing import TypedDict
 import json
 
 import huxt.huxt as H
+import huxt.huxt_inputs as Hin
 import huxt.huxt_analysis as HA
 from mypy.build import TypedDict
 from scipy.special.cython_special import log_wright_bessel
@@ -26,7 +27,7 @@ import seaborn as sns
 import colorcet as cc
 import pytest
 from cme_par_dict_structure import required_dict_keys
-from make_prior_covariance_mat import make_uncorrelated_samples, make_blair_samples, make_donki_samples
+import make_prior_covariance_mat as mp_cov
 
 # import numpy as np
 # import numpy.typing as npt
@@ -38,13 +39,36 @@ from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 
+
+def allowed_cov_types():
+    return {"uncorr", "donki", "mo_cone"}
+
+
 def initialise_huxt_parameters():
     """
     Function to initialise the Huxt parameters for simulation
     :return:
     """
-    huxt_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0)
-    vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
+    obs_par_dict = initialise_observation_parameters()
+    if obs_par_dict["ssw_event"] == "ssw_007":
+        huxt_init_time: datetime.datetime = datetime.datetime(2012, 8, 31, 10, 0, 0)
+
+    elif obs_par_dict["ssw_event"] == "ssw_008":
+        huxt_init_time: datetime.datetime = datetime.datetime(2012, 9, 27, 15, 0, 0)
+
+    elif obs_par_dict["ssw_event"] == "ssw_009":
+        huxt_init_time: datetime.datetime = datetime.datetime(2012, 10, 4, 20, 0, 0)
+
+    elif obs_par_dict["ssw_event"] == "ssw_012":
+        huxt_init_time: datetime.datetime = datetime.datetime(2012, 11, 20, 0, 0, 0)
+
+    else:
+        sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
+
+
+    cr_num: int = np.trunc(sn.carrington_rotation_number(huxt_init_time))
+    vr_in = Hin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
+    #vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
     lon_start: Quantity[u.deg] = 290 * u.deg
     lon_stop: Quantity[u.deg] = 430 * u.deg
     sim_time: Quantity[u.day] = 3 * u.day
@@ -95,19 +119,62 @@ def initialise_true_cme_par_dict(huxt_init_time: datetime.datetime):
 
 def initialise_fg_cme_parameters():
     # Initialise CME parameters
-    fg_cme_t_init: datetime.datetime = datetime.datetime(2008, 1, 1, 1, 0, 0)
-    fg_cme_t_init_str: str = fg_cme_t_init.strftime("%Y%m%d-%H%M")
-    fg_cme_speed: float = 470
-    fg_cme_width: float = 37.0
-    fg_cme_lon: float = -4
-    fg_cme_lat: float = 0
-    fg_cme_thick: float = 0
+    obs_par_dict = initialise_observation_parameters()
+    if obs_par_dict["ssw_event"] == "ssw_007":
+        cme_at_21rs: datetime.datetime = datetime.datetime(2012, 8, 31, 22, 46, 0)
+        print(f"CR = {sn.carrington_rotation_number(cme_at_21rs)}")
+        fg_cme_speed: float = 1010
+        fg_cme_width: float = 66
+        fg_cme_lon: float = -30
+        fg_cme_lat: float = 0
+        fg_cme_thick: float = 0
 
-    sd_cme_t_init: float = 0  # In seconds
-    sd_cme_speed: float = 50  # In km/s
+    elif obs_par_dict["ssw_event"] == "ssw_008":
+        cme_at_21rs: datetime.datetime = datetime.datetime(2012, 9, 28, 3, 49, 0)
+
+        fg_cme_speed: float = 872
+        fg_cme_width: float = 110
+        fg_cme_lon: float = 20
+        fg_cme_lat: float = 4
+        fg_cme_thick: float = 0
+
+    elif obs_par_dict["ssw_event"] == "ssw_009":
+        cme_at_21rs: datetime.datetime = datetime.datetime(2012, 10, 5, 8, 47, 0)
+
+        fg_cme_speed: float = 698
+        fg_cme_width: float = 84
+        fg_cme_lon: float = 9
+        fg_cme_lat: float = -24
+        fg_cme_thick: float = 0
+
+    elif obs_par_dict["ssw_event"] == "ssw_012":
+        cme_at_21rs: datetime.datetime = datetime.datetime(2012, 11, 20, 17, 40, 0)
+
+        fg_cme_speed: float = 664
+        fg_cme_width: float = 94
+        fg_cme_lon: float = 22
+        fg_cme_lat: float = 20
+        fg_cme_thick: float = 0
+
+    else:
+        sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
+
+    # Time taken to get from cme_init_rad to r_min
+    huxt_dict = initialise_huxt_parameters()
+    huxt_cme_ir: Quantity[u.solRad] = huxt_dict["cme_init_rad"]
+    huxt_r_min: Quantity[u.solRad] = huxt_dict["r_min"]
+
+    dist_in_km: Quantity[u.km] = (huxt_r_min - huxt_cme_ir).to(u.km)
+    seconds_to_r_min: float = dist_in_km.to(u.km).value / fg_cme_speed
+
+    fg_cme_t_init: datetime.datetime = cme_at_21rs - datetime.timedelta(seconds=seconds_to_r_min)
+    fg_cme_t_init_str: str = fg_cme_t_init.strftime("%Y%m%d-%H%M")
+
+    sd_cme_t_init: float = 3600  # In seconds
+    sd_cme_speed: float = 25  # In km/s
     sd_cme_width: float = 5  # In deg
     sd_cme_lon: float = 5  # In deg
-    sd_cme_lat: float = 0  # In deg
+    sd_cme_lat: float = 5  # In deg
     sd_cme_thick: float = 0  # In solRad
 
     fg_cme_par_dict = {
@@ -128,16 +195,41 @@ def initialise_fg_cme_parameters():
     return fg_cme_par_dict
 
 
-def initialise_prior_cme_sd():
+def initialise_prior_cme_cov():
+    cme_cov_type = "mo_cone"
+
+    """# Initialise how to build the prior CME covariance matrix
+    if cme_cov_type is None:
+        cme_cov_type = "uncorr"
+    
+    try:
+        assert cme_cov_type.lower() in allowed_cov_types()
+    except AssertionError:
+        print("Defaulting to uncorrelated covariance matrix")
+        cme_cov_type = "uncorr"
+    else:
+        cme_cov_type = cme_cov_type.lower()"""
+
+    # Scale correlation matrix to make covariance matrix
+    scale_corr = True
+    use_log_v = True
+
     # Initialise CME parameters for uniform distribution
-    sd_t_init: float = 0  # In seconds
-    sd_speed: float = 0.1 # Multiplicative variance
+    sd_t_init: float = 3600  # In seconds
+
+    if use_log_v:
+        sd_speed: float = 0.1 # Multiplicative variance
+    else:
+        sd_speed: float = 50 # In km/s
     sd_width: float = 5  # In deg
     sd_lon: float = 5  # In deg
-    sd_lat: float = 0  # In deg
+    sd_lat: float = 2.5  # In deg
     sd_thick: float = 0  # In solRad
 
-    prior_cme_par_dict = {
+    prior_cme_cov_dict = {
+        "cme_cov_type": cme_cov_type,
+        "scale_corr": scale_corr,
+        "use_log_v": use_log_v,
         "sd_t_init": sd_t_init,
         "sd_speed": sd_speed,
         "sd_width": sd_width,
@@ -146,7 +238,7 @@ def initialise_prior_cme_sd():
         "sd_thick": sd_thick
     }
 
-    return prior_cme_par_dict
+    return prior_cme_cov_dict
 
 
 def initialise_observation_parameters():
@@ -155,16 +247,25 @@ def initialise_observation_parameters():
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
 
-    obs_cov: list[float] = [0.15]  # * np.eye(len(obs))
+    obs_cov: list[float] = [0.4]  # * np.eye(len(obs))
 
     obs_times: list[datetime.datetime] = [
-        datetime.datetime(2008, 1, 1, 9, 0, 0) + datetime.timedelta(hours=1 * i)
+        datetime.datetime(2012, 11, 21, 0, 0, 0) + datetime.timedelta(hours=1 * i)
         for i in range(1, 1 + n_obs)
     ]
 
-    use_synthetic_obs: bool = True
+    use_synthetic_obs: bool = False
     obs_rng_seed: int = 4096
-    obs_filenames: list[str] = None
+    obs_filenames: list[str] = [
+        os.path.join(
+            "C:\\", "Users", "ss905122", "PycharmProjects",
+            "SIR_HUXt", "SSW_cme_classifications.hdf5"
+        )
+    ]
+
+    ssw_event = "ssw_007"
+    craft = "sta"
+    img = "norm"
 
     obs_par_dict = {
         "n_obs": n_obs,
@@ -175,6 +276,9 @@ def initialise_observation_parameters():
         "use_synthetic_obs": use_synthetic_obs,
         "obs_filenames": obs_filenames,
         "obs_rng_seed": obs_rng_seed,
+        "ssw_event": ssw_event,
+        "craft": craft,
+        "img": img
     }
 
     return obs_par_dict
@@ -182,10 +286,10 @@ def initialise_observation_parameters():
 
 def initialise_da_parameters():
     n_members: int = 50
-    n_runs: int = 2
+    n_runs: int = 1
 
     delta_aux_pf: float = 0.98
-    pars_in_state_vector: list[str] = ["v", "width", "lon"]
+    pars_in_state_vector: list[str] = ["t_init", "v", "width", "lon", "lat"]
     time_tolerance: Quantity[u.day] = 0.5 * u.day
 
     da_par_dict = {
@@ -201,10 +305,12 @@ def initialise_da_parameters():
 
 class RunDataAssimilationRoutine:
     def __init__(self):
+
         # Get HUXt parameters
         huxt_par_dict = initialise_huxt_parameters()
         self.huxt_init_time: datetime.datetime = huxt_par_dict["huxt_init_time"]
         self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = huxt_par_dict["vr_in"]
+        self.n_lon: int = len(self.vr_in)
         self.lon_start: Quantity[u.deg] = huxt_par_dict["lon_start"]
         self.lon_stop: Quantity[u.deg] = huxt_par_dict["lon_stop"]
         self.sim_time: Quantity[u.days] = huxt_par_dict["sim_time"]
@@ -217,13 +323,16 @@ class RunDataAssimilationRoutine:
         # Initialise observation variables
         obs_par_dict = initialise_observation_parameters()
         self.n_obs: int = obs_par_dict["n_obs"]
-        self.obs_lon: Quantity[u.deg] = obs_par_dict["obs_lon"]
+        self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = obs_par_dict["obs_lon"]
         self.obs_lat: Quantity[u.deg] = obs_par_dict["obs_lat"]
         self.obs_cov: float | npt.NDArray[float] = obs_par_dict["obs_cov"]
         self.obs_times: list[datetime.datetime] = obs_par_dict["obs_times"]
         self.use_synthetic_obs: bool = obs_par_dict["use_synthetic_obs"]
         self.obs_filenames: list[str] = obs_par_dict["obs_filenames"]
         self.obs_rng_seed: int = obs_par_dict["obs_rng_seed"]
+        self.ssw_event:str = obs_par_dict["ssw_event"]
+        self.craft:str = obs_par_dict["craft"]
+        self.img:str = obs_par_dict["img"]
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
         if self.use_synthetic_obs or (self.obs_filenames is None):
@@ -233,8 +342,21 @@ class RunDataAssimilationRoutine:
         else:
             self.true_cme_par_dict: CmeParEns = None
 
-        # Generate observations
-        self.observations: list[float] = self.get_observations()
+        if self.use_synthetic_obs:
+            # Generate observations
+            self.observations: list[float] = self.get_observations()
+            if not isinstance(self.obs_lon, list):
+                self.obs_lon = [self.obs_lon for _ in range(self.n_obs)]
+        else:
+            obs_tuple: tuple[
+                list[datetime.datetime], list[Quantity[u.deg]], list[float], int
+            ] = self.get_observations()
+
+            self.obs_times: list[datetime.datetime] = obs_tuple[0]
+            self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
+            self.observations: list[float] = obs_tuple[2]
+            self.n_obs: int = obs_tuple[3]
+
 
         # Generate prior cme_parameters
         fg_cme_par_dict = initialise_fg_cme_parameters()
@@ -253,7 +375,10 @@ class RunDataAssimilationRoutine:
         self.fg_sd_cme_thick: float = fg_cme_par_dict["sd_cme_thick"]
 
         # Get prior CME standard deviations
-        prior_cme_par_dict = initialise_prior_cme_sd()
+        prior_cme_par_dict = initialise_prior_cme_cov()
+        self.cme_cov_type: str = prior_cme_par_dict["cme_cov_type"]
+        self.scale_corr: bool = prior_cme_par_dict["scale_corr"]
+        self.use_log_v: bool = prior_cme_par_dict["use_log_v"]
         self.prior_sd_t_init: float = prior_cme_par_dict["sd_t_init"]
         self.prior_sd_speed: float = prior_cme_par_dict["sd_speed"]
         self.prior_sd_width: float = prior_cme_par_dict["sd_width"]
@@ -290,7 +415,10 @@ class RunDataAssimilationRoutine:
         if run_no is None:
             run_no = 0
 
-        random_seed = add_const + (mult_const * run_no)
+        if run_no >= 0:
+            random_seed = add_const + (mult_const * run_no)
+        else:
+            random_seed = int(np.abs((add_const + (mult_const / 2.0)) + (run_no * mult_const)))
 
         return random_seed
 
@@ -304,13 +432,21 @@ class RunDataAssimilationRoutine:
         parent_dir = os.path.join(current_dir, "..")
         abs_par_dir = os.path.abspath(parent_dir)
 
-        base_dir = os.path.join(abs_par_dir, "output", "24_obs")
-
-        truth_dir = (
-            f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
-            f"_{self.true_cme_par_dict["lon"].value}_{self.true_cme_par_dict["lat"].value}"
-            f"_{self.true_cme_par_dict["thick"].value}"
+        base_dir = os.path.join(
+            abs_par_dir, "output3", "MAS_v",
+            f"ens_{self.n_members}", self.cme_cov_type
         )
+
+        if self.use_synthetic_obs:
+            obs_dir = (
+                f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
+                f"_{self.true_cme_par_dict["lon"].value}_{self.true_cme_par_dict["lat"].value}"
+                f"_{self.true_cme_par_dict["thick"].value}"
+            )
+        else:
+            obs_dir = (
+                f"obs_{self.craft}_{self.ssw_event}_{self.img}"
+            )
         prior_dir = (
             f"prior_{self.fg_mean_cme_speed}_{self.fg_mean_cme_width}"
             f"_{self.fg_mean_cme_lon}_{self.fg_mean_cme_lat}"
@@ -319,7 +455,7 @@ class RunDataAssimilationRoutine:
         run_dir = f"run_{run_no:03d}"
 
         output_dir = os.path.join(
-            base_dir, truth_dir, prior_dir, f"{self.delta_aux_pf}", run_dir
+            base_dir, obs_dir, prior_dir, f"{self.delta_aux_pf}", run_dir
         )
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -327,7 +463,9 @@ class RunDataAssimilationRoutine:
         return output_dir
 
 
-    def get_observations(self) -> list[float]:
+    def get_observations(self) -> (
+            list[float] | tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float], int]
+    ):
         """
         Function to get observations from files or generate synthetic observations
         :return: observations: Observations to be assimilated
@@ -336,7 +474,7 @@ class RunDataAssimilationRoutine:
         obs_class = Observations(
             obs_lon=self.obs_lon,
             obs_times_in_datetime=self.obs_times,
-            obs_filenames=None,
+            obs_filenames=self.obs_filenames,
             use_synthetic_obs=self.use_synthetic_obs,
             true_cme_par_dict=self.true_cme_par_dict,
             obs_cov=self.obs_cov,
@@ -352,9 +490,25 @@ class RunDataAssimilationRoutine:
             fixed_duration=self.fixed_duration,
             plot_huxt_output=False,
             obs_rng_seed=self.obs_rng_seed,
+            ssw_event=self.ssw_event,
+            craft=self.craft,
+            img=self.img,
         )
 
-        return obs_class.observations
+        # Get observations and update obs_times, n_obs and obs_lon if necessary
+        if self.use_synthetic_obs:
+            obs_out = obs_class.observations
+            return obs_out
+        else:
+            obs_out = obs_class.observations
+            obs_times_out = obs_class.obs_times_in_datetime
+            obs_lon_out = obs_class.obs_lon
+            n_obs = len(obs_out)
+
+            assert len(obs_times_out) == n_obs
+            assert len(obs_lon_out) == n_obs
+
+            return obs_times_out, obs_lon_out, obs_out, n_obs
 
 
     def initialise_mean_cme_pars(self, rng):
@@ -400,48 +554,6 @@ class RunDataAssimilationRoutine:
         mean_cme_lat = mean_cme_par_dict["mean_cme_lat"]
         mean_cme_thick = mean_cme_par_dict["mean_cme_thick"]
 
-        # Initialise cme_par_dict
-        cme_par_dict = initialise_cme_parameter_ensemble_dict(
-            n_ensemble=self.n_members,huxt_init_time=self.huxt_init_time
-        )
-
-        """low_cme_t_init = mean_cme_t_init - self.prior_sd_t_init
-        high_cme_t_init = mean_cme_t_init + self.prior_sd_t_init
-        cme_par_dict["t_init"] = [
-            self.huxt_init_time + datetime.timedelta(
-                seconds=rng.uniform(low=low_cme_t_init, high=high_cme_t_init)
-            ) for _ in range(self.n_members)
-        ]
-
-        low_cme_speed = (1 - self.prior_sd_speed) * mean_cme_speed
-        high_cme_speed = (1 + self.prior_sd_speed) * mean_cme_speed
-        cme_par_dict["v"] = [
-            rng.uniform(low=low_cme_speed, high=high_cme_speed) for _ in range(self.n_members)
-        ] * u.km / u.s
-
-        low_cme_width = mean_cme_width - self.prior_sd_width
-        high_cme_width = mean_cme_width + self.prior_sd_width
-        cme_par_dict["width"] = [
-            rng.uniform(low=low_cme_width, high=high_cme_width) for _ in range(self.n_members)
-        ] * u.deg
-
-        low_cme_lon = mean_cme_lon - self.prior_sd_lon
-        high_cme_lon = mean_cme_lon + self.prior_sd_lon
-        cme_par_dict["lon"] = [
-            rng.uniform(low=low_cme_lon, high=high_cme_lon) for _ in range(self.n_members)
-        ] * u.deg
-
-        low_cme_lat = mean_cme_lat - self.prior_sd_lat
-        high_cme_lat = mean_cme_lat + self.prior_sd_lat
-        cme_par_dict["lat"] = [
-            rng.uniform(low=low_cme_lat, high=high_cme_lat) for _ in range(self.n_members)
-        ] * u.deg
-
-        low_cme_thick = mean_cme_thick - self.prior_sd_thick
-        high_cme_thick = mean_cme_thick + self.prior_sd_thick
-        cme_par_dict["thick"] = [
-            rng.uniform(low=low_cme_thick, high=high_cme_thick) for _ in range(self.n_members)
-        ] * u.solRad"""
         mean_cme_par_array = [
             mean_cme_t_init,
             mean_cme_speed,
@@ -451,34 +563,96 @@ class RunDataAssimilationRoutine:
             mean_cme_thick
         ]
 
-        start_time_donki = datetime.datetime(2024, 1, 1, 0, 0, 0)
-        end_time_donki = datetime.datetime(2025, 1, 1, 0, 0, 0)
-
-        donki_samp = make_donki_samples(
-            n_ens=self.n_members,
-            mean_cme_pars=mean_cme_par_array,
-            rng=rng,
-            start_time=start_time_donki,
-            end_time=end_time_donki,
-            vars_req=np.array(self.pars_in_state),
-            sd_t_init = self.prior_sd_t_init,
-            sd_thick = self.prior_sd_thick,
-            most_acc_only = "true",
-            catalog = "ALL",
-            feature = "LE"
+        # Initialise cme_par_dict
+        cme_par_dict = initialise_cme_parameter_ensemble_dict(
+            n_ensemble=self.n_members, huxt_init_time=self.huxt_init_time
         )
-        #print(f"donki_samp[0, :] = {donki_samp[0, :]}")
+
+        if self.cme_cov_type == "uncorr":
+            samples = mp_cov.make_uncorrelated_samples(
+                n_ens=self.n_members,
+                mean_cme_pars=mean_cme_par_array,
+                rng=rng,
+                sd_t_init=self.prior_sd_t_init,
+                sd_v=self.prior_sd_speed,
+                sd_width=self.prior_sd_width,
+                sd_lon=self.prior_sd_lon,
+                sd_lat=self.prior_sd_lat,
+                sd_thick=self.prior_sd_thick,
+            )
+
+        elif self.cme_cov_type == "donki":
+            start_time_donki = datetime.datetime(2017, 1, 1, 0, 0, 0)
+            end_time_donki = datetime.datetime(2026, 2, 1, 0, 0, 0)
+
+            samples = mp_cov.make_donki_samples(
+                n_ens=self.n_members,
+                mean_cme_pars=mean_cme_par_array,
+                rng=rng,
+                start_time=start_time_donki,
+                end_time=end_time_donki,
+                scale_corr=self.scale_corr,
+                vars_req=np.array(self.pars_in_state),
+                sd_t_init=self.prior_sd_t_init,
+                sd_v=self.prior_sd_speed,
+                sd_width=self.prior_sd_width,
+                sd_lon=self.prior_sd_lon,
+                sd_lat=self.prior_sd_lat,
+                sd_thick=self.prior_sd_thick,
+                use_log_v=self.use_log_v,
+                plot_cme_cov=False,
+                most_acc_only="true",
+                catalog="ALL",
+                feature="LE"
+            )
+
+        elif self.cme_cov_type == "mo_cone":
+            mo_cone_cov_dir = os.path.join(
+                "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "moConeCMECov"
+            )
+            if not os.path.exists(mo_cone_cov_dir):
+                os.makedirs(mo_cone_cov_dir)
+
+            mo_cme_cone_file_dir = os.path.join(
+                "C:\\", "Users", "ss905122", "PycharmProjects", "moswoc_cone"
+            )
+            start_time_mo_cone = datetime.datetime(2017, 1, 1, 0, 0, 0)
+            end_time_mo_cone = datetime.datetime(2026, 2, 1, 0, 0, 0)
+
+            samples = mp_cov.make_mo_cone_samples(
+                n_ens=self.n_members,
+                mean_cme_pars=mean_cme_par_array,
+                rng=rng,
+                mo_cone_file_dir=mo_cme_cone_file_dir,
+                start_time=start_time_mo_cone,
+                end_time=end_time_mo_cone,
+                overwrite_cov=False,
+                mo_cone_cov_dir=mo_cone_cov_dir,
+                scale_corr=self.scale_corr,
+                vars_req=np.array(self.pars_in_state),
+                sd_t_init=self.prior_sd_t_init,
+                sd_v=self.prior_sd_speed,
+                sd_width=self.prior_sd_width,
+                sd_lon=self.prior_sd_lon,
+                sd_lat=self.prior_sd_lat,
+                sd_thick=self.prior_sd_thick,
+                use_log_v=self.use_log_v,
+                plot_cme_cov=False,
+            )
+        else:
+            print(f"cme_cov_type provided was: {self.cme_cov_type}")
+            print(f"cme_cov_type must be in {allowed_cme_cov_types}.")
+            sys.exit()
+
         cme_par_dict["t_init"] = [
-            self.huxt_init_time + datetime.timedelta(seconds=donki_samp[0, i])
+            self.huxt_init_time + datetime.timedelta(seconds=samples[0, i])
             for i in range(self.n_members)
         ]
-        print(cme_par_dict["t_init"])
-        cme_par_dict["v"] = list(donki_samp[1, :]) * u.km / u.s
-        cme_par_dict["width"] = list(donki_samp[2, :]) * u.deg
-        cme_par_dict["lon"] = list(donki_samp[3, :]) * u.deg
-        cme_par_dict["lat"] = list(donki_samp[4, :]) * u.deg
-        cme_par_dict["thick"] = list(donki_samp[5, :]) * u.solRad
-
+        cme_par_dict["v"] = list(samples[1, :]) * u.km / u.s
+        cme_par_dict["width"] = list(samples[2, :]) * u.deg
+        cme_par_dict["lon"] = list(samples[3, :]) * u.deg
+        cme_par_dict["lat"] = list(samples[4, :]) * u.deg
+        cme_par_dict["thick"] = list(samples[5, :]) * u.solRad
 
         return cme_par_dict
 
@@ -488,8 +662,21 @@ class RunDataAssimilationRoutine:
         Function to run the data assimilation routine
         :return: None
         """
-        for run_no in range(run_start, run_start + self.n_runs):
+        if run_start < 0:
+            self.n_runs = -self.n_runs
+            step = -1
+        else:
+            step = 1
+
+        for run_no in range(run_start, run_start + self.n_runs, step):
             print(f"run_no = {run_no}")
+            if run_no < 0:
+                self.fg_sd_cme_t_init: float = 0
+                self.fg_sd_cme_speed: float = 0
+                self.fg_sd_cme_width: float = 0
+                self.fg_sd_cme_lon: float = 0
+                self.fg_sd_cme_lat: float = 0
+                self.fg_sd_cme_thick: float = 0
 
             # Initialise random generator
             rand_seed = self.generate_random_seed(
@@ -529,11 +716,12 @@ class RunDataAssimilationRoutine:
             #print(f"obs={self.observations}")
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
+                print(f"obs = {obs}, obs_lon = {self.obs_lon[yi]}, obs_time = {self.obs_times[yi]}")
                 aux_pf_class = AuxPF(
                     cme_par_dict=cme_par_dict,
                     obs=obs,
                     obs_cov=self.obs_cov,
-                    obs_lon=self.obs_lon,
+                    obs_lon=self.obs_lon[yi],
                     obs_time=self.obs_times[yi],
                     true_cme_par_dict=self.true_cme_par_dict,
                     infl_fact=1,
@@ -575,7 +763,9 @@ class RunDataAssimilationRoutine:
                 # for par_ind in [1, 2, 3]:
                 #     print(f"cme_saved_pars[{yi + 1}] = {cme_saved_pars[yi + 1, :, par_ind]}")
 
-            for par_ind in [1, 2, 3]:
+            for par_ind in range(7):
+                if par_ind == 6:
+                    print(f"weights_post = {np.exp(cme_saved_pars[:, -1, par_ind])}")
                 print(f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}")
 
             # Save cme_parameters into a .nc file
@@ -592,11 +782,12 @@ class RunDataAssimilationRoutine:
                     lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
                     lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
                     thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
+                    log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
                 ),
                 coords=dict(
                     obs_no=("n_obs", range(self.n_obs + 1)),
                     ens_no=("n_ens", range(self.n_members)),
-                    huxt_lon=("n_lon", (2 * np.pi / 128.0) * np.arange(128)),
+                    huxt_lon=("n_lon", (2 * np.pi / self.n_lon) * np.arange(self.n_lon)),
                 ),
             )
             print(cme_par_ds)
@@ -608,7 +799,7 @@ class RunDataAssimilationRoutine:
 
 def main():
     run_da_class = RunDataAssimilationRoutine()
-    run_da_class.run_data_assimilation(run_start=0)
+    run_da_class.run_data_assimilation(run_start=-1)
 
     return None
 
