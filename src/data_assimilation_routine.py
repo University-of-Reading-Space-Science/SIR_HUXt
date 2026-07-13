@@ -273,12 +273,12 @@ def initialise_observation_parameters():
     obs_rng_seed: int = 4096
     obs_filenames: list[str] = [
         os.path.join(
-            os.environ.get("obs_dir"), "SSW_cme_classifications.hdf5"
+            str(os.getenv("OBS_DIR")), "SSW_cme_classifications.hdf5"
         )
     ]
 
-    ssw_event = "ssw_007"
-    craft = "stb"
+    ssw_event = "ssw_008"
+    craft = "sta"
     img = "norm"
 
     obs_par_dict = {
@@ -443,7 +443,7 @@ class RunDataAssimilationRoutine:
         :return: out_dir: Output directory
         """
         base_dir = os.path.join(
-            os.environ.get("out_base_dir"),
+            os.getenv("OUT_BASE_DIR")
             f"ens_{self.n_members}", self.cme_cov_type
         )
 
@@ -617,14 +617,14 @@ class RunDataAssimilationRoutine:
             )
 
         elif self.cme_cov_type == "mo_cone":
-            mo_cone_cov_dir = os.environ.get("mo_cone_cov_dir")
+            mo_cone_cov_dir = os.environ.get("MO_CONE_COV_DIR")
             #os.path.join(
             #     "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "moConeCMECov"
             # )
             if not os.path.exists(mo_cone_cov_dir):
                 os.makedirs(mo_cone_cov_dir)
 
-            mo_cme_cone_file_dir = os.environ.get("mo_cme_cone_file_dir")
+            mo_cme_cone_file_dir = os.environ.get("MO_CME_CONE_FILE_DIR")
             # os.path.join(
             #    "C:\\", "Users", "ss905122", "PycharmProjects", "moswoc_cone"
             # )

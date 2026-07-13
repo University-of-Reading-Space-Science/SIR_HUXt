@@ -35,4 +35,6 @@ dependencies:
       - netcdf4==1.7.4
       - huxt==5.0.2
       - python-dotenv==1.2.2
+      - stereo_spice==0.1
+      - tables==3.11.1
 prefix: C:\Users\ss905122\.conda\envs\msl_sir_huxt_man_env
