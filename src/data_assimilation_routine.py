@@ -443,7 +443,7 @@ class RunDataAssimilationRoutine:
         :return: out_dir: Output directory
         """
         base_dir = os.path.join(
-            os.getenv("OUT_BASE_DIR")
+            os.getenv("OUT_BASE_DIR"),
             f"ens_{self.n_members}", self.cme_cov_type
         )
 
