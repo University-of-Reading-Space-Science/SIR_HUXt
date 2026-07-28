@@ -151,7 +151,8 @@ class ObservationOperator:
             cme_init_rad: Quantity[u.solRad] = None,
             cme_fixed_duration:bool = True,
             fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
-            plot_huxt_output: bool = False
+            plot_huxt_output: bool = False,
+            bias_term_bool: bool = False,
     ) -> None:
         """
         Class to get observations for DA from
@@ -172,6 +173,7 @@ class ObservationOperator:
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
         :param plot_huxt_output: Boolean to determine whether to plot HUXt output at observation time
+        :param bias_term_bool: Boolean to determine whether to use bias term or not
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: CHANGE cme_init_rad SUCH THAT IT CAN BE VARIED BETWEEN ENSEMBLE MEMBERS
@@ -250,6 +252,7 @@ class ObservationOperator:
             self.fixed_duration = fixed_duration
 
         self.plot_huxt_output = plot_huxt_output
+        self.bias_term_bool = bias_term_bool
 
 
     def extract_cme_launch_time_and_speed(self) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
@@ -504,6 +507,29 @@ class ObservationOperator:
 
         return cme_flanks
 
+    def obs_op_bias_correction(
+            self,
+            corr_at_elon6: float,
+            corr_at_elon_21: float,
+            elon: float
+    ):
+        """
+        Function to calculate the bias correction due to using tracer particles to measure CME flank
+        Initial experiments will use a simple linear relation
+        :param corr_at_elon6: Correction required at elongation 5deg
+        :param corr_at_elon_21: Correction required at elongation 21deg
+        :param elon: Elongation to calculate the bias correction for
+        :return: bias_corr: bias correction
+        """
+
+        # Calculate gradient and constant terms for linear relation
+        m: float = (corr_at_elon6 - corr_at_elon_21) / 15.0
+        c: float = ((21 * corr_at_elon6) - (6 * corr_at_elon_21)) / 15.0
+
+        # Calculate bias required
+        bias_corr = (m * elon) + c
+
+        return bias_corr
 
     def make_obs_op(self) -> npt.NDArray[float]:
         """
@@ -539,7 +565,17 @@ class ObservationOperator:
                     abs(cme_flank["time"].values - Time(self.obs_time_in_datetime).jd)
                 )
                 #print(f"ind_req={ind_req}")
-                obs_op[i, :] = [cme_flank["el"].values[ind_req]]
+                #print(f"self.bias_term_bool1 = {self.bias_term_bool}")
+                if self.bias_term_bool:
+                    obs_op[i, :] = [
+                        cme_flank["el"].values[ind_req] + self.obs_op_bias_correction(
+                            corr_at_elon6=3.5,
+                            corr_at_elon_21=1.5,
+                            elon=cme_flank["el"].values[ind_req]
+                        )
+                    ]
+                else:
+                    obs_op[i, :] = [cme_flank["el"].values[ind_req]]
 
             elif type_list_datetime:
                 obs_times_in_jd: list[float] = Time(
@@ -553,8 +589,15 @@ class ObservationOperator:
                     for obs_time in obs_times_in_jd
                 ]
                 #print(f"inds_req={inds_req}")
+                #print(f"self.bias_term_bool = {self.bias_term_bool}")
                 obs_op[i, :] = [
-                    cme_flank["el"].values[j] for j in inds_req
+                    cme_flank["el"].values[j] + self.obs_op_bias_correction(
+                        corr_at_elon6=1.5,
+                        corr_at_elon_21=1.5,
+                        elon=cme_flank["el"].values[j]
+                    )
+                    if self.bias_term_bool else cme_flank["el"].values[j]
+                    for j in inds_req
                 ]
 
 

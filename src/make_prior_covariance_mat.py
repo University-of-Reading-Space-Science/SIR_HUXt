@@ -92,15 +92,17 @@ def uncorrelated_cov_mat(
     uncorr_cov_mat = np.zeros((6, 6))
     sd_vals = [sd_t_init, sd_v, sd_width, sd_lon, sd_lat, sd_thick]
 
-    for iv, var_name in enumerate(required_dict_keys()):
+    cme_par_keys_ordered = cme_par_key_to_index().keys()
+
+    for iv, var_name in enumerate(cme_par_keys_ordered):
         ind_req = cme_par_get_indices(var_name)
-        uncorr_cov_mat[ind_req, ind_req] = sd_vals[iv] * sd_vals[iv]
+        uncorr_cov_mat[ind_req, ind_req] = sd_vals[ind_req] * sd_vals[ind_req]
 
     plot_sample_cov(
         uncorr_cov_mat,
         np.identity(6),
         "Uncorrelated covariance matrix",
-        vars_req=["t_init", "v", "width", "lon", "lat", "thick"],
+        #vars_req=["t_init", "v", "width", "lon", "lat", "thick"],
     )
     return uncorr_cov_mat
 
@@ -114,7 +116,8 @@ def make_uncorrelated_samples(
         sd_width: float=0,
         sd_lon: float=0,
         sd_lat: float=0,
-        sd_thick: float=0
+        sd_thick: float=0,
+        use_log_v: bool = False,
 ) -> npt.NDArray[float]:
     """
     Generate uncorrelated covariance matrix
@@ -138,11 +141,15 @@ def make_uncorrelated_samples(
     )
     print(f"uncorr_cov = {uncorr_cov}")
 
+    if use_log_v:
+        mean_cme_pars[1] = np.log(mean_cme_pars[1])
+
     for m in range(n_ens):
         uncorr_samples[:, m] = rng.multivariate_normal(
             mean=mean_cme_pars, cov=uncorr_cov
         )
-
+    if use_log_v:
+        uncorr_samples[1, :] = np.exp(uncorr_samples[1, :])
     #print(uncorr_samples)
     return uncorr_samples
 

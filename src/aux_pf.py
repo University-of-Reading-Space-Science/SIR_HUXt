@@ -47,6 +47,8 @@ class AuxPF:
             cme_init_rad: Quantity[u.solRad]=12 * u.solRad,
             cme_fixed_duration: bool = True,
             fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
+            plot_huxt_output: bool = False,
+            bias_term_bool: bool = False,
             rng=None
     ):
         self.cme_par_dict:CmeParEns = cme_par_dict
@@ -68,6 +70,7 @@ class AuxPF:
         self.cme_init_rad = cme_init_rad
         self.cme_fixed_duration = cme_fixed_duration
         self.fixed_duration = fixed_duration
+        self.plot_huxt_output = plot_huxt_output
 
         if rng is None:
             self.rng = np.random.default_rng()
@@ -107,6 +110,9 @@ class AuxPF:
 
         # Get HUXt simulation time for current observation time
         self.sim_time = self.get_sim_time()
+
+        # Get bias_term_bool to determine whether to include a bias in the observation operator
+        self.bias_term_bool = bias_term_bool
 
 
     def get_state_cov(self) -> tuple[npt.NDArray[float], npt.NDArray[float]]:
@@ -293,13 +299,23 @@ class AuxPF:
             cme_init_rad=self.cme_init_rad,
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
-            plot_huxt_output=False
+            plot_huxt_output=self.plot_huxt_output,
+            bias_term_bool=self.bias_term_bool,
         )
 
         hx = obs_op_class.make_obs_op()
         #print(f"hx={hx}")
         return hx
 
+    def calculate_diff_between_obs_and_obs_op(self, hx):
+        """
+        Function to calculate the difference between the observation operator and the observation
+        :param hx: Observation operator
+        :return: obs_diff: difference between the observation operator and the observation
+        """
+        obs_diff = self.obs - hx
+
+        return obs_diff
 
     def calculate_likelihood_single_ens(self, hx):
         """
@@ -424,6 +440,19 @@ class AuxPF:
         :return: Updated cme_par_dict with parameters changed by Auxillary PF
         :TODO: Add ESS calculation and print out
         """
+        # Calculate the effective sample size from the prior weights
+        ess_prior = self.calc_ess_log_weights(self.log_weights)
+        if ess_prior < (self.n_members / 2.0):
+            self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]
+            self.weights = [1.0 / self.n_members for _ in range(self.n_members)]
+
+            self.cme_par_dict["log_weight"] = [-np.log(self.n_members) for _ in range(self.n_members)]
+            self.log_weights = [-np.log(self.n_members) for _ in range(self.n_members)]
+
+        ess_prior2 = self.calc_ess_log_weights(self.log_weights)
+        print(f"ess_prior: {ess_prior}")
+        print(f"ess_prior2 = {ess_prior2}")
+
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
         #print(f"state_vector_shrunk_dict = {self.state_vector_shrunk_dict['t_init']}")
@@ -436,13 +465,14 @@ class AuxPF:
         ]
         #print(f"weights = {self.weights}")
         #print(f"max_weights = {np.max(self.weights)}")
-        # Calculate the effective sample size from the prior weights
-        ess_prior = self.calc_ess_log_weights(self.log_weights)
-        if ess_prior < (self.n_members / 2.0):
-            self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]#weights_post
-            self.cme_par_dict["log_weight"] = [-np.log(self.n_members) for _ in range(self.n_members)]
-        ess_prior2 = self.calc_ess_log_weights(self.log_weights)
-        print(f"ess_prior = {ess_prior2}")
+        # obs_minus_obs_op = [
+        #     self.calculate_diff_between_obs_and_obs_op(obs_op_shrunk[i, :])
+        #     for i in range(self.n_members)
+        # ]
+        # print(f"obs = {self.obs}")
+        # print(f"obs_minus_obs_op = {obs_minus_obs_op}")
+        # print(f"obs_minus_obs_op_mean = {np.nanmean(obs_minus_obs_op)}")
+
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob(log_likelihood_shrunk_ens)
@@ -484,7 +514,6 @@ class AuxPF:
         ]
         log_weights_post = [
             log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
-        #    - self.cme_par_dict["log_weight"][resample_ind[i]]
             for i in range(len(resample_ind))
         ]
 

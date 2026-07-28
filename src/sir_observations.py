@@ -288,7 +288,7 @@ class Observations:
                 # craft = "stb"
                 # img = "diff"
                 pa_wid=1.0
-                ssw_path = "/".join(['', self.ssw_event, self.craft, self.img])
+                ssw_path = "/".join([str(''), self.ssw_event, self.craft, self.img])
                 event = f.get_node(ssw_path)
                 spice = StereoSpice()
 
@@ -428,9 +428,12 @@ def main():
         "C:\\", "Users", "ss905122", "PycharmProjects",
         "SIR_HUXt", "SSW_cme_classifications.hdf5"
     )
-    ObsClass = Observations(obs_filenames=h5_file_path)
+    ssw_event: str = "ssw_012"
+    craft: str = "stb"
+    img: str = "diff"
+    ObsClass = Observations(obs_filenames=h5_file_path, ssw_event=ssw_event, craft=craft, img=img)
     obs_times_out, obs_lon, obs_out = ObsClass.read_obs_from_file()
-
+    print(f"ssw_event: {ssw_event}, craft: {craft}, img: {img}")
     print(f"obs_times_out = {obs_times_out}")
     print(f"obs_out = {obs_out}")
     print(f"obs_lon_out = {obs_lon}")
