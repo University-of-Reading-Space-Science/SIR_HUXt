@@ -1,4 +1,3 @@
-import huxt.huxt
 import numpy as np
 import numpy.typing as npt
 import datetime
@@ -10,7 +9,8 @@ from typing import TypedDict
 import json
 
 import huxt.huxt as H
-import huxt.huxt_analysis as HA
+import surf.surf as S
+import surf.surf_analysis as SA
 from mypy.build import TypedDict
 from scipy.special.cython_special import log_wright_bessel
 import math
@@ -113,7 +113,7 @@ class TestObservationOperator:
         return None
 
     def test_make_cme_objects(self, init_obs_op, exp_obs_op, mocker) -> None:
-        mock_cme = mocker.patch("huxt.huxt.ConeCME")
+        mock_cme = mocker.patch("surf.surf.ConeCME")
         mock_cme.return_value = 500
 
         expected_cme_pars = exp_obs_op.expected_cme_parameters()
@@ -171,17 +171,17 @@ class TestObservationOperator:
             self, init_obs_op, init_test_cme_flank_single_ens, ens_no, exp_cme_flank, mocker
     ) -> None:
 
-        # Initialise mockers for the H.HUXt and H.ConeCME calls
-        mock_huxt = mocker.patch("huxt.huxt.HUXt")
-        mock_huxt.return_value = H.HUXt()
+        # Initialise mockers for the S.SURF and S.ConeCME calls
+        mock_surf = mocker.patch("surf.surf.SURF")
+        mock_surf.return_value = S.SURF()
 
-        mock_solve = mocker.patch("huxt.huxt.HUXt.solve")
+        mock_solve = mocker.patch("surf.surf.SURF.solve")
         mock_solve.return_value = 450
 
-        mock_cme = mocker.patch("huxt.huxt.ConeCME")
+        mock_cme = mocker.patch("surf.surf.ConeCME")
         mock_cme.return_value = 500
 
-        mock_flank = mocker.patch("SIR_HUXt.code.sir_observation_operator.Observer.compute_flank_profile")
+        mock_flank = mocker.patch("SIR_SURF.code.sir_observation_operator.Observer.compute_flank_profile")
         mock_flank.return_value = init_test_cme_flank_single_ens
 
         expected_cme_flank_el = exp_cme_flank.expected_flank_el(ens_no)
@@ -203,21 +203,21 @@ class TestObservationOperator:
     ) -> None:
         n_ensemble = init_obs_op.n_members
 
-        # Initialise mockers for the H.HUXt and H.ConeCME calls
-        mock_huxt = mocker.patch("huxt.huxt.HUXt")
-        mock_huxt.return_value = H.HUXt()
+        # Initialise mockers for the S.SURF and S.ConeCME calls
+        mock_surf = mocker.patch("surf.surf.SURF")
+        mock_surf.return_value = S.SURF()
 
-        mock_solve = mocker.patch("huxt.huxt.HUXt.solve")
+        mock_solve = mocker.patch("surf.surf.SURF.solve")
         mock_solve.return_value = 450
 
-        mock_cme = mocker.patch("huxt.huxt.ConeCME")
+        mock_cme = mocker.patch("surf.surf.ConeCME")
         mock_cme_values = [i for i in range(n_ensemble)]
         def mock_cme_side_effect(*args, **kwargs):
             return mock_cme_values[np.mod(mock_cme.call_count - 1, len(mock_cme_values))]
 
         mock_cme.side_effect = mock_cme_side_effect
 
-        mock_flank = mocker.patch("SIR_HUXt.code.sir_observation_operator.Observer.compute_flank_profile")
+        mock_flank = mocker.patch("SIR_SURF.code.sir_observation_operator.Observer.compute_flank_profile")
         mock_flank_values = [
             init_test_cme_flanks[i] for i in range(n_ensemble)
         ]
@@ -258,7 +258,7 @@ class TestObservationOperator:
         ], indirect=["init_test_cme_flanks", "obs_op_tests"]
     )
     def test_make_obs_op(
-            self, init_obs_op, obs_op_tests, init_test_cme_flanks, exp_cme_flank, mocker
+            self, get_use_model, init_obs_op, obs_op_tests, init_test_cme_flanks, exp_cme_flank, mocker
     ) -> None:
         n_ensemble = init_obs_op.n_members
 
@@ -266,15 +266,28 @@ class TestObservationOperator:
         #init_obs_op.get_obs_times = exp_cme_flank.obs_op_tests(test_no)[0]
         #print(f"init_obs_op.get_obs_times: {init_obs_op.obs_time_in_datetime}")
 
-        # Initialise mockers for the H.HUXt and H.ConeCME calls
-        mock_huxt = mocker.patch("huxt.huxt.HUXt")
-        mock_huxt.return_value = H.HUXt()
+        if get_use_model in ["surf", "compress_surf"]:
+            # Initialise mockers for the S.SURF and S.ConeCME calls
+            mock_surf = mocker.patch("surf.surf.SURF")
+            mock_surf.return_value = S.SURF()
 
-        mock_solve = mocker.patch("huxt.huxt.HUXt.solve")
-        mock_solve.return_value = 450
+            mock_solve = mocker.patch("surf.surf.SURF.solve")
+            mock_solve.return_value = 450
 
-        mock_cme = mocker.patch("huxt.huxt.ConeCME")
-        mock_cme_values = [i for i in range(n_ensemble)]
+            mock_cme = mocker.patch("surf.surf.ConeCME")
+            mock_cme_values = [i for i in range(n_ensemble)]
+        elif get_use_model in ["huxt"]:
+            # Initialise mockers for the S.SURF and S.ConeCME calls
+            mock_surf = mocker.patch("huxt.huxt.HUXt")
+            mock_surf.return_value = H.HUXt()
+
+            mock_solve = mocker.patch("huxt.huxt.HUXt.solve")
+            mock_solve.return_value = 450
+
+            mock_cme = mocker.patch("huxt.huxt.ConeCME")
+            mock_cme_values = [i for i in range(n_ensemble)]
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
         def mock_cme_side_effect(*args, **kwargs):
             return mock_cme_values[np.mod(mock_cme.call_count - 1, len(mock_cme_values))]

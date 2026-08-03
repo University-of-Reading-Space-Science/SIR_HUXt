@@ -9,7 +9,7 @@ class CmeParArray:
     def __init__(
             self,
             n_members: int,
-            huxt_init_time: datetime.datetime,
+            surf_init_time: datetime.datetime,
             t_init: npt.NDArray[float],
             v: npt.NDArray[float],
             width: npt.NDArray[float],
@@ -18,7 +18,7 @@ class CmeParArray:
             thick: npt.NDArray[float]
     ):
         self.n_members: int = n_members
-        self.huxt_init_time: datetime.datetime = huxt_init_time
+        self.surf_init_time: datetime.datetime = surf_init_time
         self.t_init: npt.NDArray[float] = t_init
         self.v: npt.NDArray[float] = v
         self.width: npt.NDArray[float] = width

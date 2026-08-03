@@ -7,11 +7,11 @@ import numpy.typing as npt
 from SIR_HUXt.tests.cme_par_array import CmeParArray
 
 #sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-from SIR_HUXt.code.cme_par_dict_structure import required_dict_keys, cme_par_get_indices
+from SIR_HUXt.src.cme_par_dict_structure import required_dict_keys, cme_par_get_indices
 
 class ExpCmeParArray:
     def __init__(self):
-        self.huxt_init_time: datetime.datetime = datetime.datetime(
+        self.surf_init_time: datetime.datetime = datetime.datetime(
             year=2021, month=1, day=1, hour=18, minute=0, second=0
         )
         self.n_members: int = 5
@@ -40,8 +40,8 @@ class ExpCmeParArray:
             3, 12, 5, 7, 8
         ])
 
-    def expected_huxt_init_time(self) -> datetime.datetime:
-        return self.huxt_init_time
+    def expected_surf_init_time(self) -> datetime.datetime:
+        return self.surf_init_time
 
     def expected_t_init(self) -> npt.NDArray[float]:
         return self.exp_t_init
@@ -64,7 +64,7 @@ class ExpCmeParArray:
     def expected_cme_par_array(self) -> npt.NDArray[float]:
         par_arr_class = CmeParArray(
             n_members=self.n_members,
-            huxt_init_time=self.huxt_init_time,
+            surf_init_time=self.surf_init_time,
             t_init=self.exp_t_init,
             v=self.exp_v,
             width=self.exp_width,

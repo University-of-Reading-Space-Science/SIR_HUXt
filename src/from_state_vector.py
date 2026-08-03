@@ -108,29 +108,29 @@ class FromStateVector:
 
     def convert_t_init_array_to_dict(self) -> list[datetime.datetime]:
         """
-        Function to convert t_init from seconds since huxt_init_time to datetime for insertion back into a dictionary
+        Function to convert t_init from seconds since surf_init_time to datetime for insertion back into a dictionary
         :param cme_par_dict: Dictionary containing CME parameters with following keys:
-            ['t_init', 'v', 'width', 'lon', 'lat', 'thick', 'weight', 'huxt_init_time', 'n_members']
+            ['t_init', 'v', 'width', 'lon', 'lat', 'thick', 'weight', 'surf_init_time', 'n_members']
         :param cme_par_array: Array that contains all CME parameters required,
             an (n_ens, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
                 cme_par_array[:, 4] = cme_par_dict["lat"] in deg
                 cme_par_array[:, 5] = cme_par_dict["thick"] in solar radii
-        :return: t_init_arr: Array of t_init values in seconds since huxt_init_time
+        :return: t_init_arr: Array of t_init values in seconds since surf_init_time
         """
-        assert all(p in self.cme_par_dict.keys() for p in ["huxt_init_time", "n_members"])
+        assert all(p in self.cme_par_dict.keys() for p in ["surf_init_time", "n_members"])
 
         n_ens: int = np.shape(self.cme_par_array)[0]
 
         # Get the required cme_par_array index for t_init
         ind_req = cme_par_get_indices("t_init")
 
-        # Calculate number of seconds that need to be added to huxt_init_time
+        # Calculate number of seconds that need to be added to surf_init_time
         t_init_dict: list[datetime.datetime] = [
-            self.cme_par_dict["huxt_init_time"] + datetime.timedelta(seconds=self.cme_par_array[i, ind_req])
+            self.cme_par_dict["surf_init_time"] + datetime.timedelta(seconds=self.cme_par_array[i, ind_req])
             for i in range(n_ens)
         ]
 
@@ -139,7 +139,7 @@ class FromStateVector:
     def convert_v_array_to_dict(self) -> list[Quantity[u.km / u.s]]:
         """
         Function to convert cme_speed (v) from an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -159,7 +159,7 @@ class FromStateVector:
     def convert_width_array_to_dict(self) -> list[Quantity[u.deg]]:
         """
         Function to convert width from an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -179,7 +179,7 @@ class FromStateVector:
     def convert_lon_array_to_dict(self) -> list[Quantity[u.deg]]:
         """
         Function to convert lon from an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -204,7 +204,7 @@ class FromStateVector:
     def convert_lat_array_to_dict(self) -> list[Quantity[u.deg]]:
         """
         Function to convert lat from an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -225,7 +225,7 @@ class FromStateVector:
         """
         Function to convert thickness to solar radii and place in array,
             an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -247,7 +247,7 @@ class FromStateVector:
             and place them into the CME parameter dictionary
         :param cme_par_array: Array that contains all CME parameters required,
             an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
@@ -256,9 +256,9 @@ class FromStateVector:
         :param cme_par_dict: Dictionary that contains all CME parameters required
         :return: cme_par_dict: Dictionary of CME parameters (with units added back in)
         """
-        # Get the required keys and add the 'huxt_init_time' and 'n_members' keys as requirements for this function
+        # Get the required keys and add the 'surf_init_time' and 'n_members' keys as requirements for this function
         req_keys = required_dict_keys()
-        additional_keys_req = ["huxt_init_time", "n_members"]
+        additional_keys_req = ["surf_init_time", "n_members"]
         req_keys.update(additional_keys_req)
 
         assert all(p in self.cme_par_dict.keys() for p in req_keys)

@@ -1,31 +1,15 @@
-import huxt.huxt
 import numpy as np
 import numpy.typing as npt
 import datetime
-import os
-import sys
+
 import pandas as pd
-import xarray as xr
-from typing import TypedDict
-import json
-
-import huxt.huxt as H
-import huxt.huxt_analysis as HA
-from mypy.build import TypedDict
-from scipy.special.cython_special import log_wright_bessel
-
-import sunpy.coordinates.sun as sn
 
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 from sir_observation_operator import ObservationOperator
 
-import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
-import seaborn as sns
-import colorcet as cc
-import pytest
 from cme_par_dict_structure import required_dict_keys
 
 class ExpectedObservationOperator:
@@ -96,13 +80,13 @@ class ExpectedCMEFlankSingle:
     def __init__(self):
         # For test CME flanks, set timestep to 10 minutes
         #  (for ease of checking the rounding of the times)
-        self.huxt_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
+        self.surf_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
         self.deltaT: Quantity[u.s] = 6000 * u.s
         self.n_timesteps_day: int = 144
         self.n_members: int = 5
 
         self.times: Time = Time([
-            self.huxt_init_time + datetime.timedelta(seconds=i * self.deltaT.value)
+            self.surf_init_time + datetime.timedelta(seconds=i * self.deltaT.value)
             for i in range(self.n_timesteps_day)
         ])
 

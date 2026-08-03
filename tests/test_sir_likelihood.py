@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-from sir_likelihood import LikelihoodFunction
+from SIR_HUXt.src.sir_likelihood import LikelihoodFunction
 
 class TestSirLikelihood:
     @pytest.fixture
@@ -108,6 +108,7 @@ class TestSirLikelihood:
         assert init_test.log_likelihood_gaussian() == pytest.approx(expected_test_log_lik_gauss)
 
     @pytest.mark.parametrize("init_test, expected_test_lik_gauss", [
+        (-1, -1),
         (0, 0),
         (1, 1),
         (2, 2),

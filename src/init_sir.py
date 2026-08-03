@@ -1,12 +1,13 @@
 # @package init_sir
-# This module will take inputs from HUXt and perform an SIR to
+# This module will take inputs from SURF and perform an SIR to
 #  generate an updated set of weights and particles
-import huxt.huxt
 import numpy as np
 import numpy.typing as npt
 import datetime
 
 import huxt.huxt as H
+import surf.surf as S
+
 import sunpy.coordinates.sun as sn
 
 import astropy.units as u
@@ -23,17 +24,17 @@ def setup_huxt(
         lon_stop: Quantity[u.deg] = 380 * u.deg,
         sim_time: Quantity[u.day] = 2 * u.day,
         dt_scale: int = 20,
-        r_min: Quantity[u.solRad] = 30 * u.solRad,
+        r_min: Quantity[u.solRad] = 21.5 * u.solRad,
 #        accel_limit: bool = False
-) -> huxt.huxt.HUXt:
+) -> H.HUXt:
     """
-    Initialise HUXt with some predetermined boundary/initial conditions
-    Here a uniform 400km/s wind is used, and HUXt time is set to 2008-01-01T00:00:00.
-    :param start_datetime: Initial datetime of HUXt simulation
+    Initialise SURF with some predetermined boundary/initial conditions
+    Here a uniform 400km/s wind is used, and SURF time is set to 2008-01-01T00:00:00.
+    :param start_datetime: Initial datetime of SURF simulation
     :param vr_in: Initial radial solar wind speed in km/s
-    :param lon_start: Initial longitude of HUXt simulation in degrees
-    :param lon_stop: Final longitude of HUXt simulation in degrees
-    :param sim_time: HUXt simulation time in seconds
+    :param lon_start: Initial longitude of SURF simulation in degrees
+    :param lon_stop: Final longitude of SURF simulation in degrees
+    :param sim_time: SURF simulation time in seconds
     :param dt_scale: Scalar specifying cadence of output timesteps
     :param r_min: Inner boundary radius in solar radii
 
@@ -44,10 +45,10 @@ def setup_huxt(
     assert type(start_datetime) == datetime.datetime
 
     start_time: Time = Time(start_datetime, scale="utc")
-    cr_num: int = np.fix(sn.carrington_rotation_number(start_time))
+    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
     ert: Observer = H.Observer("EARTH", start_time)
 
-    # Set up HUXt for a sim_time-day simulation, outputting every dt_scale
+    # Set up SURF for a sim_time-day simulation, outputting every dt_scale
     model: HUXt = H.HUXt(
         v_boundary=vr_in,
         cr_num=cr_num,
@@ -61,7 +62,55 @@ def setup_huxt(
 #        accel_limit=accel_limit
     )
 
-    # model1d = H.HUXt(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
+    return model
+
+
+def setup_surf(
+        start_datetime: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
+        vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.ones(128) * 400 * u.km / u.s,
+        lon_start: Quantity[u.deg] = 290 * u.deg,
+        lon_stop: Quantity[u.deg] = 380 * u.deg,
+        sim_time: Quantity[u.day] = 2 * u.day,
+        dt_scale: int = 20,
+        r_min: Quantity[u.solRad] = 21.5 * u.solRad,
+#        accel_limit: bool = False
+) -> S.SURF:
+    """
+    Initialise SURF with some predetermined boundary/initial conditions
+    Here a uniform 400km/s wind is used, and SURF time is set to 2008-01-01T00:00:00.
+    :param start_datetime: Initial datetime of SURF simulation
+    :param vr_in: Initial radial solar wind speed in km/s
+    :param lon_start: Initial longitude of SURF simulation in degrees
+    :param lon_stop: Final longitude of SURF simulation in degrees
+    :param sim_time: SURF simulation time in seconds
+    :param dt_scale: Scalar specifying cadence of output timesteps
+    :param r_min: Inner boundary radius in solar radii
+
+    :return model: SURF model object with required ambient wind conditions at required
+                    longitudes and latitude
+    """
+
+    assert type(start_datetime) == datetime.datetime
+
+    start_time: Time = Time(start_datetime, scale="utc")
+    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
+    ert: Observer = S.Observer("EARTH", start_time)
+
+    # Set up SURF for a sim_time-day simulation, outputting every dt_scale
+    model: SURF = S.SURF(
+        v_boundary=vr_in,
+        cr_num=cr_num,
+        cr_lon_init=ert.lon_c.to(u.deg),
+        latitude=ert.lat.to(u.deg),
+        lon_start=lon_start.to(u.rad),
+        lon_stop=lon_stop.to(u.rad),
+        simtime=sim_time,
+        dt_scale=dt_scale,
+        r_min=r_min,
+#        accel_limit=accel_limit
+    )
+
+    # model1d = S.SURF(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
     #                  lon_out=0 * u.deg, simtime=5 * u.day, dt_scale=4)
     # print(type(model))
 
@@ -70,18 +119,18 @@ def setup_huxt(
 
 def initialise_cme_parameter_ensemble_dict(
         n_ensemble: int,
-        huxt_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
+        surf_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
 ) -> CmeParEns:
     """
     Function to initialise empty arrays for storing the CME parameters for each ensemble member at each analysis step
     :param n_ensemble: The number of ensemble members in the SIR analysis
-    :param huxt_init_time: Initial datetime of HUXt simulation
+    :param surf_init_time: Initial datetime of SURF simulation
     :return parameter_arrays: A dictionary of parameter keys and an empty array for
         storing each ensemble member value conforming to class CmeParEns
     """
 
     parameter_dict: CmeParEns = {
-        "huxt_init_time": huxt_init_time,
+        "surf_init_time": surf_init_time,
         "t_init": [
             datetime.datetime(2008, 1, 1, 0, 0, 0)
             for _ in range(n_ensemble)

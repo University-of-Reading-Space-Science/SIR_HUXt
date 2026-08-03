@@ -16,7 +16,6 @@ class LikelihoodFunction:
         :param hx: Observation operator (what model thinks the observation should be),
            should be precomputed previous to calculating the likelihood function
         """
-
         # If a list is provided to the class, convert it to an array
         if isinstance(obs, list):
             if len(obs) == 1:
@@ -28,10 +27,11 @@ class LikelihoodFunction:
                     self.obs: float = obs[0].item()
             else:
                 self.obs: npt.NDArray[float] = np.array(obs)
-        elif (isinstance(obs, np.ndarray)) and (np.ndim(obs) == 1):
+        elif (isinstance(obs, np.ndarray)) and (np.ndim(obs) == 0):
+            print(f"obs = {obs}: {type(obs)}, np.ndim = {np.ndim(obs)}")
             self.obs: float = obs.item()
         elif isinstance(obs, np.float64):
-            self.obs: float = obs.item()
+            self.obs: float = float(obs) #.item()
         else:
             self.obs: npt.NDArray[float] | float = obs
 
@@ -45,7 +45,7 @@ class LikelihoodFunction:
                     self.obs_cov: float = obs_cov[0].item()
             else:
                 self.obs_cov: npt.NDArray[float] = np.array(obs_cov)
-        elif (isinstance(obs_cov, np.ndarray)) and (np.ndim(obs_cov) == 1):
+        elif (isinstance(obs_cov, np.ndarray)) and (np.ndim(obs_cov) == 0):
             self.obs_cov: float = obs_cov.item().astype(float)
         elif isinstance(obs_cov, np.float64):
             self.obs_cov: float = obs_cov.item()
@@ -62,7 +62,7 @@ class LikelihoodFunction:
                     self.hx: float = hx[0].item()
             else:
                 self.hx: npt.NDArray[float] = np.array(hx)
-        elif (isinstance(hx, np.ndarray)) and (np.ndim(hx) == 1):
+        elif (isinstance(hx, np.ndarray)) and (np.ndim(hx) == 0):
             self.hx: float = hx.item()
         elif isinstance(hx, np.float64):
             self.hx: float = hx.item()
@@ -102,6 +102,7 @@ class LikelihoodFunction:
                 #print(f"obs_cov={self.obs_cov}")
                 self.obs_cov: float = obs_cov[0]
 
+
     def log_likelihood_gaussian(self) -> float:
         """
         log_likelihood_function_gaussian: The purpose of this definition is to calculate the
@@ -116,8 +117,14 @@ class LikelihoodFunction:
         #  of the likelihood function
         if np.ndim(self.obs_cov) == 0:
             # 1D-case
+            innov_float = float(innov)
             obs_cov_1: float = 1.0 / self.obs_cov
-            log_likelihood: float = -obs_cov_1 * innov * innov
+            log_likelihood: float = -obs_cov_1 * innov_float * innov_float
+
+            return log_likelihood
+        elif np.ndim(self.obs_cov) == 1:
+            obs_cov_1: float = 1.0 / float(self.obs_cov.item())
+            log_likelihood: float = -obs_cov_1 * float(np.transpose(innov).dot(innov))
 
             return log_likelihood
         else:
@@ -144,6 +151,7 @@ class LikelihoodFunction:
 
         return likelihood
 
+
     def make_log_likelihood(self) -> float:
         """
         make_log_likelihood: The purpose of this definition is to calculate the logarithm
@@ -163,7 +171,3 @@ class LikelihoodFunction:
         likelihood: float = self.likelihood_gaussian()
 
         return likelihood
-
-
-
-

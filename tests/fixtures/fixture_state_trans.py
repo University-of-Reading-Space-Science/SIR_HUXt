@@ -1,4 +1,3 @@
-
 import pytest
 import numpy as np
 import astropy.units as u
@@ -8,12 +7,12 @@ import sys
 import numpy.typing as npt
 from astropy.units import Quantity
 
-sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
+sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\src')
 from cme_par_ens import CmeParEns
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
 
-#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests')
+#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\tests')
 from cme_par_array import CmeParArray
 from cme_par_dict import CmeParDict
 
@@ -24,9 +23,9 @@ def get_n_members() -> int:
 
 
 @pytest.fixture
-def get_huxt_init_time() -> datetime.datetime:
-    huxt_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
-    return huxt_init_time
+def get_surf_init_time_state_trans() -> datetime.datetime:
+    surf_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
+    return surf_init_time
 
 #########################################################################################
 ######################## GET THE VALUES FOR THE DICTIONARY ##############################
@@ -122,7 +121,7 @@ def get_thick_dict(get_n_members) -> list[Quantity]:
 @pytest.fixture
 def par_dict(
     get_n_members,
-    get_huxt_init_time,
+    get_surf_init_time_state_trans,
     get_t_init_dict,
     get_v_dict,
     get_width_dict,
@@ -133,7 +132,7 @@ def par_dict(
 
     par_class = CmeParDict(
         n_members=get_n_members,
-        huxt_init_time=get_huxt_init_time,
+        surf_init_time=get_surf_init_time_state_trans,
         t_init=get_t_init_dict,
         v=get_v_dict,
         width=get_width_dict,
@@ -152,7 +151,7 @@ def init_to_state_vector(par_dict, request) -> ToStateVector:
     else:
         pars_in_state_vector = None
     print(f"pars_in_state_vector={pars_in_state_vector}")
-
+    print(f"par_dict = {par_dict}")
     return ToStateVector(par_dict, pars_in_state_vector=pars_in_state_vector)
 ############################################################################################
 
@@ -251,7 +250,7 @@ def get_thick_state(get_n_members) -> list[Quantity]:
 @pytest.fixture
 def par_state(
         get_n_members,
-        get_huxt_init_time,
+        get_surf_init_time_state_trans,
         get_t_init_state,
         get_v_state,
         get_width_state,
@@ -262,7 +261,7 @@ def par_state(
 
     par_class = CmeParDict(
         n_members=get_n_members,
-        huxt_init_time=get_huxt_init_time,
+        surf_init_time=get_surf_init_time_state_trans,
         t_init=get_t_init_state,
         v=get_v_state,
         width=get_width_state,
@@ -334,7 +333,7 @@ def get_thick_array(get_n_members) -> npt.NDArray[float]:
 @pytest.fixture
 def par_array(
         get_n_members,
-        get_huxt_init_time,
+        get_surf_init_time_state_trans,
         get_t_init_array,
         get_v_array,
         get_width_array,
@@ -345,7 +344,7 @@ def par_array(
 
     par_class = CmeParArray(
         n_members=get_n_members,
-        huxt_init_time=get_huxt_init_time,
+        surf_init_time=get_surf_init_time_state_trans,
         t_init=get_t_init_array,
         v=get_v_array,
         width=get_width_array,

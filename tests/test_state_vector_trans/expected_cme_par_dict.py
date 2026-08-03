@@ -8,7 +8,7 @@ from SIR_HUXt.tests.cme_par_dict import CmeParDict
 
 class ExpCmeParDict:
     def __init__(self):
-        self.huxt_init_time: datetime.datetime = datetime.datetime(
+        self.surf_init_time: datetime.datetime = datetime.datetime(
             year=2021, month=1, day=1, hour=0, minute=0, second=0
         )
         self.n_members: int = 5
@@ -41,8 +41,8 @@ class ExpCmeParDict:
             3, 12, 5, 7, 8
         ] * u.solRad
 
-    def expected_huxt_init_time(self) -> datetime.datetime:
-        return self.huxt_init_time
+    def expected_surf_init_time(self) -> datetime.datetime:
+        return self.surf_init_time
 
     def expected_t_init(self) -> list[datetime.datetime]:
         return self.exp_t_init
@@ -65,7 +65,7 @@ class ExpCmeParDict:
     def expected_cme_par_dict(self):
         par_class = CmeParDict(
             n_members=self.n_members,
-            huxt_init_time=self.huxt_init_time,
+            surf_init_time=self.surf_init_time,
             t_init=self.exp_t_init,
             v=self.exp_v,
             width=self.exp_width,

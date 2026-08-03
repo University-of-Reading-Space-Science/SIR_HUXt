@@ -5,8 +5,8 @@ import numpy.typing as npt
 from SIR_HUXt.tests.test_state_vector_trans.expected_cme_par_arr import ExpCmeParArray, ExpStateVector
 
 #sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-from SIR_HUXt.code.cme_par_ens import CmeParEns
-from SIR_HUXt.code.to_state_vector import ToStateVector
+from SIR_HUXt.src.cme_par_ens import CmeParEns
+from SIR_HUXt.src.to_state_vector import ToStateVector
 
 @pytest.mark.usefixtures("init_to_state_vector")
 class TestToStateVector:

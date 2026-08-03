@@ -19,12 +19,13 @@ def jacobian_log(exponents: list[float]) -> float:
     # Update the Jacobian logarithm based upon the algorithm in Gentner (2008) Algorithm 1
     for i in range(1, lenExp):
         # Calculate the components
-        term1: float = np.max([jacob_log, exponents[i]])
+        if ~np.isnan(exponents[i]):
+            term1: float = np.max([jacob_log, exponents[i]])
 
-        t2exp: float = -np.abs(exponents[i] - jacob_log)
-        term2: float = np.log(1 + np.exp(t2exp))
+            t2exp: float = -np.abs(exponents[i] - jacob_log)
+            term2: float = np.log(1 + np.exp(t2exp))
 
-        jacob_log: float = term1 + term2
+            jacob_log: float = term1 + term2
 
     return jacob_log
 
@@ -36,13 +37,15 @@ class ResampleParsLogWeights:
             n_ensemble: int = None,
             rng: Generator = None
     ):
-        #self.log_weights: list[float] = log_weights
+        self.log_weights: list[float] = log_weights
+        print(f"self.log_weights1 = {self.log_weights}")
 
         # Remove nan or infinite values from log_weights
         self.log_weights: list[float] = [
             x if (~np.isnan(x) or np.isfinite(x)) else -1e31
             for x in log_weights
         ]
+        print(f"self.log_weights2 = {self.log_weights}")
 
         if n_ensemble is None:
             self.n_ensemble: int = len(log_weights)

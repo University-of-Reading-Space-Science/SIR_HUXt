@@ -1,5 +1,5 @@
 # @package sir
-# This module will take inputs from HUXt and perform an SIR to
+# This module will take inputs from SURF and perform an SIR to
 #  generate an updated set of weights and particles
 import numpy as np
 import numpy.typing as npt
@@ -29,6 +29,7 @@ class AuxPF:
     """
     def __init__(
             self,
+            use_model: str,
             cme_par_dict: CmeParEns,
             obs: list[float] | float,
             obs_cov: list[float] | float,
@@ -47,10 +48,13 @@ class AuxPF:
             cme_init_rad: Quantity[u.solRad]=12 * u.solRad,
             cme_fixed_duration: bool = True,
             fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
-            plot_huxt_output: bool = False,
+            plot_surf_output: bool = False,
             bias_term_bool: bool = False,
+            bias_term_5rs: float = None,
+            bias_term_21rs: float = None,
             rng=None
     ):
+        self.use_model = use_model
         self.cme_par_dict:CmeParEns = cme_par_dict
 
         self.obs = obs
@@ -70,7 +74,7 @@ class AuxPF:
         self.cme_init_rad = cme_init_rad
         self.cme_fixed_duration = cme_fixed_duration
         self.fixed_duration = fixed_duration
-        self.plot_huxt_output = plot_huxt_output
+        self.plot_surf_output = plot_surf_output
 
         if rng is None:
             self.rng = np.random.default_rng()
@@ -78,7 +82,7 @@ class AuxPF:
             self.rng = rng
 
         self.n_pars_in_state = len(self.pars_in_state)
-        self.huxt_init_time = cme_par_dict["huxt_init_time"]
+        self.surf_init_time = cme_par_dict["surf_init_time"]
         self.n_members = cme_par_dict["n_members"]
 
         state_vector_class = ToStateVector(
@@ -108,11 +112,17 @@ class AuxPF:
         # Create a state_vector dictionary containing all shrunken parameters
         self.state_vector_shrunk_dict = self.make_state_vector_dictionary()
 
-        # Get HUXt simulation time for current observation time
+        # Get SURF simulation time for current observation time
         self.sim_time = self.get_sim_time()
 
         # Get bias_term_bool to determine whether to include a bias in the observation operator
         self.bias_term_bool = bias_term_bool
+        self.bias_term_5rs = bias_term_5rs
+        self.bias_term_21rs = bias_term_21rs
+
+        # Ensure all bias terms exist, if not, set bias_term_bool to False
+        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
+            self.bias_term_bool = False
 
 
     def get_state_cov(self) -> tuple[npt.NDArray[float], npt.NDArray[float]]:
@@ -228,10 +238,10 @@ class AuxPF:
 
     def get_sim_time(self) -> Quantity[u.day]:
         """
-        Get HUXt simulation time for current observation time
-        :return: sim_time: HUXt simulation time
+        Get SURF simulation time for current observation time
+        :return: sim_time: SURF simulation time
         """
-        init_astro_time = Time(self.huxt_init_time, format="datetime", scale="utc")
+        init_astro_time = Time(self.surf_init_time, format="datetime", scale="utc")
         obs_astro_time = Time(self.obs_time, format="datetime", scale="utc")
         #print(f"init_astro_time={init_astro_time}, obs_astro_time={obs_astro_time}")
         sim_time = (obs_astro_time - init_astro_time).to(u.day) + self.time_tolerance
@@ -253,7 +263,7 @@ class AuxPF:
 
         # If there are non-finite weights, set weight to zero (i.e. discard particle)
         weight_cond = ~np.isfinite(weights)
-        #print(weight_cond)
+        print(np.sum(weight_cond))
         if np.sum(weight_cond) > 0:
             weights[weight_cond] = 0
 
@@ -285,11 +295,12 @@ class AuxPF:
         :return: hx: Observation operator for self.obs_time
         """
         obs_op_class = ObservationOperator(
+            use_model=self.use_model,
             cme_par_dict=state_dict_in,
             obs_lon=self.obs_lon,
             obs_time_in_datetime=self.obs_time,
             obs_cov=self.obs_cov,
-            huxt_init_time=self.huxt_init_time,
+            surf_init_time=self.surf_init_time,
             vr_in=self.vr_in,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
@@ -299,13 +310,16 @@ class AuxPF:
             cme_init_rad=self.cme_init_rad,
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
-            plot_huxt_output=self.plot_huxt_output,
+            plot_surf_output=self.plot_surf_output,
             bias_term_bool=self.bias_term_bool,
+            bias_term_5rs=self.bias_term_5rs,
+            bias_term_21rs=self.bias_term_21rs,
         )
 
         hx = obs_op_class.make_obs_op()
         #print(f"hx={hx}")
         return hx
+
 
     def calculate_diff_between_obs_and_obs_op(self, hx):
         """
@@ -316,6 +330,7 @@ class AuxPF:
         obs_diff = self.obs - hx
 
         return obs_diff
+
 
     def calculate_likelihood_single_ens(self, hx):
         """
@@ -372,10 +387,10 @@ class AuxPF:
         log_aux_prob_unnorm = [
             self.log_weights[i] + log_likelihood[i] for i in range(self.n_members)
         ]
-
+        jacob_log = jacobian_log(log_aux_prob_unnorm)
         # Normalised logarithm of auxillary proabilities
         log_aux_prob_norm = [
-            log_aux_prob_unnorm[i] - jacobian_log(log_aux_prob_unnorm)
+            log_aux_prob_unnorm[i] - jacob_log
             for i in range(self.n_members)
         ]
 
@@ -475,10 +490,12 @@ class AuxPF:
 
 
         # Calculate the auxillary probabilities for selecting the new particles
-        log_aux_prob = self.get_aux_prob(log_likelihood_shrunk_ens)
+        log_aux_prob = self.get_aux_prob_log_weights(log_likelihood_shrunk_ens)
+        print(f"log_aux_prob1 = {log_aux_prob}")
         log_aux_prob = [
             x if ~np.isnan(x) else -1e31 for x in log_aux_prob
         ]
+        print(f"log_aux_prob2 = {log_aux_prob}")
 
         # Get indices to resample
         resample_class = ResampleParsLogWeights(
@@ -549,7 +566,7 @@ class AuxPF:
             inflFact,
             fixed_ambient=True,
             pars_in_state=["v", "lon", "width"],
-            huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+            surf_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
             vr_in=np.zeros(128) + 400 * u.km / u.s,
             lon_start=290 * u.deg,
             lon_stop=380 * u.deg,
@@ -570,7 +587,7 @@ class AuxPF:
         :param log_weights: Unnormalised logarithm of the weights
         :param fixed_ambient:
         :param pars_in_state:
-        :param hux_init_time:
+        :param surf_init_time:
         :param vr_in:
         :param lon_start:
         :param lon_stop:
@@ -593,7 +610,7 @@ class AuxPF:
         # pars = np.asarray(pars)   # Array containing all parameters as required
 
         obs = np.asarray(obs)
-        initAstroTime = Time(huxt_init_time, format="datetime", scale="utc")
+        initAstroTime = Time(surf_init_time, format="datetime", scale="utc")
         obs_astroTime = Time(obs_time, format="datetime", scale="utc")
         sim_time = (obs_astroTime - initAstroTime).to(u.day) + time_tolerance
         obs_time_in_jd = obs_astroTime.jd  # - initAstroTime.jd
@@ -630,9 +647,9 @@ class AuxPF:
         for j in range(nEns):
             if fixed_ambient:
                 if j == 0:
-                    # Initialise HUXt model object for each ensemble member
-                    model = setup_huxt(
-                        start_datetime=huxt_init_time,
+                    # Initialise SURF model object for each ensemble member
+                    model = setup_surf(
+                        start_datetime=surf_init_time,
                         vr_in=vr_in,
                         lon_start=lon_start,
                         lon_stop=lon_stop,
@@ -641,9 +658,9 @@ class AuxPF:
                         r_min=r_min,
                     )
             else:
-                # Initialise HUXt model object for each ensemble member
-                model = setup_huxt(
-                    start_datetime=huxt_init_time,
+                # Initialise SURF model object for each ensemble member
+                model = setup_surf(
+                    start_datetime=surf_init_time,
                     vr_in=vr_in,
                     lon_start=lon_start,
                     lon_stop=lon_stop,
@@ -666,7 +683,7 @@ class AuxPF:
                 # if parVal == 't_init':
                 #     if type(par_arr_j[ip]) is datetime.datetime:
                 #         par_arr_j[ip] = (
-                #             par_arr_j[ip] - cme_par_dict['huxt_init_time']
+                #             par_arr_j[ip] - cme_par_dict['surf_init_time']
                 #         ).total_seconds()
 
             log_likelihood_ens = log_likelihood_function(

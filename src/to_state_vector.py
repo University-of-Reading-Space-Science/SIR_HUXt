@@ -45,15 +45,17 @@ class ToStateVector:
 
     def convert_t_init_dict_to_array(self) -> npt.NDArray[float]:
         """
-        Function to convert datetime t_init to seconds since huxt_init_time
+        Function to convert datetime t_init to seconds since surf_init_time
         :param cme_par_dict: Dictionary that contains all CME parameters required
-            (must contain "huxt_init_time" and "t_init")
-        :return: t_init_arr: Array of t_init values in seconds since huxt_init_time
+            (must contain "surf_init_time" and "t_init")
+        :return: t_init_arr: Array of t_init values in seconds since surf_init_time
         """
-        assert all(p in self.cme_par_dict.keys() for p in ["huxt_init_time", "t_init", "n_members"])
+        assert all(p in self.cme_par_dict.keys() for p in ["surf_init_time", "t_init", "n_members"])
 
+        print(f"cme_par_dict[t_init] = {self.cme_par_dict['t_init']}")
+        print(f"cme_par_dict[surf_init_time] = {self.cme_par_dict['surf_init_time']}")
         t_init_arr: npt.NDArray[float] = np.array([
-            (self.cme_par_dict["t_init"][i] - self.cme_par_dict["huxt_init_time"]).total_seconds()
+            (self.cme_par_dict["t_init"][i] - self.cme_par_dict["surf_init_time"]).total_seconds()
             for i in range(self.n_ensemble)
         ])
 
@@ -144,16 +146,16 @@ class ToStateVector:
         :param cme_par_dict: Dictionary that contains all CME parameters required
         :return: cme_par_array: Array of CME parameters (with no units) in
             an (nEns, nPar) array with the following entries:
-                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["huxt_init_time"]
+                cme_par_array[:, 0] = cme_par_dict["t_init"] in seconds from cme_par_dict["surf_init_time"]
                 cme_par_array[:, 1] = cme_par_dict["v"] in km/s
                 cme_par_array[:, 2] = cme_par_dict["width"] in deg
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
                 cme_par_array[:, 4] = cme_par_dict["lat"] in deg
                 cme_par_array[:, 5] = cme_par_dict["thick"] in solar radii
         """
-        # Get the required keys and add the 'huxt_init_time' and 'n_members' keys as requirements for this function
+        # Get the required keys and add the 'surf_init_time' and 'n_members' keys as requirements for this function
         req_keys = required_dict_keys()
-        additional_keys_req = ["huxt_init_time", "n_members"]
+        additional_keys_req = ["surf_init_time", "n_members"]
         req_keys.update(additional_keys_req)
 
         assert all(p in self.cme_par_dict.keys() for p in req_keys)

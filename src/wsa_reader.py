@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 
-import huxt.huxt_inputs as Hin
+import surf.surf_inputs as Sin
 import astropy.units as u
 
 import requests
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     readWSAClass = ReadWSAFiles(requested_time, output_dir=output_dir)
     output_path = readWSAClass.download_file()
 
-    # Get input speeds for all longitudes for input into huxt
-    vr = Hin.get_WSA_long_profile(output_path, lat=0.0 * u.deg)
+    # Get input speeds for all longitudes for input into surf
+    vr = Sin.get_WSA_long_profile(output_path, lat=0.0 * u.deg)
     print(f"vr = {vr}")
     print(len(vr))

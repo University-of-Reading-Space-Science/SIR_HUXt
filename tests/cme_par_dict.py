@@ -14,7 +14,7 @@ class CmeParDict:
     def __init__(
             self,
             n_members: int,
-            huxt_init_time: datetime.datetime,
+            surf_init_time: datetime.datetime,
             t_init: list[datetime.datetime],
             v: list[Quantity],
             width: list[Quantity],
@@ -23,7 +23,7 @@ class CmeParDict:
             thick: list[Quantity]
     ):
         self.n_members = n_members
-        self.huxt_init_time = huxt_init_time
+        self.surf_init_time = surf_init_time
         self.t_init = t_init
         self.v = v
         self.width = width
@@ -35,7 +35,7 @@ class CmeParDict:
     def make_par_dict(self) -> CmeParEns:
         # Define a parameter dictionary
         par_dict = initialise_cme_parameter_ensemble_dict(
-            n_ensemble=self.n_members, huxt_init_time=self.huxt_init_time
+            n_ensemble=self.n_members, surf_init_time=self.surf_init_time
         )
         par_dict['t_init'] = self.t_init
         par_dict['v'] = self.v
