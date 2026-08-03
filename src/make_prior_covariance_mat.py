@@ -10,7 +10,7 @@ import pandas as pd
 import xarray as xr
 
 from huxt import huxt_inputs
-from sklearn.decomposition import dict_learning_online
+from surf import surf_inputs
 
 from cme_par_dict_structure import cme_par_get_indices, required_dict_keys, cme_par_key_to_index, cme_par_get_keys
 
@@ -165,46 +165,46 @@ def make_uncorr_uniform_samples(
         sd_lat: float=0,
         sd_thick: float=0
 ) -> npt.NDArray[float]:
+
     samples = np.zeros((6, n_ens))
 
     low_cme_t_init = mean_cme_pars[0] - sd_t_init
     high_cme_t_init = mean_cme_pars[0] + sd_t_init
     samples[0, :] = [
-        self.huxt_init_time + datetime.timedelta(
-            seconds=rng.uniform(low=low_cme_t_init, high=high_cme_t_init)
-        ) for _ in range(n_ens)
+        rng.uniform(low=low_cme_t_init, high=high_cme_t_init)
+        for _ in range(n_ens)
     ]
 
     low_cme_speed = (1 - sd_v) * mean_cme_pars[1]
     high_cme_speed = (1 + sd_v) * mean_cme_pars[1]
     samples[1, :] = [
         rng.uniform(low=low_cme_speed, high=high_cme_speed) for _ in range(n_ens)
-    ] * u.km / u.s
+    ]
 
 
     low_cme_width = mean_cme_pars[2] - sd_width
     high_cme_width = mean_cme_pars[2] + sd_width
     samples[2, :] = [
         rng.uniform(low=low_cme_width, high=high_cme_width) for _ in range(n_ens)
-    ] * u.deg
+    ]
 
     low_cme_lon = mean_cme_pars[3] - sd_lon
     high_cme_lon = mean_cme_pars[3] + sd_lon
     samples[3, :] = [
         rng.uniform(low=low_cme_lon, high=high_cme_lon) for _ in range(n_ens)
-    ] * u.deg
+    ]
 
     low_cme_lat = mean_cme_pars[4] - sd_lat
     high_cme_lat = mean_cme_pars[4] + sd_lat
     samples[4, :] = [
         rng.uniform(low=low_cme_lat, high=high_cme_lat) for _ in range(n_ens)
-    ] * u.deg
+    ]
 
     low_cme_thick = mean_cme_pars[5] - sd_thick
     high_cme_thick = mean_cme_pars[5] + sd_thick
     samples[5, :] = [
         rng.uniform(low=low_cme_thick, high=high_cme_thick) for _ in range(n_ens)
-    ] * u.solRad
+    ]
 
     return samples
 
@@ -377,6 +377,7 @@ def make_blair_samples(
 def make_donki_cov(
         start_time: datetime.datetime,
         end_time:datetime.datetime,
+        use_model: str,
         vars_req: npt.NDArray[str]=np.array(["t_init", "v", "width", "lon", "lat", "thick"]),
         scale_corr=False,
         sd_t_init: float=0,
@@ -395,6 +396,7 @@ def make_donki_cov(
     Make covariance matrix using DONKI CME catalogue
     :param start_time: Start time of DONKI CME catalogue
     :param end_time: End time of DONKI CME catalogue
+    :param use_model: String to determine which model to use, must be ["surf", "compress_surf", "huxt"]
     :param vars_req: List of variables to estimate covariance of
         Accepted inputs = ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param vars_req: List of variables that need to be perturbed in ensemble
@@ -416,15 +418,26 @@ def make_donki_cov(
     """
 
     ########################################################################
-    # Use routine in huxt.huxt_inputs to retrieve DONKI ConeCME parameters
+    # Use routine in surf.surf_inputs to retrieve DONKI ConeCME parameters
     ########################################################################
-    donki_cone_cme_dict = huxt_inputs.get_DONKI_coneCMEs(
-        startdate=start_time,
-        enddate=end_time,
-        mostAccOnly=most_acc_only,
-        catalog=catalog,
-        feature=feature
-    )
+    if use_model in ["surf", "compress_surf"]:
+        donki_cone_cme_dict = surf_inputs.get_DONKI_coneCMEs(
+            startdate=start_time,
+            enddate=end_time,
+            mostAccOnly=most_acc_only,
+            catalog=catalog,
+            feature=feature
+        )
+    elif use_model in ["huxt"]:
+        donki_cone_cme_dict = huxt_inputs.get_DONKI_coneCMEs(
+            startdate=start_time,
+            enddate=end_time,
+            mostAccOnly=most_acc_only,
+            catalog=catalog,
+            feature=feature
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
     print(donki_cone_cme_dict)
     ########################################################
     # Put CME parameters into a dataframe
@@ -946,10 +959,11 @@ def make_mo_cone_cme_cov(
         df_all_list = []
 
         ##############################################################################
-        # Use routine in huxt.huxt_inputs to retrieve Met Office ConeCME parameters
+        # Use routine in surf.surf_inputs to retrieve Met Office ConeCME parameters
         ##############################################################################
         for file_name in file_list:
-            mo_cone_dict = huxt_inputs.import_cone2bc_parameters(file_name)
+
+            mo_cone_dict = surf_inputs.import_cone2bc_parameters(file_name)
             len_mo_dict = len(mo_cone_dict)
 
             file_name_end = file_name.split("_")[-1]
@@ -1106,20 +1120,22 @@ def make_mo_cone_cme_cov(
         cov_out = mo_cone_cme_cov.copy()
     else:
         cov_out = mo_cone_cme_cov.values
+    len_cov_out = len(cov_out[0, :])
 
     if isinstance(mo_cone_cme_corr, np.ndarray):
         corr_out = mo_cone_cme_corr.copy()
     else:
-        corr_out = mo_cone_cme_corr.values
-
+        corr_out = mo_cone_cme_corr.values.copy()
+    len_corr_out = len(corr_out[0, :])
 
     for m, par_key in enumerate(cme_par_keys_ordered):
         if par_key == "lon":
+            print(type(cov_out))
             # Remove all non-diagonal entries from longitudinal covariances
             lon_var = cov_out[m, m]
 
-            cov_out[m, :] = 0
-            cov_out[:, m] = 0
+            cov_out[m, :] = 0#np.zeros(len_cov_out)
+            cov_out[:, m] = 0#np.zeros(len_cov_out)
             cov_out[m, m] = lon_var
 
             # corr_out[m, :] = 0
@@ -1247,8 +1263,8 @@ def make_mo_cone_samples(
     return mo_cone_samples
 
 '''
-    """# Use routine in huxt.huxt_inputs to retrieve DONKI ConeCME parameters
-    donki_cone_cme_dict = huxt_inputs.get_DONKI_coneCMEs(
+    """# Use routine in surf.surf_inputs to retrieve DONKI ConeCME parameters
+    donki_cone_cme_dict = surf_inputs.get_DONKI_coneCMEs(
         startdate=start_time,
         enddate=end_time,
         mostAccOnly=most_acc_only,

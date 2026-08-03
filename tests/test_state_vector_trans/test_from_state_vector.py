@@ -6,8 +6,8 @@ import sys
 from astropy.units import Quantity
 
 #sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
-from SIR_HUXt.code.cme_par_ens import CmeParEns
-from SIR_HUXt.code.from_state_vector import FromStateVector
+from SIR_HUXt.src.cme_par_ens import CmeParEns
+from SIR_HUXt.src.from_state_vector import FromStateVector
 
 from SIR_HUXt.tests.test_state_vector_trans.expected_cme_par_arr import ExpCmeParArray, ExpCmeArrayFromStateVector
 from SIR_HUXt.tests.test_state_vector_trans.expected_cme_par_dict import ExpCmeParDict
@@ -118,7 +118,7 @@ class TestFromStateVector:
         assert (cme_par_dict.keys() == expected_dict.keys())
 
         for key in cme_par_dict.keys():
-            if key in ["huxt_init_time", "n_members"]:
+            if key in ["surf_init_time", "n_members"]:
                 assert (cme_par_dict[key] == expected_dict[key])
             elif key == "t_init":
                 assert (cme_par_dict[key] == expected_dict[key])

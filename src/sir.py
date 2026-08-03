@@ -1,7 +1,6 @@
 # @package sir
-# This module will take inputs from HUXt and perform an SIR to
+# This module will take inputs from SURF and perform an SIR to
 #  generate an updated set of weights and particles
-import huxt.huxt
 import numpy as np
 import numpy.typing as npt
 import datetime
@@ -14,6 +13,9 @@ import json
 
 import huxt.huxt as H
 import huxt.huxt_analysis as HA
+
+import surf.surf as S
+import surf.surf_analysis as SA
 from mypy.build import TypedDict
 from scipy.special.cython_special import log_wright_bessel
 
@@ -26,7 +28,7 @@ from astropy.time import Time
 
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
-from init_sir import initialise_cme_parameter_ensemble_dict, setup_huxt
+from init_sir import initialise_cme_parameter_ensemble_dict, setup_surf
 import seaborn as sns
 import colorcet as cc
 import pytest
@@ -131,7 +133,7 @@ def add_units_from_cme_par(
 
     # Standardise the units and remove the astropy units
     cme_par_dict["t_init"] = np.array([
-        cme_par_dict["huxt_init_time"] + datetime.timedelta(seconds=cme_par_array[i, 0])
+        cme_par_dict["surf_init_time"] + datetime.timedelta(seconds=cme_par_array[i, 0])
         for i in range(nEns)
     ])
 
@@ -165,7 +167,7 @@ def remove_units_from_cme_par(cme_par_dict: CmeParEns) -> npt.NDArray[float]:
     nEns: int = len(cme_par_dict["weight"])
 
     # Array to hold the CME parameters in the following order
-    #  cme_par_array[:, 0] = CME start time in seconds from start of HUXt run
+    #  cme_par_array[:, 0] = CME start time in seconds from start of SURF run
     #  cme_par_array[:, 1] = CME speed
     #  cme_par_array[:, 2] = CME width
     #  cme_par_array[:, 3] = CME Longitude between +/- 180
@@ -175,7 +177,7 @@ def remove_units_from_cme_par(cme_par_dict: CmeParEns) -> npt.NDArray[float]:
 
     # Standardise the units and then remove the astropy units
     cme_par_array[:, 0]: Quantity[None] = [
-        (cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]).total_seconds()
+        (cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]).total_seconds()
         for i in range(nEns)
     ]
     # print(cme_par_dict['width'])
@@ -358,7 +360,7 @@ def state_vector_to_cme_par(state_ens, weights, par_req, cme_par_dict):
         par_temp = state_ens[:, i]
 
         if ip == "t_init":
-            par_temp = cme_par_dict["huxt_init_time"] + datetime.timedelta(
+            par_temp = cme_par_dict["surf_init_time"] + datetime.timedelta(
                 seconds=par_temp
             )
         elif ip == "v":
@@ -452,7 +454,8 @@ def shrink_par(pars, log_weights=None, delta=0.98):
 
 
 def obs_op(
-        huxtObject,
+        surfObject,
+        use_model,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -463,10 +466,10 @@ def obs_op(
     obs_op: The purpose of this definition is to perform the observation operator
               function that maps from the cme_parameters to observation space (in this
               case, the CME's flank position)
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param surfObject: SURF object that contains the ambient solar wind that the cme will be propagated through
     :param cme_par: Dictionary containing CME parameters with following keys:
     #  ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
-    :param huxt_start_time: Initial time of huxt object
+    :param surf_start_time: Initial time of surf object
     :param obs_timein_jd: Observation time that CME needs to be run to
 
     :return: hx: CME flank estimated by model
@@ -485,28 +488,42 @@ def obs_op(
     # print(cme_lat)
 
     # Generate CME object
-    cme = H.ConeCME(
-        t_launch=cme_launch_time,
-        longitude=cme_lon,
-        latitude=cme_lat,
-        width=cme_width,
-        v=cme_speed,
-        thickness=cme_thickness,  # ,
-        #        cme_fixed_duration=True,
-        #        fixed_duration=12 * 60 * 60 * u.s
-    )
+    if use_model in ["surf", "compress_surf"]:
+        cme = S.ConeCME(
+            t_launch=cme_launch_time,
+            longitude=cme_lon,
+            latitude=cme_lat,
+            width=cme_width,
+            v=cme_speed,
+            thickness=cme_thickness,  # ,
+            #        cme_fixed_duration=True,
+            #        fixed_duration=12 * 60 * 60 * u.s
+        )
+    elif use_model in ["huxt"]:
+        cme = H.ConeCME(
+            t_launch=cme_launch_time,
+            longitude=cme_lon,
+            latitude=cme_lat,
+            width=cme_width,
+            v=cme_speed,
+            thickness=cme_thickness,  # ,
+            #        cme_fixed_duration=True,
+            #        fixed_duration=12 * 60 * 60 * u.s
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
-    # Run CME through HUXt
-    huxtObject.solve([cme])
-    cme_member = huxtObject.cmes[0]
+    # Run CME through SURF
+    surfObject.solve([cme])
+    cme_member = surfObject.cmes[0]
 
     # Plot this out
     t_interest = obs_time_in_jd
-    # fig, ax = HA.plot(huxtObject, t_interest)
+    # fig, ax = SA.plot(surfObject, t_interest)
     # plt.show()
 
     # Calculate CME flank
-    obsObject = shmo.Observer(huxtObject, cme_member, obs_lon)
+    obsObject = shmo.Observer(surfObject, cme_member, obs_lon)
     cme_flank = obsObject.compute_flank_profile(cme_member)
 
     # Get the CME elongation at the required observation time
@@ -519,7 +536,7 @@ def obs_op(
 def likelihood_function_gaussian(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -531,7 +548,7 @@ def likelihood_function_gaussian(
       likelihood function
     :param obs: Observation of the CME flank
     :param obs_cov: Observation error covariance matrix of the CME flank
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param surfObject: SURF object that contains the ambient solar wind that the cme will be propagated through
     :param cme_par: CME parameters with following keys:
       ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param obs_lon: Observation longitude
@@ -543,7 +560,7 @@ def likelihood_function_gaussian(
     loglik = log_likelihood_function_gaussian(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -560,7 +577,7 @@ def likelihood_function_gaussian(
 def likelihood_function(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -571,7 +588,7 @@ def likelihood_function(
     likelihood_function: The purpose of this definition is to calculate the likelihood function with no assumptions
     :param obs: Observation of the CME flank
     :param obs_cov: Observation error covariance matrix of the CME flank
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param surfObject: SURF object that contains the ambient solar wind that the cme will be propagated through
     :param cme_par: CME parameters with following keys:
       ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param obs_lon: Observation longitude
@@ -583,7 +600,7 @@ def likelihood_function(
     likelihood = likelihood_function_gaussian(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -597,7 +614,7 @@ def likelihood_function(
 def log_likelihood_function_gaussian(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -609,7 +626,7 @@ def log_likelihood_function_gaussian(
       logarithm of the likelihood function
     :param obs: Observation of the CME flank
     :param obs_cov: Observation error covariance matrix of the CME flank
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param surfObject: SURF object that contains the ambient solar wind that the cme will be propagated through
     :param cme_par: cme parameters with following keys:
        ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param obs_lon: Observation longitude
@@ -619,7 +636,7 @@ def log_likelihood_function_gaussian(
 
     # Calculate the observation operator (what the model thinks the observation should be)
     hx = obs_op(
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -654,7 +671,7 @@ def log_likelihood_function_gaussian(
 def log_likelihood_function(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -665,7 +682,7 @@ def log_likelihood_function(
     log_likelihood_function: The purpose of this definition is to calculate the logarithm of the likelihood
     :param obs: Observation of the CME flank
     :param obs_cov: Observation error covariance matrix of the CME flank
-    :param huxtObject: HUXt object that contains the ambient solar wind that the cme will be propagated through
+    :param surfObject: SURF object that contains the ambient solar wind that the cme will be propagated through
     :param cme_par: CME parameters with following keys:
       ['t_init', 'v', 'width', 'lon', 'lat', 'thick']
     :param obs_lon: Observation longitude
@@ -677,7 +694,7 @@ def log_likelihood_function(
     log_likelihood = log_likelihood_function_gaussian(
         obs,
         obs_cov,
-        huxtObject,
+        surfObject,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -714,11 +731,12 @@ def jacob_log(x_list):
 
 
 def make_synthetic_obs(
+        use_model,
         true_cme_par_dict,
         obs_lon,
         obs_cov,
         obs_times_in_datetime,
-        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        surf_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
         lon_start=290 * u.deg,
         lon_stop=380 * u.deg,
@@ -729,11 +747,12 @@ def make_synthetic_obs(
 ):
     """
     Function to create synthetic observations
+    :param use_model:
     :param true_cme_par_dict:
     :param obs_lon:
     :param obs_cov:
     :param obs_times_in_datetime:
-    :param huxt_init_time:
+    :param surf_init_time:
     :param vr_in:
     :param lon_start:
     :param lon_stop:
@@ -742,7 +761,7 @@ def make_synthetic_obs(
     :return:
     """
 
-    initAstroTime = Time(huxt_init_time, format="datetime", scale="utc")
+    initAstroTime = Time(surf_init_time, format="datetime", scale="utc")
     obs_time_in_jd = [
         Time(obs_t_i, format="datetime", scale="utc").jd
         for obs_t_i in obs_times_in_datetime
@@ -750,25 +769,38 @@ def make_synthetic_obs(
     # sim_time = (obs_astroTime - initAstroTime).to(u.day) + time_tolerance
     # obs_time_in_jd = obs_astroTime.jd  # - initAstroTime.jd
 
-    # Initialise HUXt model object for each ensemble member
-    model = setup_huxt(
-        start_datetime=huxt_init_time,
-        vr_in=vr_in,
-        lon_start=lon_start,
-        lon_stop=lon_stop,
-        sim_time=sim_time,
-        dt_scale=dt_scale,
-        r_min=r_min,
-    )
+    # Initialise SURF model object for each ensemble member
+    if use_model in ["surf", "compress_surf"]:
+        model = setup_surf(
+            start_datetime=surf_init_time,
+            vr_in=vr_in,
+            lon_start=lon_start,
+            lon_stop=lon_stop,
+            sim_time=sim_time,
+            dt_scale=dt_scale,
+            r_min=r_min,
+        )
+    elif use_model in ["huxt"]:
+        model = setup_huxt(
+            start_datetime=surf_init_time,
+            vr_in=vr_in,
+            lon_start=lon_start,
+            lon_stop=lon_stop,
+            sim_time=sim_time,
+            dt_scale=dt_scale,
+            r_min=r_min,
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
     # Extract CME parameters from list
-    # Calculate time taken to go from cme's initial radius to huxt inner boundary
+    # Calculate time taken to go from cme's initial radius to surf inner boundary
     cme_speed = true_cme_par_dict["v"].to(u.km / u.s)
 
     dist_to_inner_rad = (r_min.to(u.solRad) - cme_init_rad.to(u.solRad)).to(u.km)
     cme_transit_time = dist_to_inner_rad / cme_speed
     cme_launch_time = (
-                              true_cme_par_dict["t_init"] - true_cme_par_dict["huxt_init_time"]
+                              true_cme_par_dict["t_init"] - true_cme_par_dict["surf_init_time"]
                       ).total_seconds() * u.s + cme_transit_time
     print(
         true_cme_par_dict["t_init"] + datetime.timedelta(seconds=cme_launch_time.value)
@@ -782,19 +814,33 @@ def make_synthetic_obs(
     cme_thickness = true_cme_par_dict["thick"].to(u.solRad)
 
     # Generate CME object
-    cme = H.ConeCME(
-        t_launch=cme_launch_time,
-        longitude=cme_lon,
-        latitude=cme_lat,
-        width=cme_width,
-        v=cme_speed,
-        thickness=cme_thickness,  # ,
-        # cme_fixed_duration=True,
-        # fixed_duration=12 * 60 * 60 * u.s
-    )
+    if use_model in ["surf", "compress_surf"]:
+        cme = S.ConeCME(
+            t_launch=cme_launch_time,
+            longitude=cme_lon,
+            latitude=cme_lat,
+            width=cme_width,
+            v=cme_speed,
+            thickness=cme_thickness,  # ,
+            #        cme_fixed_duration=True,
+            #        fixed_duration=12 * 60 * 60 * u.s
+        )
+    elif use_model in ["huxt"]:
+        cme = H.ConeCME(
+            t_launch=cme_launch_time,
+            longitude=cme_lon,
+            latitude=cme_lat,
+            width=cme_width,
+            v=cme_speed,
+            thickness=cme_thickness,  # ,
+            #        cme_fixed_duration=True,
+            #        fixed_duration=12 * 60 * 60 * u.s
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
     # print(cme.coords.items())
 
-    # Run CME through HUXt
+    # Run CME through SURF
     model.solve([cme])
     cme_member = model.cmes[0]
 
@@ -810,12 +856,16 @@ def make_synthetic_obs(
         synth_obs.append(cme_flank["el"].values[indReq] + obs_pert)
 
         # Plot this out
-        # print(obs_times_in_datetime[it])
-        t_interest = (obs_times_in_datetime[it] - huxt_init_time).total_seconds() * u.s
-        # print(t_interest.value)
-        fig, ax = HA.plot(model, t_interest)
-        ax.set_title(f"Synth obs CME at {obs_times_in_datetime[it]}")
-        plt.show()
+        t_interest = (obs_times_in_datetime[it] - surf_init_time).total_seconds() * u.s
+        if use_model in ["surf", "compress_surf"]:
+            fig, ax = SA.plot(model, t_interest)
+            ax.set_title(f"Synth obs CME at {obs_times_in_datetime[it]}")
+            plt.show()
+        elif use_model in ["huxt"]:
+            fig, ax = HA.plot(model, t_interest)
+            ax.set_title(f"Synth obs CME at {obs_times_in_datetime[it]}")
+            plt.show()
+
     return synth_obs
 
 
@@ -843,7 +893,7 @@ def auxPf(
         inflFact,
         fixed_ambient=True,
         pars_in_state=["v", "lon", "width"],
-        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        surf_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
         lon_start=290 * u.deg,
         lon_stop=380 * u.deg,
@@ -887,7 +937,7 @@ def auxPf(
     # pars = np.asarray(pars)   # Array containing all parameters as required
 
     obs = np.asarray(obs)
-    initAstroTime = Time(huxt_init_time, format="datetime", scale="utc")
+    initAstroTime = Time(surf_init_time, format="datetime", scale="utc")
     obs_astroTime = Time(obs_time, format="datetime", scale="utc")
     sim_time = (obs_astroTime - initAstroTime).to(u.day) + time_tolerance
     obs_time_in_jd = obs_astroTime.jd  # - initAstroTime.jd
@@ -924,9 +974,9 @@ def auxPf(
     for j in range(nEns):
         if fixed_ambient:
             if j == 0:
-                # Initialise HUXt model object for each ensemble member
-                model = setup_huxt(
-                    start_datetime=huxt_init_time,
+                # Initialise SURF model object for each ensemble member
+                model = setup_surf(
+                    start_datetime=surf_init_time,
                     vr_in=vr_in,
                     lon_start=lon_start,
                     lon_stop=lon_stop,
@@ -935,9 +985,9 @@ def auxPf(
                     r_min=r_min,
                 )
         else:
-            # Initialise HUXt model object for each ensemble member
-            model = setup_huxt(
-                start_datetime=huxt_init_time,
+            # Initialise SURF model object for each ensemble member
+            model = setup_surf(
+                start_datetime=surf_init_time,
                 vr_in=vr_in,
                 lon_start=lon_start,
                 lon_stop=lon_stop,
@@ -960,7 +1010,7 @@ def auxPf(
             # if parVal == 't_init':
             #     if type(par_arr_j[ip]) is datetime.datetime:
             #         par_arr_j[ip] = (
-            #             par_arr_j[ip] - cme_par_dict['huxt_init_time']
+            #             par_arr_j[ip] - cme_par_dict['surf_init_time']
             #         ).total_seconds()
 
         log_likelihood_ens = log_likelihood_function(
@@ -1187,11 +1237,11 @@ def main():
     initCMEparCov = generateCovInitCMEPar(file_path, vars_req)
     print(initCMEparCov)
 
-    huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
+    surf_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
     n_ens = 500
 
-    cme_par_dict = initialise_cme_parameter_ensemble_dict(n_ens, huxt_init_time)
-    true_cme_par_dict = initialise_cme_parameter_ensemble_dict(1, huxt_init_time)
+    cme_par_dict = initialise_cme_parameter_ensemble_dict(n_ens, surf_init_time)
+    true_cme_par_dict = initialise_cme_parameter_ensemble_dict(1, surf_init_time)
 
     # Initialise true CME parameters
     true_cme_t_init = datetime.datetime(2008, 1, 1, 1, 0, 0)
@@ -1246,7 +1296,7 @@ def main():
         obs_lon,
         obs_cov,
         obs_times,
-        huxt_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
+        surf_init_time=datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in=np.zeros(128) + 400 * u.km / u.s,
         lon_start=290 * u.deg,
         lon_stop=430 * u.deg,
@@ -1375,7 +1425,7 @@ def main():
         # Save prior parameters in an array
         cme_saved_pars[0, :, 0] = [
             (
-                    cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
+                    cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
             ).total_seconds()
             for i in range(n_ens)
         ]
@@ -1413,7 +1463,7 @@ def main():
                 inflFact=inflationFact,  # log_weights,
                 fixed_ambient=True,
                 pars_in_state=["v", "width", "lon"],  # 'lon', 'width'],
-                huxt_init_time=huxt_init_time,
+                surf_init_time=surf_init_time,
                 vr_in=np.zeros(128) + 400 * u.km / u.s,
                 lon_start=290 * u.deg,
                 lon_stop=430 * u.deg,
@@ -1432,7 +1482,7 @@ def main():
             # Standardise the units and remove the astropy units
             cme_saved_pars[yi + 1, :, 0] = [
                 (
-                        cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
+                        cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
                 ).total_seconds()
                 for i in range(n_ens)
             ]
@@ -1457,7 +1507,7 @@ def main():
         # Make an xarray object
         cme_par_ds = xr.Dataset(
             data_vars=dict(
-                model_init_time=huxt_init_time,
+                model_init_time=surf_init_time,
                 cme_init_rad=cme_init_rad,
                 r_min=r_min,
                 ambient_vr=(["n_lon"], np.zeros(128) + 400 * u.km / u.s),
@@ -1471,7 +1521,7 @@ def main():
             coords=dict(
                 obs_no=("n_obs", range(len(synth_obs) + 1)),
                 ens_no=("n_ens", range(n_ens)),
-                huxt_lon=("n_lon", (2 * np.pi / 128.0) * np.arange(128)),
+                surf_lon=("n_lon", (2 * np.pi / 128.0) * np.arange(128)),
             ),
         )
         print(cme_par_ds)
@@ -1480,9 +1530,9 @@ def main():
         #
         # for yi, y_obs in enumerate(synth_obs):
         #     # Calculate the elongation profile for the current observation for the next three days
-        #     # Initialise HUXt model object for each ensemble member
-        #     model3 = setup_huxt(
-        #         start_datetime=huxt_init_time,
+        #     # Initialise SURF model object for each ensemble member
+        #     model3 = setup_surf(
+        #         start_datetime=surf_init_time,
         #         vr_in=np.zeros(128) + 400 * u.km / u.s,
         #         lon_start=290 * u.deg,
         #         lon_stop=430 * u.deg,
@@ -1507,7 +1557,7 @@ def main():
         #         cme_thickness = cme_saved_pars[yi, m, 5] * u.solRad
         #
         #         # Generate CME object
-        #         cme = H.ConeCME(
+        #         cme = S.ConeCME(
         #             t_launch=cme_launch_time,
         #             longitude=cme_lon,
         #             latitude=cme_lat,
@@ -1517,13 +1567,13 @@ def main():
         #         )
         #         # print(cme.coords.items())
         #
-        #         # Run CME through HUXt
+        #         # Run CME through SURF
         #         model3.solve([cme])
         #         cme_member = model3.cmes[0]
         #
         #         # # Plot this out
-        #         # t_interest = (obs_times[yi] - huxt_init_time).total_seconds() * u.s
-        #         # fig, ax = HA.plot(model3, t_interest)
+        #         # t_interest = (obs_times[yi] - surf_init_time).total_seconds() * u.s
+        #         # fig, ax = SA.plot(model3, t_interest)
         #         # ax.set_title(f"CME at {obs_times[yi]} for ensemble member {m}")
         #         # plt.show()
         #

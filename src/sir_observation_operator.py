@@ -1,9 +1,12 @@
 # @package sir_observation_operator
-# This module will take a HUXt and ConeCME object and calculate its elongation profile
+# This module will take a SURF and ConeCME object and calculate its elongation profile
 #  for use as an observation operator in the data assimilation algorithm
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+
+import surf.surf as S
+import surf.surf_analysis as SA
 
 import huxt.huxt as H
 import huxt.huxt_analysis as HA
@@ -14,40 +17,36 @@ from astropy.units import Quantity
 from astropy.time import Time
 
 #from .to_state_vector import ToStateVector
-from init_sir import setup_huxt
+from init_sir import setup_huxt, setup_surf
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
 class Observer:
     """
-    The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a HUXt simulation
+    The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a SURF simulation
     for an observer at a specified longitude relative to Earth. The observers distance defaults to 1 AU, and has the same latitude as Earth
-    during the HUXt run.
+    during the SURF run.
     Author: Luke Barnard
     """
 
     @u.quantity_input(longitude=u.deg)
     def __init__(
             self,
-            model: H.HUXt,
-            cme: H.ConeCME,
+            use_model: str,
+            model: S.SURF | H.HUXt,
+            cme: S.ConeCME | H.HUXt,
             longitude: Quantity[u.deg],
             el_min: float=4.0,
             el_max: float=30.0
     ):
-
-        ert_ephem: H.Observer = model.get_observer('EARTH')
-
-        self.time: npt.NDArray[Time] = ert_ephem.time
-        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
-        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
-        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
+        self.use_model: str = use_model
+        self.lon: Quantity[u.deg] = longitude
         self.el_min: float = el_min
         self.el_max: float = el_max
 
         # Force longitude into 0-360 domain
-        id_over: list[bool] = self.lon > 360 * u.deg
-        id_under: list[bool] = self.lon < 0 * u.deg
+        id_over: list[bool] | bool = self.lon > 360 * u.deg
+        id_under: list[bool] | bool = self.lon < 0 * u.deg
         if np.any(id_over):
             self.lon[id_over] = self.lon[id_over] - 360 * u.deg
 
@@ -56,15 +55,30 @@ class Observer:
 
         self.model_flank: pd.DataFrame = self.compute_flank_profile(cme)
 
+        if self.use_model in ["surf", "surf_compress"]:
+            ert_ephem: S.Observer = model.get_observer('EARTH')
+        elif self.use_model in ["huxt"]:
+            ert_ephem: H.Observer = model.get_observer('EARTH')
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
-    def compute_flank_profile(self, cme: H.ConeCME) -> pd.DataFrame:
+        self.time: npt.NDArray[Time] = ert_ephem.time
+        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
+        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
+        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
+
+
+    def compute_flank_profile(
+            self,
+            cme: H.ConeCME | S.ConeCME
+    ) -> pd.DataFrame:
         """
-        Compute the time elongation profile of the flank of a ConeCME in HUXt. The observer longtiude is specified
+        Compute the time elongation profile of the flank of a ConeCME in SURF. The observer longtiude is specified
         relative to Earth but otherwise matches Earth's coords.
 
         Parameters
         ----------
-        cme: A ConeCME object from a completed HUXt run (i.e the ConeCME.coords dictionary has been populated).
+        cme: A ConeCME object from a completed SURF run (i.e the ConeCME.coords dictionary has been populated).
         Returns
         -------
         obs_profile: Pandas dataframe giving the coordinates of the ConeCME flank from STA's perspective, including the
@@ -137,11 +151,12 @@ class Observer:
 class ObservationOperator:
     def __init__(
             self,
+            use_model: str,
             cme_par_dict: CmeParEns,
             obs_lon: Quantity[u.deg],
             obs_time_in_datetime: list[datetime.datetime] | datetime.datetime,
             obs_cov: npt.NDArray[float] | float = None,
-            huxt_init_time: datetime.datetime = None,
+            surf_init_time: datetime.datetime = None,
             vr_in: npt.NDArray[Quantity[u.km / u.s]] = None,
             lon_start: Quantity[u.deg] = None,
             lon_stop: Quantity[u.deg] = None,
@@ -151,34 +166,42 @@ class ObservationOperator:
             cme_init_rad: Quantity[u.solRad] = None,
             cme_fixed_duration:bool = True,
             fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
-            plot_huxt_output: bool = False,
+            plot_surf_output: bool = False,
             bias_term_bool: bool = False,
+            bias_term_5rs: float = None,
+            bias_term_21rs: float = None,
     ) -> None:
         """
         Class to get observations for DA from
+        :param use_model: String to determine whether to use SURF, Compressible SURF or HUXt
         :param obs_lon: Longitude of observation source
         :param obs_time_in_datetime: Times observations are taken
         :param cme_par_dict: To be used to create synthetic observations, a dictionary containing true parameters
             to create a truth CME simulation
         :param obs_cov: To be used with synthetic observations, an observation covariance matrix to be used to
             add random noise to  truth CME elongations
-        :param huxt_init_time: Initial datetime for HUXt model
-        :param vr_in: Velocities at the inner boundary of the HUXt model domain
-        :param lon_start: Longitude where we start the HUXt simulation
-        :param lon_stop: Longitude where we stop the HUXt simulation
-        :param sim_time: How long the HUXt simulation will run for
+        :param surf_init_time: Initial datetime for SURF model
+        :param vr_in: Velocities at the inner boundary of the SURF model domain
+        :param lon_start: Longitude where we start the SURF simulation
+        :param lon_stop: Longitude where we stop the SURF simulation
+        :param sim_time: How long the SURF simulation will run for
         :param dt_scale: Frequency with which the model will output
-        :param r_min: Minimum radius of HUXt simulation
+        :param r_min: Minimum radius of SURF simulation
         :param cme_init_rad: Initial radius the CME is observed at
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
-        :param plot_huxt_output: Boolean to determine whether to plot HUXt output at observation time
+        :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
         :param bias_term_bool: Boolean to determine whether to use bias term or not
+        :param bias_term_5rs: Float to determine bias term at 5Rs
+        :param bias_term_21rs: Float to determine bias term at 21Rs
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: CHANGE cme_init_rad SUCH THAT IT CAN BE VARIED BETWEEN ENSEMBLE MEMBERS
         :TODO: Change such that observations are downloaded if need be
         """
+
+        self.use_model = use_model.lower()
+        assert (self.use_model in ["surf", "surf_compress", "huxt"])
 
         if obs_lon is None:
             self.obs_lon = 0 * u.deg
@@ -189,7 +212,7 @@ class ObservationOperator:
         self.obs_time_in_datetime = obs_time_in_datetime
         self.obs_time_in_jd = Time(self.obs_time_in_datetime, format='datetime').jd
 
-        # Define all variables required to initialise HUXt are provided
+        # Define all variables required to initialise SURF are provided
         #print(cme_par_dict)
         assert (all([cme_par_dict, obs_cov]) is not None)
         assert all(p in cme_par_dict.keys() for p in required_dict_keys())
@@ -199,11 +222,11 @@ class ObservationOperator:
 
         self.n_members = self.cme_par_dict["n_members"]
         #print(f"self.n_members = {self.n_members}")
-        # Initialise default huxt setup
-        if huxt_init_time is None:
-            self.huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
+        # Initialise default surf setup
+        if surf_init_time is None:
+            self.surf_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
         else:
-            self.huxt_init_time = huxt_init_time
+            self.surf_init_time = surf_init_time
 
         if vr_in is None:
             self.vr_in = np.ones(128) * 400 * u.km / u.s
@@ -251,32 +274,37 @@ class ObservationOperator:
         else:
             self.fixed_duration = fixed_duration
 
-        self.plot_huxt_output = plot_huxt_output
+        self.plot_surf_output = plot_surf_output
         self.bias_term_bool = bias_term_bool
+        self.bias_term_5rs = bias_term_5rs
+        self.bias_term_21rs = bias_term_21rs
+
+        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
+            self.bias_term_bool = False
 
 
     def extract_cme_launch_time_and_speed(self) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
         """
         Function to extract the CME launch time and speed at r_min
-        :return: cme_launch_time: CME launch time in seconds from start of HUXt model run
+        :return: cme_launch_time: CME launch time in seconds from start of SURF model run
         :return cme_speed: CME launch speed at r_min
         """
-        # Calculate time taken to go from cme's initial radius to huxt inner boundary
+        # Calculate time taken to go from cme's initial radius to surf inner boundary
         # Ensure all variables are lists, if not make them into lists
         # Get CME launch time
         try:
             [
-                (t - self.cme_par_dict["huxt_init_time"]).total_seconds()
+                (t - self.cme_par_dict["surf_init_time"]).total_seconds()
                 for t in self.cme_par_dict["t_init"]
             ]
         except TypeError:
             seconds_to_cme: list[float] = [
-                (t - self.cme_par_dict["huxt_init_time"]).total_seconds()
+                (t - self.cme_par_dict["surf_init_time"]).total_seconds()
                 for t in [self.cme_par_dict["t_init"]]
             ]
         else:
             seconds_to_cme: list[float] = [
-                (t - self.cme_par_dict["huxt_init_time"]).total_seconds()
+                (t - self.cme_par_dict["surf_init_time"]).total_seconds()
                 for t in self.cme_par_dict["t_init"]
             ]
         #print(f"seconds_to_cme = {seconds_to_cme}")
@@ -414,10 +442,10 @@ class ObservationOperator:
         return cme_launch_time, cme_speed, cme_width, cme_lon, cme_lat, cme_thickness
 
 
-    def make_cme_objects(self) -> list[H.ConeCME]:
+    def make_cme_objects(self) -> list[S.ConeCME] | list[H.ConeCME]:
         """
-        Function to make a HUXt ConeCME model object to be propagated through HUXt
-        :return: cme_obj: HUXt ConeCME model object
+        Function to make a SURF ConeCME model object to be propagated through SURF
+        :return: cme_obj: SURF ConeCME model object
         """
         # Extract CME parameters from true_cme_dict
         cme_pars = self.extract_cme_parameters()
@@ -430,62 +458,112 @@ class ObservationOperator:
 
         # Generate CME object
         #print(f"cme_launch_time = {cme_launch_time}")
-        cme_objects: list[H.ConeCME] = [
-            H.ConeCME(
-                t_launch=cme_launch_time[i],
-                v=cme_speed[i],
-                width=cme_width[i],
-                longitude=cme_lon[i],
-                latitude=cme_lat[i],
-                thickness=cme_thickness[i],
-                cme_fixed_duration=self.cme_fixed_duration,
-                fixed_duration=self.fixed_duration
-            ) for i in range(self.n_members)
-        ]
+        if self.use_model in ["surf", "surf_compress"]:
+            cme_objects: list[S.ConeCME] = [
+                S.ConeCME(
+                    t_launch=cme_launch_time[i],
+                    v=cme_speed[i],
+                    width=cme_width[i],
+                    longitude=cme_lon[i],
+                    latitude=cme_lat[i],
+                    thickness=cme_thickness[i],
+                    cme_fixed_duration=self.cme_fixed_duration,
+                    fixed_duration=self.fixed_duration
+                ) for i in range(self.n_members)
+            ]
+        elif self.use_model in ["huxt"]:
+            cme_objects: list[H.ConeCME] = [
+                H.ConeCME(
+                    t_launch=cme_launch_time[i],
+                    v=cme_speed[i],
+                    width=cme_width[i],
+                    longitude=cme_lon[i],
+                    latitude=cme_lat[i],
+                    thickness=cme_thickness[i],
+                    cme_fixed_duration=self.cme_fixed_duration,
+                    fixed_duration=self.fixed_duration
+                ) for i in range(self.n_members)
+            ]
+        else:
+            cme_objects = []
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
         return cme_objects
 
 
-    def plot_huxt(self, model) -> None:
+    def plot_surf(self, model) -> None:
         for it, obs_t in enumerate(self.obs_time_in_datetime):
             # Get nearest timestep to required observation time
-            t_interest = (self.obs_time_in_datetime[it] - self.huxt_init_time).total_seconds() * u.s
+            t_interest = (self.obs_time_in_datetime[it] - self.surf_init_time).total_seconds() * u.s
 
-            # Make the plot using HUXt's plotting routine
-            fig, ax = HA.plot(model, t_interest)
-            ax.set_title(f"Synth obs CME at {obs_time_in_datetime[it]}")
-            plt.show()
+            # Make the plot using SURF's plotting routine
+            if self.use_model in ["surf", "surf_compress"]:
+                fig, ax = SA.plot(model, t_interest)
+                ax.set_title(f"Synth obs CME at {obs_time_in_datetime[it]}")
+                plt.show()
+            elif self.use_model in ["huxt"]:
+                fig, ax = HA.plot(model, t_interest)
+                ax.set_title(f"Synth obs CME at {obs_time_in_datetime[it]}")
+                plt.show()
+            else:
+                sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
         return None
 
 
-    def get_cme_flank_single_ens_member(self, cme: H.ConeCME) -> pd.DataFrame:
+    def get_cme_flank_single_ens_member(
+            self,
+            cme: H.ConeCME | S.ConeCME
+    ) -> pd.DataFrame:
         """
         Function to retrieve the CME's flank for a single ensemble member
         :return: cme_flank: CME flank dataframe
         """
-        # Initialise HUXt model object for each ensemble member
-        model: HUXt = setup_huxt(
-            start_datetime=self.huxt_init_time,
-            vr_in=self.vr_in,
-            lon_start=self.lon_start,
-            lon_stop=self.lon_stop,
-            sim_time=self.sim_time,
-            dt_scale=self.dt_scale,
-            r_min=self.r_min
-        )
+        # Initialise SURF model object for each ensemble member
+        if self.use_model in ["surf", "surf_compress"]:
+            model: SURF = setup_surf(
+                start_datetime=self.surf_init_time,
+                vr_in=self.vr_in,
+                lon_start=self.lon_start,
+                lon_stop=self.lon_stop,
+                sim_time=self.sim_time,
+                dt_scale=self.dt_scale,
+                r_min=self.r_min
+            )
+            # Run CME through SURF
+            model.solve([cme])
 
-        # Run CME through HUXt
-        model.solve([cme])
+            cme_member: S.ConeCME = model.cmes[0]
 
-        cme_member: H.ConeCME = model.cmes[0]
+        elif self.use_model in ["huxt"]:
+            model: HUXt = setup_huxt(
+                start_datetime=self.surf_init_time,
+                vr_in=self.vr_in,
+                lon_start=self.lon_start,
+                lon_stop=self.lon_stop,
+                sim_time=self.sim_time,
+                dt_scale=self.dt_scale,
+                r_min=self.r_min
+            )
+            # Run CME through SURF
+            model.solve([cme])
+
+            cme_member: H.ConeCME = model.cmes[0]
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf' or 'huxt'")
+
         #print(f"cme_member={cme_member}")
         # Calculate CME flank
-        observer_object: Observer = Observer(model, cme_member, self.obs_lon)
+        observer_object: Observer = Observer(
+            use_model=self.use_model,
+            model=model,
+            cme=cme_member,
+            longitude=self.obs_lon
+        )
         cme_flank: pd.DataFrame = observer_object.model_flank #compute_flank_profile(cme_member)
 
-        if self.plot_huxt_output:
-            self.plot_huxt(model)
+        if self.plot_surf_output:
+            self.plot_surf(model)
 
         return cme_flank
 
@@ -496,7 +574,7 @@ class ObservationOperator:
          and store them in a list
         :return: cme_flanks: List of CME flank dataframes
         """
-        cme_objects: list[H.ConeCME] = self.make_cme_objects()
+        cme_objects: list[S.ConeCME] | list[H.ConeCME] = self.make_cme_objects()
 
         #print(f"make_cme_objects = {cme_objects}")
         cme_flanks: list[pd.DataFrame] = [
@@ -507,29 +585,27 @@ class ObservationOperator:
 
         return cme_flanks
 
+
     def obs_op_bias_correction(
             self,
-            corr_at_elon6: float,
-            corr_at_elon_21: float,
             elon: float
     ):
         """
         Function to calculate the bias correction due to using tracer particles to measure CME flank
         Initial experiments will use a simple linear relation
-        :param corr_at_elon6: Correction required at elongation 5deg
-        :param corr_at_elon_21: Correction required at elongation 21deg
         :param elon: Elongation to calculate the bias correction for
         :return: bias_corr: bias correction
         """
-
+        print(f"bias terms = 5rS: {self.bias_term_5rs}, 21rS: {self.bias_term_21rs}")
         # Calculate gradient and constant terms for linear relation
-        m: float = (corr_at_elon6 - corr_at_elon_21) / 15.0
-        c: float = ((21 * corr_at_elon6) - (6 * corr_at_elon_21)) / 15.0
+        m: float = (self.bias_term_5rs - self.bias_term_21rs) / 15.0
+        c: float = ((21 * self.bias_term_5rs) - (5 * self.bias_term_21rs)) / 15.0
 
         # Calculate bias required
         bias_corr = (m * elon) + c
 
         return bias_corr
+
 
     def make_obs_op(self) -> npt.NDArray[float]:
         """
@@ -567,13 +643,10 @@ class ObservationOperator:
                 #print(f"ind_req={ind_req}")
                 #print(f"self.bias_term_bool1 = {self.bias_term_bool}")
                 if self.bias_term_bool:
-                    obs_op[i, :] = [
-                        cme_flank["el"].values[ind_req] + self.obs_op_bias_correction(
-                            corr_at_elon6=3.5,
-                            corr_at_elon_21=1.5,
-                            elon=cme_flank["el"].values[ind_req]
-                        )
-                    ]
+                    obs_op[i, :] = [(
+                        cme_flank["el"].values[ind_req]
+                        + self.obs_op_bias_correction(elon=cme_flank["el"].values[ind_req])
+                    )]
                 else:
                     obs_op[i, :] = [cme_flank["el"].values[ind_req]]
 
@@ -590,10 +663,8 @@ class ObservationOperator:
                 ]
                 #print(f"inds_req={inds_req}")
                 #print(f"self.bias_term_bool = {self.bias_term_bool}")
-                obs_op[i, :] = [
+                obs_op[i, :]: list[float] = [
                     cme_flank["el"].values[j] + self.obs_op_bias_correction(
-                        corr_at_elon6=1.5,
-                        corr_at_elon_21=1.5,
                         elon=cme_flank["el"].values[j]
                     )
                     if self.bias_term_bool else cme_flank["el"].values[j]

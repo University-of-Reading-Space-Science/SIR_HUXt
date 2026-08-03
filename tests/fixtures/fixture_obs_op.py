@@ -18,43 +18,41 @@ from from_state_vector import FromStateVector
 from tests.cme_par_array import CmeParArray
 from tests.cme_par_dict import CmeParDict
 
-#from SIR_HUXt.tests.fixtures.fixture_state_trans import par_dict
-import huxt.huxt as H
 #################################################################################################
-# Initialise variables for inputting into HUXt and initialising the observation operator class
+# Initialise variables for inputting into SURF and initialising the observation operator class
 #################################################################################################
 @pytest.fixture
-def get_huxt_init_time2() -> datetime.datetime:
-    huxt_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
-    return huxt_init_time
+def get_surf_init_time_obs_op() -> datetime.datetime:
+    surf_init_time = datetime.datetime(year=2021, month=1, day=1, hour=0, minute=0, second=0)
+    return surf_init_time
 
 @pytest.fixture
-def get_huxt_vr_in() -> npt.NDArray[float]:
+def get_surf_vr_in() -> npt.NDArray[float]:
     vr_in = np.ones(128) * 450
     return vr_in
 
 @pytest.fixture
-def get_huxt_lon_start() -> Quantity[u.deg]:
+def get_surf_lon_start() -> Quantity[u.deg]:
     lon_start = 316 * u.deg
     return lon_start
 
 @pytest.fixture
-def get_huxt_lon_stop() -> Quantity[u.deg]:
+def get_surf_lon_stop() -> Quantity[u.deg]:
     lon_stop = 382 * u.deg
     return lon_stop
 
 @pytest.fixture
-def get_huxt_simtime() -> Quantity[u.day]:
+def get_surf_simtime() -> Quantity[u.day]:
     sim_time = 2 * u.day
     return sim_time
 
 @pytest.fixture
-def get_huxt_dt_scale() -> int | float:
+def get_surf_dt_scale() -> int | float:
     dt_scale=19
     return dt_scale
 
 @pytest.fixture
-def get_huxt_r_min() -> Quantity[u.solRad]:
+def get_surf_r_min() -> Quantity[u.solRad]:
     r_min = 30 * u.solRad
     return r_min
 
@@ -90,6 +88,10 @@ def get_obs_times(obs_op_tests) -> list[datetime.datetime]:
 
     return obs_times
 
+@pytest.fixture
+def get_use_model() -> str:
+    use_model = "huxt"
+    return use_model
 
 @pytest.fixture
 def get_obs_cov() -> float:
@@ -100,16 +102,17 @@ def get_obs_cov() -> float:
 @pytest.fixture
 def init_obs_op(
         par_dict: CmeParDict,
+        get_use_model: str,
         get_obs_lon: Quantity[u.deg],
         get_obs_times: list[datetime.datetime],
         get_obs_cov: float,
-        get_huxt_init_time2: datetime.datetime,
-        get_huxt_vr_in: Quantity[u.solRad],
-        get_huxt_lon_start: Quantity[u.deg],
-        get_huxt_lon_stop: Quantity[u.deg],
-        get_huxt_simtime: Quantity[u.day],
-        get_huxt_dt_scale: int | float,
-        get_huxt_r_min: Quantity[u.solRad],
+        get_surf_init_time_obs_op: datetime.datetime,
+        get_surf_vr_in: Quantity[u.solRad],
+        get_surf_lon_start: Quantity[u.deg],
+        get_surf_lon_stop: Quantity[u.deg],
+        get_surf_simtime: Quantity[u.day],
+        get_surf_dt_scale: int | float,
+        get_surf_r_min: Quantity[u.solRad],
         get_cme_init_rad: Quantity[u.solRad],
         get_cme_fixed_duration: bool,
         get_fixed_duration: Quantity[u.s],
@@ -121,17 +124,18 @@ def init_obs_op(
         test_no = -1
 
     obs_op_obj = ObservationOperator(
+        use_model=get_use_model,
         cme_par_dict=par_dict,
         obs_lon = get_obs_lon,
         obs_time_in_datetime = get_obs_times,
         obs_cov = get_obs_cov,
-        huxt_init_time = get_huxt_init_time2,
-        vr_in = get_huxt_vr_in,
-        lon_start = get_huxt_lon_start,
-        lon_stop = get_huxt_lon_stop,
-        sim_time = get_huxt_simtime,
-        dt_scale = get_huxt_dt_scale,
-        r_min = get_huxt_r_min,
+        surf_init_time = get_surf_init_time_obs_op,
+        vr_in = get_surf_vr_in,
+        lon_start = get_surf_lon_start,
+        lon_stop = get_surf_lon_stop,
+        sim_time = get_surf_simtime,
+        dt_scale = get_surf_dt_scale,
+        r_min = get_surf_r_min,
         cme_init_rad = get_cme_init_rad,
         cme_fixed_duration = get_cme_fixed_duration,
         fixed_duration = get_fixed_duration,
@@ -141,7 +145,7 @@ def init_obs_op(
 
 
 @pytest.fixture
-def init_test_cme_flank_single_ens(get_huxt_init_time2: datetime.datetime, request) -> pd.DataFrame:
+def init_test_cme_flank_single_ens(get_surf_init_time_obs_op: datetime.datetime, request) -> pd.DataFrame:
     if hasattr(request, 'param'):
         ens_member = request.param
     else:
@@ -156,7 +160,7 @@ def init_test_cme_flank_single_ens(get_huxt_init_time2: datetime.datetime, reque
     # Define times over one day
     n_timesteps_day: int = 144
     times: Time = Time([
-        get_huxt_init_time2 + datetime.timedelta(seconds=i * deltaT.value)
+        get_surf_init_time_obs_op + datetime.timedelta(seconds=i * deltaT.value)
         for i in range(n_timesteps_day)
     ])
 
@@ -191,7 +195,7 @@ def init_test_cme_flank_single_ens(get_huxt_init_time2: datetime.datetime, reque
 
 
 @pytest.fixture
-def init_test_cme_flanks(get_huxt_init_time2: datetime.datetime, request) -> list[pd.DataFrame]:
+def init_test_cme_flanks(get_surf_init_time_obs_op: datetime.datetime, request) -> list[pd.DataFrame]:
     if hasattr(request, 'param'):
         n_ensemble = request.param
     else:
@@ -204,7 +208,7 @@ def init_test_cme_flanks(get_huxt_init_time2: datetime.datetime, request) -> lis
     # Define times over one day
     n_timesteps_day: int = 144
     times: Time = Time([
-        get_huxt_init_time2 + datetime.timedelta(seconds=i * deltaT.value)
+        get_surf_init_time_obs_op + datetime.timedelta(seconds=i * deltaT.value)
         for i in range(n_timesteps_day)
     ])
     print(f"n_ensemble = {n_ensemble}")

@@ -13,6 +13,7 @@ import matplotlib as mpl
 import numpy as np
 
 import huxt.huxt as H
+import surf.surf as S
 import xarray as xr
 import scipy.stats as st
 
@@ -206,6 +207,7 @@ def plot_par_values_over_mult_runs(
 
 def get_cme_arrival_time(
         ds,
+        use_model,
         runNo=0,
         n_ens=50,
         real_arrival_time=None,
@@ -217,7 +219,14 @@ def get_cme_arrival_time(
     print(start_time)
     start_time_astro = Time(start_time, format='datetime')
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
-    ert = H.Observer("EARTH", start_time_astro)
+
+    if use_model in ["surf", "compress_surf"]:
+        ert = S.Observer("EARTH", start_time_astro)
+    elif use_model in ["huxt"]:
+        ert = H.Observer("EARTH", start_time_astro)
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
     lon_start = 300 * u.deg
     lon_end = 420 * u.deg
 
@@ -229,18 +238,34 @@ def get_cme_arrival_time(
 
     n_members = len(ds["ens_no"].values)
 
-    model: HUXt = H.HUXt(
-        v_boundary=ds["ambient_vr"].values * u.km / u.s,
-        cr_num=cr_num,
-        cr_lon_init=ert.lon_c.to(u.deg),
-        latitude=ert.lat.to(u.deg),
-        lon_start=lon_start.to(u.rad),
-        lon_stop=lon_end.to(u.rad),
-        simtime=5 * u.day,
-        dt_scale=20,
-        r_min=ds["r_min"].values * u.solRad,
-        #        accel_limit=accel_limit
-    )
+    if use_model in ["surf", "compress_surf"]:
+        model: SURF = S.SURF(
+            v_boundary=ds["ambient_vr"].values * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=ds["r_min"].values * u.solRad,
+            #        accel_limit=accel_limit
+        )
+    elif use_model in ["huxt"]:
+        model: HUXt = H.HUXt(
+            v_boundary=ds["ambient_vr"].values * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=ds["r_min"].values * u.solRad,
+            #        accel_limit=accel_limit
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
     # Generate CME object
     # print(f"cme_launch_time = {cme_launch_time}")
@@ -289,31 +314,60 @@ def get_cme_arrival_time(
         np.exp(log_weights_post[i]) for i in range(n_members)
     ])
 
-    prior_cme_objects: list[H.ConeCME] = [
-        H.ConeCME(
-            t_launch=sec_to_cme_prior[i],
-            v=v_prior[i],
-            width=width_prior[i],
-            longitude=lon_prior[i],
-            latitude=lat_prior[i],
-            thickness=thick_prior[i],
-            cme_fixed_duration=True,
-            fixed_duration=12 * 3600 * u.s
-        ) for i in range(n_members)
-    ]
+    if use_model in ["surf", "compress_surf"]:
+        prior_cme_objects: list[S.ConeCME] = [
+            S.ConeCME(
+                t_launch=sec_to_cme_prior[i],
+                v=v_prior[i],
+                width=width_prior[i],
+                longitude=lon_prior[i],
+                latitude=lat_prior[i],
+                thickness=thick_prior[i],
+                cme_fixed_duration=True,
+                fixed_duration=12 * 3600 * u.s
+            ) for i in range(n_members)
+        ]
 
-    post_cme_objects: list[H.ConeCME] = [
-        H.ConeCME(
-            t_launch=sec_to_cme_post[i],
-            v=v_post[i],
-            width=width_post[i],
-            longitude=lon_post[i],
-            latitude=lat_post[i],
-            thickness=thick_post[i],
-            cme_fixed_duration=True,
-            fixed_duration=12 * 3600 * u.s
-        ) for i in range(n_members)
-    ]
+        post_cme_objects: list[S.ConeCME] = [
+            S.ConeCME(
+                t_launch=sec_to_cme_post[i],
+                v=v_post[i],
+                width=width_post[i],
+                longitude=lon_post[i],
+                latitude=lat_post[i],
+                thickness=thick_post[i],
+                cme_fixed_duration=True,
+                fixed_duration=12 * 3600 * u.s
+            ) for i in range(n_members)
+        ]
+    elif use_model in ["huxt"]:
+        prior_cme_objects: list[H.ConeCME] = [
+            H.ConeCME(
+                t_launch=sec_to_cme_prior[i],
+                v=v_prior[i],
+                width=width_prior[i],
+                longitude=lon_prior[i],
+                latitude=lat_prior[i],
+                thickness=thick_prior[i],
+                cme_fixed_duration=True,
+                fixed_duration=12 * 3600 * u.s
+            ) for i in range(n_members)
+        ]
+
+        post_cme_objects: list[H.ConeCME] = [
+            H.ConeCME(
+                t_launch=sec_to_cme_post[i],
+                v=v_post[i],
+                width=width_post[i],
+                longitude=lon_post[i],
+                latitude=lat_post[i],
+                thickness=thick_post[i],
+                cme_fixed_duration=True,
+                fixed_duration=12 * 3600 * u.s
+            ) for i in range(n_members)
+        ]
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
     prior_count_hit = 0
     post_count_hit = 0
@@ -727,15 +781,18 @@ def main():
     #     "mo_cone",# "New folder",
     #     "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     # )
-    event_list = ["ssw_007", "ssw_008"]#, "ssw_009", "ssw_012"]
+    event_list = ["ssw_008", "ssw_009", "ssw_012"]#["ssw_007", "ssw_008", "ssw_009", "ssw_012"]
     craft_list = ["sta", "stb"]
     img_list = ["diff"] # ["norm", "diff"]
     par_type = "donki"
-    bias_folder_name = "const3.5deg"
+    use_model = "surf"
+    bias_folder_name = "bias5_2.5_bias21_2.5"
     n_ens = 50
     all_comb_list = [
         (x, y, z) for x in event_list for y in craft_list for z in img_list
     ]
+
+    assert (use_model in ["surf", "compress_surf", "huxt"])
 
     for (event, craft, img) in all_comb_list:
         print(f"\nevent: {event}, craft: {craft}, img: {img}")
@@ -875,11 +932,11 @@ def main():
         elif event == "ssw_012":
             if par_type=="donki":
                 prior_dir = "prior_725_60_90_5_0"
-                cme_hit_object = "STA"
+                cme_hit_object = "EARTH"
             else:
                 prior_dir = "prior_664_94_22_20_0"
                 cme_hit_object = "EARTH"
-            real_arrival_time = datetime.datetime(2012, 11, 23, 21, 12, 0)
+            real_arrival_time = datetime.datetime(2012, 11, 23, 21, 10, 0)
             fig_title = f"CME-4: {craft_name} data assimilated"
 
             if craft == "sta":
@@ -925,9 +982,16 @@ def main():
         else:
             sys.exit(f"Unknown event {event}.")
         obs_dir_name = f"obs_{craft}_{event}_{img}"
+        """baseFilePath = os.path.join(
+            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
+            "WSA_v", f"{use_model.upper()}", f"ens_{n_ens}", "mo_cone", obs_dir_name,  # "New folder",
+            prior_dir, "0.98",
+        )"""
         baseFilePath = os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output", "bias_correction",
-            bias_folder_name, "WSA_v", f"ens_{n_ens}", "mo_cone", obs_dir_name, # "New folder",
+            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
+            "WSA_v", f"{use_model.upper()}", f"ens_{n_ens}", "mo_cone",
+            "bias_correction", bias_folder_name,
+            obs_dir_name, # "New folder",
             prior_dir, "0.98",
         )
         """baseFilePath = os.path.join(
@@ -957,6 +1021,7 @@ def main():
             get_cme_arrival_time(
                 ds,
                 runNo,
+                use_model=use_model,
                 n_ens=n_ens,
                 real_arrival_time=real_arrival_time,
                 cme_hit_object=cme_hit_object,

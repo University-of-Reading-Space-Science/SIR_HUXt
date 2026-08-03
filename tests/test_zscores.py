@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import sys
 
-sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code')
+sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\src')
 import sir
 
 class TestZscores:

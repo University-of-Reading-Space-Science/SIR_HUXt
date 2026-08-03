@@ -8,13 +8,16 @@ import xarray as xr
 from typing import TypedDict
 import json
 
+import surf.surf as S
+import surf.surf_inputs as Sin
+
 import huxt.huxt as H
 import huxt.huxt_inputs as Hin
-import huxt.huxt_analysis as HA
+
+import surf.surf_analysis as SA
 from mypy.build import TypedDict
 from scipy.special.cython_special import log_wright_bessel
 
-import sir_huxt_mono_obs as shmo
 import sunpy.coordinates.sun as sn
 
 import astropy.units as u
@@ -62,45 +65,60 @@ def allowed_cov_types():
 
 
 def get_mas_wsa_const():
-    mas_wsa_const = "const"
+    mas_wsa_const = "wsa"
     
     return mas_wsa_const
 
-def get_huxt_init_time():
+def get_surf_init_time():
 
     ssw_event, _, _ = get_ssw_event_craft()
     if get_use_synthetic_obs():
-        huxt_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0)
+        surf_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0)
     else:
         if ssw_event == "ssw_007":
-            huxt_init_time: datetime.datetime = datetime.datetime(2012, 8, 31, 0, 0, 0)
+            surf_init_time: datetime.datetime = datetime.datetime(2012, 8, 31, 0, 0, 0)
 
         elif ssw_event == "ssw_008":
-            huxt_init_time: datetime.datetime = datetime.datetime(2012, 9, 27, 15, 0, 0)
+            surf_init_time: datetime.datetime = datetime.datetime(2012, 9, 27, 15, 0, 0)
 
         elif ssw_event == "ssw_009":
-            huxt_init_time: datetime.datetime = datetime.datetime(2012, 10, 4, 20, 0, 0)
+            surf_init_time: datetime.datetime = datetime.datetime(2012, 10, 4, 20, 0, 0)
 
         elif ssw_event == "ssw_012":
-            huxt_init_time: datetime.datetime = datetime.datetime(2012, 11, 20, 0, 0, 0)
+            surf_init_time: datetime.datetime = datetime.datetime(2012, 11, 20, 0, 0, 0)
 
         else:
             sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
 
-    return huxt_init_time
+    return surf_init_time
 
 
-def initialise_huxt_parameters():
+def get_use_model():
     """
-    Function to initialise the Huxt parameters for simulation
+    Function to get model we require to use
+    :return: use_model: String containing either "surf", "surf_compress", "huxt"
+    """
+    poss_models = ["surf", "surf_compress", "huxt"]
+
+    use_model = "surf"
+
+    assert use_model.lower() in poss_models
+
+    return use_model.lower()
+
+
+def initialise_surf_parameters():
+    """
+    Function to initialise the SURF parameters for simulation
     :return:
     """
     mas_or_wsa = get_mas_wsa_const()
 
-    huxt_init_time = get_huxt_init_time()
+    surf_init_time = get_surf_init_time()
+    use_model = get_use_model().lower()
 
-    huxt_init_time_astro = Time(huxt_init_time, format="datetime")
-    ert = H.Observer("EARTH", huxt_init_time_astro)
+    surf_init_time_astro = Time(surf_init_time, format="datetime")
+    ert = S.Observer("EARTH", surf_init_time_astro)
     earth_lat = ert.lat.to(u.deg)
     earth_lon = ert.lat.to(u.deg)
 
@@ -109,39 +127,56 @@ def initialise_huxt_parameters():
     sim_time: Quantity[u.day] = 3 * u.day
     dt_scale: int = 1
     cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
-    r_min: Quantity[u.solRad] = 30 * u.solRad
+    r_min: Quantity[u.solRad] = 21.5 * u.solRad
     cme_fixed_duration: bool = True
     fixed_duration: Quantity[u.s] = 12 * 3600 * u.s
 
 
     if mas_or_wsa.upper() == "MAS":
-        cr_num: int = np.trunc(sn.carrington_rotation_number(huxt_init_time))
-        vr_in = Hin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
+        cr_num: int = np.trunc(sn.carrington_rotation_number(surf_init_time))
+
+        if use_model in ["surf", "compress_surf"]:
+            vr_in = Sin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
+        elif use_model in ["huxt"]:
+            vr_in = Hin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
     elif mas_or_wsa.upper() == "WSA":
         wsa_dir = os.getenv('WSA_DIR')
-        readWSAClass = ReadWSAFiles(huxt_init_time, output_dir=wsa_dir)
+        readWSAClass = ReadWSAFiles(surf_init_time, output_dir=wsa_dir)
         output_path = readWSAClass.download_file()
 
-        # Get input speeds for all longitudes for input into huxt
-        # vr_in = Hin.get_WSA_long_profile(output_path, lat=0.0 * u.deg)
-
+        # Get input speeds for all longitudes for input into surf
         # Decelerate the WSA map from 1-AU calibrated speeds to expected 21.5 rS values
         # Load in map and Earth lon cut, decaccelerate both from 215 to 21.5.
-        huxt_init_time_astro = Time(huxt_init_time, format="datetime")
-        ert = H.Observer("EARTH", huxt_init_time_astro)
+        surf_init_time_astro = Time(surf_init_time, format="datetime")
+        ert = S.Observer("EARTH", surf_init_time_astro)
         earth_lat = ert.lat.to(u.deg)
 
         # Can't use hin.map_vmap_inwards as that shifts the longitudes and interpolates, which we do not want for
         # WSA
-        vr_in = Hin.get_WSA_long_profile(output_path, lat=earth_lat)
-        n_lon = len(vr_in)
-        v_lon_grid_step = 2 * np.pi / n_lon
-        v_lons = np.array([
-            i * v_lon_grid_step for i in range(n_lon)
-        ]) * u.rad
+        if use_model in ["surf", "compress_surf"]:
+            vr_in = Sin.get_WSA_long_profile(output_path, lat=earth_lat)
+            n_lon = len(vr_in)
+            v_lon_grid_step = 2 * np.pi / n_lon
+            v_lons = np.array([
+                i * v_lon_grid_step for i in range(n_lon)
+            ]) * u.rad
 
-        vr_in, lon_temp = Hin.map_v_inwards(vr_in, 215 * u.solRad, v_lons, r_min)
+            vr_in, lon_temp = Sin.map_v_inwards(vr_in, 215 * u.solRad, v_lons, r_min)
+        elif use_model in ["huxt"]:
+            vr_in = Hin.get_WSA_long_profile(output_path, lat=earth_lat)
+            n_lon = len(vr_in)
+            v_lon_grid_step = 2 * np.pi / n_lon
+            v_lons = np.array([
+                i * v_lon_grid_step for i in range(n_lon)
+            ]) * u.rad
+
+            vr_in, lon_temp = Hin.map_v_inwards(vr_in, 215 * u.solRad, v_lons, r_min)
+        else:
+            sys.exit("Unknown model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
 
     elif mas_or_wsa.upper() == "CONST":
         vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
@@ -149,8 +184,9 @@ def initialise_huxt_parameters():
         print("Defaulting to constant ambient solar wind of 400 km/s")
         vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
 
-    out_huxt_par = {
-        "huxt_init_time": huxt_init_time,
+    out_surf_par = {
+        "use_model": use_model,
+        "surf_init_time": surf_init_time,
         "vr_in": vr_in,
         "lon_start": lon_start,
         "lon_stop": lon_stop,
@@ -162,17 +198,17 @@ def initialise_huxt_parameters():
         "fixed_duration": fixed_duration
     }
 
-    return out_huxt_par
+    return out_surf_par
 
 
 def initialise_true_cme_par_dict():
-    huxt_init_time = get_huxt_init_time()
+    surf_init_time = get_surf_init_time()
     true_cme_par_dict = initialise_cme_parameter_ensemble_dict(
-        1, huxt_init_time
+        1, surf_init_time
     )
 
     # Initialise true CME parameters
-    true_cme_t_init: datetime.datetime = huxt_init_time + datetime.timedelta(hours=1)
+    true_cme_t_init: datetime.datetime = surf_init_time + datetime.timedelta(hours=1)
     true_cme_speed: float = 495
     true_cme_width: float = 37.4
     true_cme_lon: float = 0
@@ -197,12 +233,12 @@ def initialise_fg_cme_parameters():
     donki_cme = True
 
     if get_use_synthetic_obs():
-        huxt_init_time = get_huxt_init_time()
+        surf_init_time = get_surf_init_time()
         cme_at_12rs: datetime.datetime = (
-                huxt_init_time + datetime.timedelta(hours=1)
+                surf_init_time + datetime.timedelta(hours=1)
         )
-        huxt_init_time_astro = Time(huxt_init_time, format="datetime")
-        ert = H.Observer("EARTH", huxt_init_time_astro)
+        surf_init_time_astro = Time(surf_init_time, format="datetime")
+        ert = S.Observer("EARTH", surf_init_time_astro)
         earth_lat = ert.lat.to(u.deg)
         earth_lon = ert.lon.to(u.deg)
 
@@ -348,11 +384,11 @@ def initialise_fg_cme_parameters():
                 sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
 
     # Time taken to get from cme_init_rad to r_min
-    huxt_dict = initialise_huxt_parameters()
-    huxt_cme_ir: Quantity[u.solRad] = huxt_dict["cme_init_rad"]
-    huxt_r_min: Quantity[u.solRad] = huxt_dict["r_min"]
+    surf_dict = initialise_surf_parameters()
+    surf_cme_ir: Quantity[u.solRad] = surf_dict["cme_init_rad"]
+    surf_r_min: Quantity[u.solRad] = surf_dict["r_min"]
 
-    dist_in_km: Quantity[u.km] = (huxt_r_min - huxt_cme_ir).to(u.km)
+    dist_in_km: Quantity[u.km] = (surf_r_min - surf_cme_ir).to(u.km)
     seconds_to_r_min: float = dist_in_km.to(u.km).value / fg_cme_speed
 
     fg_cme_t_init: datetime.datetime = (
@@ -411,7 +447,7 @@ def initialise_prior_cme_cov():
         cme_cov_type = cme_cov_type.lower()"""
 
     # Scale correlation matrix to make covariance matrix
-    scale_corr = False #True
+    scale_corr = True
     use_log_v = True
 
     if get_use_synthetic_obs():
@@ -455,17 +491,17 @@ def initialise_prior_cme_cov():
 
 
 def get_use_synthetic_obs():
-    use_synthetic_obs = True
+    use_synthetic_obs = False
 
     return use_synthetic_obs
 
 
 def get_ssw_event_craft():
-    ssw_event = "ssw_008"
+    ssw_event = "ssw_012"
     craft = "stb"
     img = "diff"
     
-    return ssw_event, img, craft
+    return ssw_event, craft, img
     
     
 def initialise_observation_parameters():
@@ -474,7 +510,7 @@ def initialise_observation_parameters():
     true_cme_dict = initialise_true_cme_par_dict()
     true_cme_t_init: datetime.datetime = true_cme_dict["t_init"]
 
-    huxt_init_time = get_huxt_init_time()
+    surf_init_time = get_surf_init_time()
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
 
@@ -499,6 +535,9 @@ def initialise_observation_parameters():
     else:
         bias_term_bool = True
 
+    bias_term_5 = 2.5
+    bias_term_21 = 2.5
+
     obs_par_dict = {
         "n_obs": n_obs,
         "obs_lon": obs_lon,
@@ -512,13 +551,15 @@ def initialise_observation_parameters():
         "craft": craft,
         "img": img,
         "bias_term_bool": bias_term_bool,
+        "bias_term_5rs": bias_term_5,
+        "bias_term_21rs": bias_term_21,
     }
 
     return obs_par_dict
 
 
 def initialise_da_parameters():
-    n_members: int = 5#0
+    n_members: int = 50
     n_runs: int = 1
 
     delta_aux_pf: float = 0.98
@@ -542,19 +583,20 @@ def initialise_da_parameters():
 class RunDataAssimilationRoutine:
     def __init__(self):
 
-        # Get HUXt parameters
-        huxt_par_dict = initialise_huxt_parameters()
-        self.huxt_init_time: datetime.datetime = huxt_par_dict["huxt_init_time"]
-        self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = huxt_par_dict["vr_in"]
+        # Get SURF parameters
+        surf_par_dict = initialise_surf_parameters()
+        self.use_model: str = get_use_model()
+        self.surf_init_time: datetime.datetime = surf_par_dict["surf_init_time"]
+        self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = surf_par_dict["vr_in"]
         self.n_lon: int = len(self.vr_in)
-        self.lon_start: Quantity[u.deg] = huxt_par_dict["lon_start"]
-        self.lon_stop: Quantity[u.deg] = huxt_par_dict["lon_stop"]
-        self.sim_time: Quantity[u.days] = huxt_par_dict["sim_time"]
-        self.dt_scale: int | float = huxt_par_dict["dt_scale"]
-        self.r_min: Quantity[u.solRad] = huxt_par_dict["r_min"]
-        self.cme_init_rad: Quantity[u.solRad] = huxt_par_dict["cme_init_rad"]
-        self.cme_fixed_duration: bool = huxt_par_dict["cme_fixed_duration"]
-        self.fixed_duration: Quantity[u.s] = huxt_par_dict["fixed_duration"]
+        self.lon_start: Quantity[u.deg] = surf_par_dict["lon_start"]
+        self.lon_stop: Quantity[u.deg] = surf_par_dict["lon_stop"]
+        self.sim_time: Quantity[u.days] = surf_par_dict["sim_time"]
+        self.dt_scale: int | float = surf_par_dict["dt_scale"]
+        self.r_min: Quantity[u.solRad] = surf_par_dict["r_min"]
+        self.cme_init_rad: Quantity[u.solRad] = surf_par_dict["cme_init_rad"]
+        self.cme_fixed_duration: bool = surf_par_dict["cme_fixed_duration"]
+        self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
 
         # Initialise observation variables
         obs_par_dict = initialise_observation_parameters()
@@ -570,6 +612,12 @@ class RunDataAssimilationRoutine:
         self.craft:str = obs_par_dict["craft"]
         self.img:str = obs_par_dict["img"]
         self.bias_term_bool: bool = obs_par_dict["bias_term_bool"]
+        self.bias_term_5rs: float = obs_par_dict["bias_term_5rs"]
+        self.bias_term_21rs: float = obs_par_dict["bias_term_21rs"]
+
+        # Ensure all bias terms exist, if not, set bias_term_bool to False
+        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
+            self.bias_term_bool = False
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
         if self.use_synthetic_obs or (self.obs_filenames is None):
@@ -668,6 +716,8 @@ class RunDataAssimilationRoutine:
             f"ens_{self.n_members}", self.cme_cov_type
         )
 
+        model_dir = f"model_{self.use_model.upper()}"
+
         if self.use_synthetic_obs:
             obs_dir = (
                 f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
@@ -678,6 +728,7 @@ class RunDataAssimilationRoutine:
             obs_dir = (
                 f"obs_{self.craft}_{self.ssw_event}_{self.img}"
             )
+
         prior_dir = (
             f"prior_{self.fg_mean_cme_speed}_{self.fg_mean_cme_width}"
             f"_{self.fg_mean_cme_lon}_{self.fg_mean_cme_lat}"
@@ -685,9 +736,19 @@ class RunDataAssimilationRoutine:
         )
         run_dir = f"run_{run_no:03d}"
 
-        output_dir = os.path.join(
-            base_dir, obs_dir, prior_dir, f"{self.delta_aux_pf}", run_dir
-        )
+        if self.bias_term_bool:
+            bias_dir = os.path.join(
+                "bias_correction", f"bias5_{self.bias_term_5rs}_bias21_{self.bias_term_21rs}"
+            )
+            output_dir = os.path.join(
+                base_dir, model_dir, bias_dir, obs_dir,
+                prior_dir, f"{self.delta_aux_pf}", run_dir
+            )
+        else:
+            output_dir = os.path.join(
+                base_dir, model_dir, obs_dir, prior_dir,
+                f"{self.delta_aux_pf}", run_dir
+            )
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -709,7 +770,7 @@ class RunDataAssimilationRoutine:
             use_synthetic_obs=self.use_synthetic_obs,
             true_cme_par_dict=self.true_cme_par_dict,
             obs_cov=self.obs_cov,
-            huxt_init_time=self.huxt_init_time,
+            surf_init_time=self.surf_init_time,
             vr_in=self.vr_in,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
@@ -719,7 +780,7 @@ class RunDataAssimilationRoutine:
             cme_init_rad=self.cme_init_rad,
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
-            plot_huxt_output=False,
+            plot_surf_output=False,
             obs_rng_seed=self.obs_rng_seed,
             ssw_event=self.ssw_event,
             craft=self.craft,
@@ -790,7 +851,7 @@ class RunDataAssimilationRoutine:
         # Get mean CME parameters
         mean_cme_par_dict = self.initialise_mean_cme_pars(rng=rng)
         mean_cme_t_init = (
-            mean_cme_par_dict["mean_cme_t_init"] - self.huxt_init_time
+            mean_cme_par_dict["mean_cme_t_init"] - self.surf_init_time
         ).total_seconds()
         mean_cme_speed = mean_cme_par_dict["mean_cme_speed"]
         mean_cme_width = mean_cme_par_dict["mean_cme_width"]
@@ -809,12 +870,12 @@ class RunDataAssimilationRoutine:
 
         # Initialise cme_par_dict
         cme_par_dict = initialise_cme_parameter_ensemble_dict(
-            n_ensemble=self.n_members, huxt_init_time=self.huxt_init_time
+            n_ensemble=self.n_members, surf_init_time=self.surf_init_time
         )
 
         if self.cme_cov_type == "uncorr":
             print(mean_cme_par_array)
-            samples = make_uncorr_uniform_samples(
+            samples = mp_cov.make_uncorr_uniform_samples(
                 n_ens=self.n_members,
                 mean_cme_pars=mean_cme_par_array,
                 rng=rng,
@@ -864,16 +925,12 @@ class RunDataAssimilationRoutine:
 
         elif self.cme_cov_type == "mo_cone":
             mo_cone_cov_dir = os.environ.get("MO_CONE_COV_DIR")
-            #os.path.join(
-            #     "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "moConeCMECov"
-            # )
+
             if not os.path.exists(mo_cone_cov_dir):
                 os.makedirs(mo_cone_cov_dir)
 
             mo_cme_cone_file_dir = os.environ.get("MO_CME_CONE_FILE_DIR")
-            # os.path.join(
-            #    "C:\\", "Users", "ss905122", "PycharmProjects", "moswoc_cone"
-            # )
+
             start_time_mo_cone = datetime.datetime(2017, 1, 1, 0, 0, 0)
             end_time_mo_cone = datetime.datetime(2026, 2, 1, 0, 0, 0)
 
@@ -903,7 +960,7 @@ class RunDataAssimilationRoutine:
             sys.exit()
 
         cme_par_dict["t_init"] = [
-            self.huxt_init_time + datetime.timedelta(seconds=samples[0, i])
+            self.surf_init_time + datetime.timedelta(seconds=samples[0, i])
             for i in range(self.n_members)
         ]
         cme_par_dict["v"] = list(samples[1, :]) * u.km / u.s
@@ -950,7 +1007,7 @@ class RunDataAssimilationRoutine:
             # Save prior state
             cme_saved_pars[0, :, 0] = [
                 (
-                        cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
+                        cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
                 ).total_seconds()
                 for i in range(self.n_members)
             ]
@@ -996,6 +1053,8 @@ class RunDataAssimilationRoutine:
                     cme_fixed_duration = self.cme_fixed_duration,
                     fixed_duration=self.fixed_duration,
                     bias_term_bool=self.bias_term_bool,
+                    bias_term_5rs=self.bias_term_5rs,
+                    bias_term_21rs=self.bias_term_21rs,
                     rng=rng
                 )
 
@@ -1004,7 +1063,7 @@ class RunDataAssimilationRoutine:
                 # Standardise the units and remove the astropy units
                 cme_saved_pars[yi + 1, :, 0] = [
                     (
-                        cme_par_dict["t_init"][i] - cme_par_dict["huxt_init_time"]
+                        cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
                     ).total_seconds()
                     for i in range(self.n_members)
                 ]
@@ -1034,7 +1093,7 @@ class RunDataAssimilationRoutine:
             # Make an xarray object
             cme_par_ds = xr.Dataset(
                 data_vars=dict(
-                    model_init_time=self.huxt_init_time,
+                    model_init_time=self.surf_init_time,
                     cme_init_rad=self.cme_init_rad,
                     r_min=self.r_min,
                     ambient_vr=(["n_lon"], self.vr_in),
@@ -1049,7 +1108,7 @@ class RunDataAssimilationRoutine:
                 coords=dict(
                     obs_no=("n_obs", range(self.n_obs + 1)),
                     ens_no=("n_ens", range(self.n_members)),
-                    huxt_lon=("n_lon", (2 * np.pi / self.n_lon) * np.arange(self.n_lon)),
+                    surf_lon=("n_lon", (2 * np.pi / self.n_lon) * np.arange(self.n_lon)),
                 ),
             )
             print(cme_par_ds)
@@ -1062,7 +1121,7 @@ class RunDataAssimilationRoutine:
 def main():
     print_environment_variables()
     run_da_class = RunDataAssimilationRoutine()
-    run_da_class.run_data_assimilation(run_start=0)
+    run_da_class.run_data_assimilation(run_start=-1)
 
     return None
 

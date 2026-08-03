@@ -11,7 +11,7 @@ from astropy.units import Quantity
 
 
 class CmeParEns(TypedDict):
-    huxt_init_time: datetime.datetime
+    surf_init_time: datetime.datetime
     t_init: list[datetime.datetime] | datetime.datetime
     v: list[Quantity[u.km / u.s]] | Quantity[u.km / u.s]
     width: list[Quantity[u.deg]] | Quantity[u.deg]

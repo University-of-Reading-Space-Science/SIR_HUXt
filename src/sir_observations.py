@@ -1,7 +1,10 @@
 import numpy as np
 import numpy.typing as npt
 import datetime
+
 from huxt.huxt import Observer as Hobs
+from surf.surf import Observer as Sobs
+
 import h5py
 import pandas as pd
 import xarray as xr
@@ -37,7 +40,7 @@ def get_ssw_profile(ssw_event, craft, img, pa_center, pa_wid=1.0):
 
     """
     # Open up the SSW data
-    project_dirs = H._setup_dirs_()
+    project_dirs = S._setup_dirs_()
     ssw_out = tables.open_file(project_dirs['SSW_data'], mode="r")
 
     # Pull out event
@@ -83,13 +86,14 @@ def get_ssw_profile(ssw_event, craft, img, pa_center, pa_wid=1.0):
 class Observations:
     def __init__(
             self,
+            use_model: str,
             obs_lon: Quantity[u.deg] | list[Quantity[u.deg]]=None,
             obs_times_in_datetime: datetime.datetime | list[datetime.datetime]=None,
             obs_filenames: list[str] | str =None,
             use_synthetic_obs: bool=False,
             true_cme_par_dict: CmeParEns=None,
             obs_cov: npt.NDArray[float] | float=None,
-            huxt_init_time: datetime.datetime=None,
+            surf_init_time: datetime.datetime=None,
             vr_in: npt.NDArray[Quantity[u.km / u.s]]=None,
             lon_start: Quantity[u.deg]=None,
             lon_stop: Quantity[u.deg]=None,
@@ -99,7 +103,7 @@ class Observations:
             cme_init_rad: Quantity[u.solRad]=None,
             cme_fixed_duration:bool = None,
             fixed_duration: Quantity[u.s] = None,
-            plot_huxt_output: bool=False,
+            plot_surf_output: bool=False,
             obs_rng_seed: int=None,
             ssw_event: str=None,
             craft:str=None,
@@ -107,6 +111,7 @@ class Observations:
     ) -> None:
         """
         Class to get observations for DA from
+        :param use_model: String to determine which model to use, possible models are ['surf', 'compress_surf', 'huxt']
         :param obs_lon: Longitude of observation source
         :param obs_times_in_datetime: Times observations are taken
         :param obs_filenames: A list of observation filenames that observations are to be read from
@@ -117,22 +122,26 @@ class Observations:
             to create a truth CME simulation
         :param obs_cov: To be used with synthetic observations, an observation covariance matrix to be used to
             add random noise to  truth CME elongations
-        :param huxt_init_time: Initial datetime for HUXt model
-        :param vr_in: Velocities at the inner boundary of the HUXt model domain
-        :param lon_start: Longitude where we start the HUXt simulation
-        :param lon_stop: Longitude where we stop the HUXt simulation
-        :param sim_time: How long the HUXt simulation will run for
+        :param surf_init_time: Initial datetime for SURF model
+        :param vr_in: Velocities at the inner boundary of the SURF model domain
+        :param lon_start: Longitude where we start the SURF simulation
+        :param lon_stop: Longitude where we stop the SURF simulation
+        :param sim_time: How long the SURF simulation will run for
         :param dt_scale: Frequency with which the model will output
-        :param r_min: Minimum radius of HUXt simulation
+        :param r_min: Minimum radius of SURF simulation
         :param cme_init_rad: Initial radius the CME is observed at
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
-        :param plot_huxt_output: Boolean to determine whether to plot HUXt output at observation time
+        :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
         :param rng_seed: Seed to use for random number generator
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: Change such that observations are downloaded if need be
         """
+
+        # Read in string to determine which model to use
+        self.use_model = use_model.lower()
+        assert self.use_model in ["surf", "compress_surf", "huxt"]
 
         # Check whether we're reading observations from a file or using synthetic observations
         self.use_synth_obs = use_synthetic_obs
@@ -166,11 +175,11 @@ class Observations:
             self.true_cme_par_dict = true_cme_par_dict
             self.obs_cov = obs_cov
 
-            # Initialise default huxt setup
-            if huxt_init_time is None:
-                self.huxt_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
+            # Initialise default surf setup
+            if surf_init_time is None:
+                self.surf_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
             else:
-                self.huxt_init_time = huxt_init_time
+                self.surf_init_time = surf_init_time
 
             if vr_in is None:
                 self.vr_in = np.ones(128) * 400 * u.km / u.s
@@ -222,7 +231,7 @@ class Observations:
             else:
                 self.rng: Generator = np.random.default_rng(obs_rng_seed)
 
-            self.plot_huxt_output = plot_huxt_output
+            self.plot_surf_output = plot_surf_output
 
 
             self.observations = self.make_synthetic_obs()
@@ -235,7 +244,7 @@ class Observations:
         """
         Function to create synthetic observations
         :param rng: Current seed of the random number generator
-        :param plot_huxt: Boolean to determine whether to plot the HUXt output at observation times
+        :param plot_surf: Boolean to determine whether to plot the SURF output at observation times
         :return: synth_obs: List of synthetic observations
         """
 
@@ -250,7 +259,7 @@ class Observations:
             obs_lon = self.obs_lon,
             obs_time_in_datetime=self.obs_times_in_datetime,
             obs_cov = self.obs_cov,
-            huxt_init_time = self.huxt_init_time,
+            surf_init_time = self.surf_init_time,
             vr_in = self.vr_in,
             lon_start = self.lon_start,
             lon_stop = self.lon_stop,
@@ -260,7 +269,7 @@ class Observations:
             cme_init_rad = self.cme_init_rad,
             cme_fixed_duration = self.cme_fixed_duration,
             fixed_duration = self.fixed_duration,
-            plot_huxt_output = self.plot_huxt_output
+            plot_surf_output = self.plot_surf_output
         )
 
         unpert_obs = obs_op_obj.make_obs_op()
@@ -288,7 +297,9 @@ class Observations:
                 # craft = "stb"
                 # img = "diff"
                 pa_wid=1.0
-                ssw_path = "/".join([str(''), self.ssw_event, self.craft, self.img])
+                ssw_path = "/".join(['', self.ssw_event, self.craft, self.img])
+                #ssw_path = "/".join(["", self.ssw_event, self.craft])
+                print(f"Reading observation from: {ssw_path}")
                 event = f.get_node(ssw_path)
                 spice = StereoSpice()
 
@@ -313,7 +324,13 @@ class Observations:
                     id_pa = (cme_df['pa'] >= (pa_center - pa_wid)) & (cme_df['pa'] <= (pa_center + pa_wid))
 
                     # Get observations longitude
-                    h_obs_class = Hobs(self.craft.upper(), frame_time)
+                    if self.use_model in ["surf", "compress_surf"]:
+                        h_obs_class = Sobs(self.craft.upper(), frame_time)
+                    elif use_model in ["huxt"]:
+                        h_obs_class = Hobs(self.craft.upper(), frame_time)
+                    else:
+                        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
                     obs_lon.append(h_obs_class.lon.to(u.deg))
 
                     times_datetime.append(frame_time.to_datetime())
@@ -322,7 +339,7 @@ class Observations:
                     el_hi.append(np.nanmean(cme_df['el_hi'][id_pa]))
 
                 # Get observations longitude
-                # h_obs_class = Hobs(craft.upper(), np.array(times_astro))
+                # h_obs_class = Sobs(craft.upper(), np.array(times_astro))
                 # obs_lon = h_obs_class.lon
 
                 # Make dataframe of the raw ssw profile
@@ -426,12 +443,19 @@ def main():
     # "C:\Users\ss905122\PycharmProjects\SIR_HUXt\SSW_cme_classifications.hdf5"
     h5_file_path = os.path.join(
         "C:\\", "Users", "ss905122", "PycharmProjects",
-        "SIR_HUXt", "SSW_cme_classifications.hdf5"
+        "SIR_SUXt", "SSW_cme_classifications.hdf5"
     )
+    use_model = "surf"
     ssw_event: str = "ssw_012"
     craft: str = "stb"
     img: str = "diff"
-    ObsClass = Observations(obs_filenames=h5_file_path, ssw_event=ssw_event, craft=craft, img=img)
+    ObsClass = Observations(
+        use_model=use_model,
+        obs_filenames=h5_file_path,
+        ssw_event=ssw_event,
+        craft=craft,
+        img=img
+    )
     obs_times_out, obs_lon, obs_out = ObsClass.read_obs_from_file()
     print(f"ssw_event: {ssw_event}, craft: {craft}, img: {img}")
     print(f"obs_times_out = {obs_times_out}")

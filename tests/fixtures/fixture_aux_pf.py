@@ -1,19 +1,7 @@
-import huxt.huxt
 import numpy as np
 import numpy.typing as npt
 import datetime
-import os
-import sys
-import pandas as pd
-import xarray as xr
-from typing import TypedDict
-import json
 
-import huxt.huxt as H
-import huxt.huxt_analysis as HA
-from mypy.build import TypedDict
-from scipy.special.cython_special import log_wright_bessel
-import math
 import sir_huxt_mono_obs as shmo
 import sunpy.coordinates.sun as sn
 
@@ -43,20 +31,21 @@ def get_n_ens():
 
 
 @pytest.fixture
-def get_huxt_init_time():
+def get_surf_init_time_aux_pf():
     return datetime.datetime(2008, 1, 1, 0, 0, 0)
 
 
 @pytest.fixture
-def get_cme_par_dict(get_n_ens, get_huxt_init_time) -> CmeParEns:
-    n_ens = get_n_ens()
+def get_cme_par_dict(get_n_ens, get_surf_init_time_aux_pf) -> CmeParEns:
+    n_ens = get_n_ens
 
     w: npt.NDArray[float] = np.ones(n_ens) / n_ens
     cme_par_dictionary: CmeParEns = initialise_cme_parameter_ensemble_dict(n_ens)
 
-    cme_par_dictionary["huxt_init_time"] = get_huxt_init_time()
+    cme_par_dictionary["surf_init_time"] = get_surf_init_time_aux_pf
     cme_par_dictionary["t_init"] = [datetime.datetime(2008, 1, 1)] * n_ens
     cme_par_dictionary["v"] = np.linspace(400, 600, n_ens) * u.km / u.s
+    #print(f"cme_par_dictionary[v]: {cme_par_dictionary['v']}")
     cme_par_dictionary["width"] = np.ones(n_ens) * 30 * u.deg
     cme_par_dictionary["lon"] = np.linspace(-20, 20, n_ens) * u.deg
     cme_par_dictionary["lat"] = np.zeros(n_ens) * u.deg
@@ -70,9 +59,9 @@ def get_cme_par_dict(get_n_ens, get_huxt_init_time) -> CmeParEns:
 
 
 @pytest.fixture
-def get_true_cme_par_dict(get_huxt_init_time) -> CmeParEns:
+def get_true_cme_par_dict(get_surf_init_time_aux_pf) -> CmeParEns:
 
-    true_cme_par_dict = initialise_cme_parameter_ensemble_dict(1, get_huxt_init_time)
+    true_cme_par_dict = initialise_cme_parameter_ensemble_dict(1, get_surf_init_time_aux_pf)
 
     # Initialise true CME parameters
     true_cme_t_init: datetime.datetime = datetime.datetime(2008, 1, 1, 1, 0, 0)
@@ -96,6 +85,7 @@ def get_true_cme_par_dict(get_huxt_init_time) -> CmeParEns:
 @pytest.fixture
 def get_aux_pf(get_cme_par_dict, get_true_cme_par_dict) -> AuxPF:
     aux_pf_class = AuxPF(
+        use_model="surf",
         cme_par_dict=get_cme_par_dict,
         obs=[10.0, 12.0],
         obs_cov=0.1,
@@ -104,7 +94,7 @@ def get_aux_pf(get_cme_par_dict, get_true_cme_par_dict) -> AuxPF:
             datetime.datetime(2008, 1, 1, 9, 0, 0),
             datetime.datetime(2008, 1, 1, 10, 0, 0)
         ],
-        get_true_cme_par_dict=get_true_cme_par_dict,
+        true_cme_par_dict=get_true_cme_par_dict,
         pars_in_state = ["v", "width"],
         rng=np.random.default_rng(42)
     )
