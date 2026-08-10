@@ -266,10 +266,20 @@ class TestObservationOperator:
         #init_obs_op.get_obs_times = exp_cme_flank.obs_op_tests(test_no)[0]
         #print(f"init_obs_op.get_obs_times: {init_obs_op.obs_time_in_datetime}")
 
-        if get_use_model in ["surf", "compress_surf"]:
+        if get_use_model in ["surf"]:
             # Initialise mockers for the S.SURF and S.ConeCME calls
             mock_surf = mocker.patch("surf.surf.SURF")
-            mock_surf.return_value = S.SURF()
+            mock_surf.return_value = S.SURF(solver="huxt")
+
+            mock_solve = mocker.patch("surf.surf.SURF.solve")
+            mock_solve.return_value = 450
+
+            mock_cme = mocker.patch("surf.surf.ConeCME")
+            mock_cme_values = [i for i in range(n_ensemble)]
+        elif get_use_model in ["compress_surf"]:
+            # Initialise mockers for the S.SURF and S.ConeCME calls
+            mock_surf = mocker.patch("surf.surf.SURF")
+            mock_surf.return_value = S.SURF(solver="hydro")
 
             mock_solve = mocker.patch("surf.surf.SURF.solve")
             mock_solve.return_value = 450

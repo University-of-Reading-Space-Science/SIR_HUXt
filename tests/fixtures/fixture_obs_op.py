@@ -90,7 +90,7 @@ def get_obs_times(obs_op_tests) -> list[datetime.datetime]:
 
 @pytest.fixture
 def get_use_model() -> str:
-    use_model = "huxt"
+    use_model = "compress_surf"
     return use_model
 
 @pytest.fixture

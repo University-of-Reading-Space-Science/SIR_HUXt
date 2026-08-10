@@ -1,5 +1,6 @@
 import numpy as np
 import numpy.typing as npt
+import sys
 
 class LikelihoodFunction:
     def __init__(
@@ -115,24 +116,34 @@ class LikelihoodFunction:
 
         # Calculate the inverse of the observation error covariance and calculate the logarithm
         #  of the likelihood function
+        if np.ndim(innov) == 0:
+            innov = float(innov)
+        elif np.ndim(innov) == 1:
+            innov = float(innov[0])
+
         if np.ndim(self.obs_cov) == 0:
             # 1D-case
-            innov_float = float(innov)
-            obs_cov_1: float = 1.0 / self.obs_cov
-            log_likelihood: float = -obs_cov_1 * innov_float * innov_float
+            obs_cov_1: float = float(1.0 / self.obs_cov)
 
-            return log_likelihood
         elif np.ndim(self.obs_cov) == 1:
             obs_cov_1: float = 1.0 / float(self.obs_cov.item())
-            log_likelihood: float = -obs_cov_1 * float(np.transpose(innov).dot(innov))
 
-            return log_likelihood
         else:
             # Dimension of observation is greater than 1
             obs_cov_1: npt.NDArray[float] = np.linalg.pinv(self.obs_cov)
-            log_likelihood: float = -np.transpose(innov).dot(obs_cov_1.dot(innov))
 
-            return log_likelihood
+        if isinstance(innov, float):
+            assert isinstance(obs_cov_1, float)
+
+            log_likelihood: float = -obs_cov_1 * innov * innov
+        elif isinstance(innov, np.ndarray):
+            assert(isinstance(obs_cov_1, np.ndarray))
+            log_likelihood: float = -np.transpose(innov).dot(obs_cov_1.dot(innov))
+        else:
+            log_likelihood = np.nan
+            sys.exit(f"type(innov) = {type(innov)} is an unsupported variable type, should be float or np.ndarray.")
+
+        return log_likelihood
 
 
     def likelihood_gaussian(self) -> float:

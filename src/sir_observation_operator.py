@@ -21,6 +21,8 @@ from init_sir import setup_huxt, setup_surf
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
+from surf.surf_imaging import SyntheticImager
+
 class Observer:
     """
     The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a SURF simulation
@@ -40,9 +42,20 @@ class Observer:
             el_max: float=30.0
     ):
         self.use_model: str = use_model
-        self.lon: Quantity[u.deg] = longitude
         self.el_min: float = el_min
         self.el_max: float = el_max
+
+        if self.use_model in ["surf", "compress_surf"]:
+            ert_ephem: S.Observer = model.get_observer('EARTH')
+        elif self.use_model in ["huxt"]:
+            ert_ephem: H.Observer = model.get_observer('EARTH')
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
+        self.time: npt.NDArray[Time] = ert_ephem.time
+        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
+        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
+        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
 
         # Force longitude into 0-360 domain
         id_over: list[bool] | bool = self.lon > 360 * u.deg
@@ -54,18 +67,6 @@ class Observer:
             self.lon[id_under] = self.lon[id_under] + 360 * u.deg
 
         self.model_flank: pd.DataFrame = self.compute_flank_profile(cme)
-
-        if self.use_model in ["surf", "surf_compress"]:
-            ert_ephem: S.Observer = model.get_observer('EARTH')
-        elif self.use_model in ["huxt"]:
-            ert_ephem: H.Observer = model.get_observer('EARTH')
-        else:
-            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
-
-        self.time: npt.NDArray[Time] = ert_ephem.time
-        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
-        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
-        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
 
 
     def compute_flank_profile(
@@ -153,7 +154,7 @@ class ObservationOperator:
             self,
             use_model: str,
             cme_par_dict: CmeParEns,
-            obs_lon: Quantity[u.deg],
+            obs_lon: list[Quantity[u.deg]] | Quantity[u.deg],
             obs_time_in_datetime: list[datetime.datetime] | datetime.datetime,
             obs_cov: npt.NDArray[float] | float = None,
             surf_init_time: datetime.datetime = None,
@@ -200,8 +201,19 @@ class ObservationOperator:
         :TODO: Change such that observations are downloaded if need be
         """
 
+        # Get model to use and whether to use compressible SURF, incompressible SURF or HUXt;
+        #  and define the solver accordingly.
         self.use_model = use_model.lower()
-        assert (self.use_model in ["surf", "surf_compress", "huxt"])
+        assert (self.use_model in ["surf", "compress_surf", "huxt"])
+
+        if use_model == "surf":
+            self.solver = "huxt"
+        elif use_model == "compress_surf":
+            self.solver = "hydro"
+        else:
+            self.solver = "huxt"
+
+        assert (self.solver in ["huxt", "hydro"])
 
         if obs_lon is None:
             self.obs_lon = 0 * u.deg
@@ -292,6 +304,8 @@ class ObservationOperator:
         # Calculate time taken to go from cme's initial radius to surf inner boundary
         # Ensure all variables are lists, if not make them into lists
         # Get CME launch time
+        # print(f"self.cme_par_dict['t_init']: {self.cme_par_dict['t_init']}")
+        # print(f"self.cme_par_dict['surf_init_time']: {self.cme_par_dict['surf_init_time']}")
         try:
             [
                 (t - self.cme_par_dict["surf_init_time"]).total_seconds()
@@ -458,7 +472,7 @@ class ObservationOperator:
 
         # Generate CME object
         #print(f"cme_launch_time = {cme_launch_time}")
-        if self.use_model in ["surf", "surf_compress"]:
+        if self.use_model in ["surf", "compress_surf"]:
             cme_objects: list[S.ConeCME] = [
                 S.ConeCME(
                     t_launch=cme_launch_time[i],
@@ -497,7 +511,7 @@ class ObservationOperator:
             t_interest = (self.obs_time_in_datetime[it] - self.surf_init_time).total_seconds() * u.s
 
             # Make the plot using SURF's plotting routine
-            if self.use_model in ["surf", "surf_compress"]:
+            if self.use_model in ["surf", "compress_surf"]:
                 fig, ax = SA.plot(model, t_interest)
                 ax.set_title(f"Synth obs CME at {obs_time_in_datetime[it]}")
                 plt.show()
@@ -513,14 +527,18 @@ class ObservationOperator:
 
     def get_cme_flank_single_ens_member(
             self,
-            cme: H.ConeCME | S.ConeCME
+            cme: H.ConeCME | S.ConeCME,
+            obs_longitude: float=None
     ) -> pd.DataFrame:
         """
         Function to retrieve the CME's flank for a single ensemble member
         :return: cme_flank: CME flank dataframe
         """
+        if obs_longitude is None:
+            obs_longitude = self.obs_lon
+
         # Initialise SURF model object for each ensemble member
-        if self.use_model in ["surf", "surf_compress"]:
+        if self.use_model in ["surf", "compress_surf"]:
             model: SURF = setup_surf(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
@@ -528,11 +546,12 @@ class ObservationOperator:
                 lon_stop=self.lon_stop,
                 sim_time=self.sim_time,
                 dt_scale=self.dt_scale,
-                r_min=self.r_min
+                r_min=self.r_min,
+                solver=self.solver,
             )
+
             # Run CME through SURF
             model.solve([cme])
-
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["huxt"]:
@@ -554,13 +573,23 @@ class ObservationOperator:
 
         #print(f"cme_member={cme_member}")
         # Calculate CME flank
-        observer_object: Observer = Observer(
-            use_model=self.use_model,
-            model=model,
-            cme=cme_member,
-            longitude=self.obs_lon
-        )
-        cme_flank: pd.DataFrame = observer_object.model_flank #compute_flank_profile(cme_member)
+        if self.use_model in ["huxt", "surf"]:
+            observer_object: Observer = Observer(
+                use_model=self.use_model,
+                model=model,
+                cme=cme_member,
+                longitude=obs_longitude
+            )
+            cme_flank: pd.DataFrame = observer_object.model_flank #compute_flank_profile(cme_member)
+
+        elif self.use_model in ["compress_surf"]:
+            observer_object: Observer = Observer(
+                use_model=self.use_model,
+                model=model,
+                cme=cme_member,
+                longitude=obs_longitude
+            )
+            cme_flank: pd.DataFrame = observer_object.model_flank  # compute_flank_profile(cme_member)
 
         if self.plot_surf_output:
             self.plot_surf(model)
@@ -577,10 +606,17 @@ class ObservationOperator:
         cme_objects: list[S.ConeCME] | list[H.ConeCME] = self.make_cme_objects()
 
         #print(f"make_cme_objects = {cme_objects}")
-        cme_flanks: list[pd.DataFrame] = [
-            self.get_cme_flank_single_ens_member(i_cme)
-            for i_cme in cme_objects
-        ]
+
+        if isinstance(self.obs_lon, np.ndarray):
+            cme_flanks: list[pd.DataFrame] = [
+                self.get_cme_flank_single_ens_member(i_cme, self.obs_lon[i])
+                for i, i_cme in enumerate(cme_objects)
+            ]
+        else:
+            cme_flanks: list[pd.DataFrame] = [
+                self.get_cme_flank_single_ens_member(i_cme, self.obs_lon)
+                for i, i_cme in enumerate(cme_objects)
+            ]
         #print(f"cme_flanks = {cme_flanks}")
 
         return cme_flanks

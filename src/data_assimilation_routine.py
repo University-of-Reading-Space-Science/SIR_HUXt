@@ -65,7 +65,7 @@ def allowed_cov_types():
 
 
 def get_mas_wsa_const():
-    mas_wsa_const = "wsa"
+    mas_wsa_const = "const"
     
     return mas_wsa_const
 
@@ -73,7 +73,7 @@ def get_surf_init_time():
 
     ssw_event, _, _ = get_ssw_event_craft()
     if get_use_synthetic_obs():
-        surf_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0)
+        surf_init_time: datetime.datetime = datetime.datetime(2012, 1, 1, 0, 0)
     else:
         if ssw_event == "ssw_007":
             surf_init_time: datetime.datetime = datetime.datetime(2012, 8, 31, 0, 0, 0)
@@ -98,9 +98,9 @@ def get_use_model():
     Function to get model we require to use
     :return: use_model: String containing either "surf", "surf_compress", "huxt"
     """
-    poss_models = ["surf", "surf_compress", "huxt"]
+    poss_models = ["surf", "compress_surf", "huxt"]
 
-    use_model = "surf"
+    use_model = "compress_surf"
 
     assert use_model.lower() in poss_models
 
@@ -195,7 +195,7 @@ def initialise_surf_parameters():
         "r_min": r_min,
         "cme_init_rad": cme_init_rad,
         "cme_fixed_duration": cme_fixed_duration,
-        "fixed_duration": fixed_duration
+        "fixed_duration": fixed_duration,
     }
 
     return out_surf_par
@@ -491,7 +491,7 @@ def initialise_prior_cme_cov():
 
 
 def get_use_synthetic_obs():
-    use_synthetic_obs = False
+    use_synthetic_obs = True
 
     return use_synthetic_obs
 
@@ -505,8 +505,8 @@ def get_ssw_event_craft():
     
     
 def initialise_observation_parameters():
-    n_obs: int = 18
-
+    n_obs: int = 8
+    obs_cadence_hr = 3 # Observations cadence in hours
     true_cme_dict = initialise_true_cme_par_dict()
     true_cme_t_init: datetime.datetime = true_cme_dict["t_init"]
 
@@ -517,7 +517,7 @@ def initialise_observation_parameters():
     obs_cov: list[float] = [0.5]  # * np.eye(len(obs))
 
     obs_times: list[datetime.datetime] = [
-        true_cme_t_init + datetime.timedelta(hours=8 + (1 * i))
+        true_cme_t_init + datetime.timedelta(hours=10 + (obs_cadence_hr * i))
         for i in range(1, 1 + n_obs)
     ]
 
@@ -585,7 +585,7 @@ class RunDataAssimilationRoutine:
 
         # Get SURF parameters
         surf_par_dict = initialise_surf_parameters()
-        self.use_model: str = get_use_model()
+        self.use_model: str = surf_par_dict["use_model"]
         self.surf_init_time: datetime.datetime = surf_par_dict["surf_init_time"]
         self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = surf_par_dict["vr_in"]
         self.n_lon: int = len(self.vr_in)
@@ -764,6 +764,7 @@ class RunDataAssimilationRoutine:
         """
         # Initialise observations
         obs_class = Observations(
+            use_model=self.use_model,
             obs_lon=self.obs_lon,
             obs_times_in_datetime=self.obs_times,
             obs_filenames=self.obs_filenames,
@@ -1034,6 +1035,7 @@ class RunDataAssimilationRoutine:
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
                 print(f"obs = {obs}, obs_lon = {self.obs_lon[yi]}, obs_time = {self.obs_times[yi]}")
                 aux_pf_class = AuxPF(
+                    use_model=self.use_model,
                     cme_par_dict=cme_par_dict,
                     obs=obs,
                     obs_cov=self.obs_cov,
@@ -1121,7 +1123,11 @@ class RunDataAssimilationRoutine:
 def main():
     print_environment_variables()
     run_da_class = RunDataAssimilationRoutine()
-    run_da_class.run_data_assimilation(run_start=-1)
+
+    if get_use_synthetic_obs():
+        run_da_class.run_data_assimilation(run_start=0)
+    else:
+        run_da_class.run_data_assimilation(run_start=-1)
 
     return None
 

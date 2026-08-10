@@ -73,6 +73,7 @@ def setup_surf(
         sim_time: Quantity[u.day] = 2 * u.day,
         dt_scale: int = 20,
         r_min: Quantity[u.solRad] = 21.5 * u.solRad,
+        solver: str = "huxt",
 #        accel_limit: bool = False
 ) -> S.SURF:
     """
@@ -85,12 +86,15 @@ def setup_surf(
     :param sim_time: SURF simulation time in seconds
     :param dt_scale: Scalar specifying cadence of output timesteps
     :param r_min: Inner boundary radius in solar radii
+    :param solver: Solver to use, string, must be in ["huxt", "hydro"]
 
     :return model: SURF model object with required ambient wind conditions at required
                     longitudes and latitude
     """
 
     assert type(start_datetime) == datetime.datetime
+
+    assert solver in ["huxt", "hydro"], "Solver must be in ['huxt', 'hydro']"
 
     start_time: Time = Time(start_datetime, scale="utc")
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
@@ -107,6 +111,7 @@ def setup_surf(
         simtime=sim_time,
         dt_scale=dt_scale,
         r_min=r_min,
+        solver=solver,
 #        accel_limit=accel_limit
     )
 

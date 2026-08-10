@@ -140,104 +140,107 @@ class Observations:
         """
 
         # Read in string to determine which model to use
-        self.use_model = use_model.lower()
+        self.use_model: str = use_model.lower()
         assert self.use_model in ["surf", "compress_surf", "huxt"]
 
         # Check whether we're reading observations from a file or using synthetic observations
-        self.use_synth_obs = use_synthetic_obs
+        self.use_synth_obs: bool = use_synthetic_obs
 
         # If no observation filenames are specified, make synthetic observations
         if obs_filenames is None:
-            self.use_synth_obs = True
+            self.use_synth_obs: bool = True
         else:
-            self.obs_filenames = obs_filenames
+            self.obs_filenames: str | list[str] = obs_filenames
             if isinstance(self.obs_filenames, str):
                 self.obs_filenames = [self.obs_filenames]
-            self.ssw_event = ssw_event
-            self.craft = craft
-            self.img = img
+            self.ssw_event: str = ssw_event
+            self.craft: str = craft
+            self.img: str = img
 
         if obs_lon is None:
-            self.obs_lon = 0 * u.deg
+            self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = 0 * u.deg
         else:
-            self.obs_lon = obs_lon
+            self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = obs_lon
 
         # If we are using synthetic observations, ensure all variables required to initialise them are provided
         if self.use_synth_obs:
             assert obs_times_in_datetime is not None
-            self.obs_times_in_datetime = obs_times_in_datetime
+            self.obs_times_in_datetime: datetime.datetime | list[datetime.datetime] = obs_times_in_datetime
 
             assert(
                 all([true_cme_par_dict, obs_cov]) is not None
             )
             assert all(p in true_cme_par_dict.keys() for p in required_dict_keys())
 
-            self.true_cme_par_dict = true_cme_par_dict
-            self.obs_cov = obs_cov
+            self.true_cme_par_dict: CmeParEns = true_cme_par_dict
+            self.obs_cov: float | list[float] = obs_cov
 
             # Initialise default surf setup
             if surf_init_time is None:
-                self.surf_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
+                self.surf_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0)
             else:
-                self.surf_init_time = surf_init_time
+                self.surf_init_time: datetime.datetime = surf_init_time
 
             if vr_in is None:
-                self.vr_in = np.ones(128) * 400 * u.km / u.s
+                self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.ones(128) * 400 * u.km / u.s
             else:
-                self.vr_in = vr_in
+                self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = vr_in
 
             if lon_start is None:
-                self.lon_start = 290 * u.deg
+                self.lon_start: Quantity[u.deg] = 290 * u.deg
             else:
-                self.lon_start = lon_start
+                self.lon_start: Quantity[u.deg] = lon_start
 
             if lon_stop is None:
-                self.lon_stop = 380 * u.deg
+                self.lon_stop: Quantity[u.deg] = 380 * u.deg
             else:
-                self.lon_stop = lon_stop
+                self.lon_stop: Quantity[u.deg] = lon_stop
 
             if sim_time is None:
-                self.sim_time = 5 * u.day
+                self.sim_time: Quantity[u.day] = 5 * u.day
             else:
-                self.sim_time = sim_time
+                self.sim_time: Quantity[u.day] = sim_time
 
             if dt_scale is None:
-                self.dt_scale = 20
+                self.dt_scale: float = 20
             else:
-                self.dt_scale = dt_scale
+                self.dt_scale: float = dt_scale
 
             if r_min is None:
-                self.r_min = 30 * u.solRad
+                self.r_min: Quantity[u.solRad] = 30 * u.solRad
             else:
-                self.r_min = r_min
+                self.r_min: Quantity[u.solRad] = r_min
 
             if cme_init_rad is None:
-                self.cme_init_rad = 12 * u.solRad
+                self.cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
             else:
-                self.cme_init_rad = cme_init_rad
+                self.cme_init_rad: Quantity[u.solRad] = cme_init_rad
 
             if cme_fixed_duration is None:
-                self.cme_fixed_duration = False
+                self.cme_fixed_duration: bool = False
             else:
-                self.cme_fixed_duration = cme_fixed_duration
+                self.cme_fixed_duration: bool = cme_fixed_duration
 
             if fixed_duration is None:
-                self.fixed_duration = 12 * 60 * 60 * u.s
+                self.fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s
             else:
-                self.fixed_duration = fixed_duration
+                self.fixed_duration: Quantity[u.s] = fixed_duration
 
             if obs_rng_seed is None:
                 self.rng: Generator = np.random.default_rng()
             else:
                 self.rng: Generator = np.random.default_rng(obs_rng_seed)
 
-            self.plot_surf_output = plot_surf_output
+            self.plot_surf_output: bool = plot_surf_output
 
-
-            self.observations = self.make_synthetic_obs()
+            self.observations: list[float] = self.make_synthetic_obs()
 
         else:
-            self.obs_times_in_datetime, self.obs_lon, self.observations = self.read_obs_from_file()
+            obs_tuple: tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]] = self.read_obs_from_file()
+
+            self.obs_times_in_datetime: list[datetime.datetime] = obs_tuple[0]
+            self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
+            self.observations: list[float] = obs_tuple[2]
 
 
     def make_synthetic_obs(self) -> list[float]:
@@ -255,6 +258,7 @@ class Observations:
 
         # Initialise an observation operator instance
         obs_op_obj = ObservationOperator(
+            use_model=self.use_model,
             cme_par_dict = self.true_cme_par_dict,
             obs_lon = self.obs_lon,
             obs_time_in_datetime=self.obs_times_in_datetime,
@@ -281,7 +285,8 @@ class Observations:
         #print(f"synth_obs: {synth_obs}")
         return synth_obs
 
-    def read_obs_from_file(self) -> tuple[list[float], list[float], list[float]]:
+
+    def read_obs_from_file(self) -> tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]]:
 
         times_datetime = []
         times_astro = []
