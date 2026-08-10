@@ -1,5 +1,5 @@
 # @package sir_observation_operator
-# This module will take a SURF and ConeCME object and calculate its elongation profile
+# This module will take a HUXt/SURF and ConeCME object and calculate its elongation profile
 #  for use as an observation operator in the data assimilation algorithm
 import numpy as np
 import numpy.typing as npt
@@ -23,6 +23,8 @@ from cme_par_dict_structure import required_dict_keys
 
 from surf.surf_imaging import SyntheticImager
 
+from surf.surf_imaging import SyntheticImager
+
 class Observer:
     """
     The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a SURF simulation
@@ -36,26 +38,26 @@ class Observer:
             self,
             use_model: str,
             model: S.SURF | H.HUXt,
-            cme: S.ConeCME | H.HUXt,
+            cme: S.ConeCME | H.ConeCME,
             longitude: Quantity[u.deg],
             el_min: float=4.0,
             el_max: float=30.0
     ):
         self.use_model: str = use_model
-        self.el_min: float = el_min
-        self.el_max: float = el_max
-
         if self.use_model in ["surf", "compress_surf"]:
             ert_ephem: S.Observer = model.get_observer('EARTH')
         elif self.use_model in ["huxt"]:
             ert_ephem: H.Observer = model.get_observer('EARTH')
         else:
             sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+            ert_ephem: H.Observer = model.get_observer('EARTH')
 
         self.time: npt.NDArray[Time] = ert_ephem.time
         self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
         self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
         self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
+        self.el_min: float = el_min
+        self.el_max: float = el_max
 
         # Force longitude into 0-360 domain
         id_over: list[bool] | bool = self.lon > 360 * u.deg
@@ -67,6 +69,24 @@ class Observer:
             self.lon[id_under] = self.lon[id_under] + 360 * u.deg
 
         self.model_flank: pd.DataFrame = self.compute_flank_profile(cme)
+
+        if self.use_model in ["surf", "surf_compress"]:
+            ert_ephem: S.Observer = model.get_observer('EARTH')
+        elif self.use_model in ["huxt"]:
+            ert_ephem: H.Observer = model.get_observer('EARTH')
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
+        self.time: npt.NDArray[Time] = ert_ephem.time
+        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
+        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
+        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
+        if self.use_model in ["surf", "surf_compress"]:
+            ert_ephem: S.Observer = model.get_observer('EARTH')
+        elif self.use_model in ["huxt"]:
+            ert_ephem: H.Observer = model.get_observer('EARTH')
+        else:
+            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
 
     def compute_flank_profile(
@@ -137,7 +157,7 @@ class Observer:
                 r_cme = r_cme[id_sub]
 
             # Find the flank coordinate and update output
-            id_obs_flank: int = np.argmax(e_obs)
+            id_obs_flank: int = int(np.argmax(e_obs))
             flank.loc[i, 'lon'] = lon_cme[id_obs_flank].value
             flank.loc[i, 'r'] = r_cme[id_obs_flank].value
             flank.loc[i, 'el'] = np.rad2deg(e_obs[id_obs_flank])
@@ -175,6 +195,7 @@ class ObservationOperator:
         """
         Class to get observations for DA from
         :param use_model: String to determine whether to use SURF, Compressible SURF or HUXt
+        :param use_model: String to determine whether to use SURF, Compressible SURF or HUXt
         :param obs_lon: Longitude of observation source
         :param obs_time_in_datetime: Times observations are taken
         :param cme_par_dict: To be used to create synthetic observations, a dictionary containing true parameters
@@ -195,11 +216,27 @@ class ObservationOperator:
         :param bias_term_bool: Boolean to determine whether to use bias term or not
         :param bias_term_5rs: Float to determine bias term at 5Rs
         :param bias_term_21rs: Float to determine bias term at 21Rs
+        :param bias_term_5rs: Float to determine bias term at 5Rs
+        :param bias_term_21rs: Float to determine bias term at 21Rs
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: CHANGE cme_init_rad SUCH THAT IT CAN BE VARIED BETWEEN ENSEMBLE MEMBERS
         :TODO: Change such that observations are downloaded if need be
         """
+
+        # Get model to use and whether to use compressible SURF, incompressible SURF or HUXt;
+        #  and define the solver accordingly.
+        self.use_model = use_model.lower()
+        assert (self.use_model in ["surf", "compress_surf", "huxt"])
+
+        if use_model == "surf":
+            self.solver = "huxt"
+        elif use_model == "compress_surf":
+            self.solver = "hydro"
+        else:
+            self.solver = "huxt"
+
+        assert (self.solver in ["huxt", "hydro"])
 
         # Get model to use and whether to use compressible SURF, incompressible SURF or HUXt;
         #  and define the solver accordingly.
@@ -225,7 +262,6 @@ class ObservationOperator:
         self.obs_time_in_jd = Time(self.obs_time_in_datetime, format='datetime').jd
 
         # Define all variables required to initialise SURF are provided
-        #print(cme_par_dict)
         assert (all([cme_par_dict, obs_cov]) is not None)
         assert all(p in cme_par_dict.keys() for p in required_dict_keys())
 
@@ -288,6 +324,11 @@ class ObservationOperator:
 
         self.plot_surf_output = plot_surf_output
         self.bias_term_bool = bias_term_bool
+        self.bias_term_5rs = bias_term_5rs
+        self.bias_term_21rs = bias_term_21rs
+
+        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
+            self.bias_term_bool = False
         self.bias_term_5rs = bias_term_5rs
         self.bias_term_21rs = bias_term_21rs
 
@@ -520,7 +561,10 @@ class ObservationOperator:
                 ax.set_title(f"Synth obs CME at {obs_time_in_datetime[it]}")
                 plt.show()
             else:
-                sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+                sys.exit(
+                    f"Unknown use_model name, {self.use_model}, "
+                    f"expected either 'surf', 'compress_surf' "
+                    f"or 'huxt'")
 
         return None
 
@@ -528,7 +572,7 @@ class ObservationOperator:
     def get_cme_flank_single_ens_member(
             self,
             cme: H.ConeCME | S.ConeCME,
-            obs_longitude: float=None
+            obs_longitude: Quantity[u.deg] | list[Quantity[u.deg]]=None
     ) -> pd.DataFrame:
         """
         Function to retrieve the CME's flank for a single ensemble member
@@ -569,6 +613,8 @@ class ObservationOperator:
 
             cme_member: H.ConeCME = model.cmes[0]
         else:
+            model = setup_huxt()
+            cme_member = model.cmes[0]
             sys.exit("Unknown use_model name, expected either 'surf' or 'huxt'")
 
         #print(f"cme_member={cme_member}")
@@ -590,6 +636,13 @@ class ObservationOperator:
                 longitude=obs_longitude
             )
             cme_flank: pd.DataFrame = observer_object.model_flank  # compute_flank_profile(cme_member)
+        else:
+            model = setup_huxt()
+            cme_flank = pd.DataFrame()
+            sys.exit(
+                f"Unrecognised model type, {self.use_model} input"
+                f" into self.use_model"
+            )
 
         if self.plot_surf_output:
             self.plot_surf(model)
@@ -622,6 +675,7 @@ class ObservationOperator:
         return cme_flanks
 
 
+
     def obs_op_bias_correction(
             self,
             elon: float
@@ -641,6 +695,7 @@ class ObservationOperator:
         bias_corr = (m * elon) + c
 
         return bias_corr
+
 
 
     def make_obs_op(self) -> npt.NDArray[float]:

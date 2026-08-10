@@ -276,6 +276,7 @@ class TestObservationOperator:
 
             mock_cme = mocker.patch("surf.surf.ConeCME")
             mock_cme_values = [i for i in range(n_ensemble)]
+
         elif get_use_model in ["compress_surf"]:
             # Initialise mockers for the S.SURF and S.ConeCME calls
             mock_surf = mocker.patch("surf.surf.SURF")
@@ -286,6 +287,7 @@ class TestObservationOperator:
 
             mock_cme = mocker.patch("surf.surf.ConeCME")
             mock_cme_values = [i for i in range(n_ensemble)]
+
         elif get_use_model in ["huxt"]:
             # Initialise mockers for the S.SURF and S.ConeCME calls
             mock_surf = mocker.patch("huxt.huxt.HUXt")

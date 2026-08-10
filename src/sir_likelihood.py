@@ -5,7 +5,7 @@ import sys
 class LikelihoodFunction:
     def __init__(
             self,
-            obs: list[float] | npt.NDArray[float] | float,
+            obs: float | list[float] | npt.NDArray[float],
             obs_cov: list[float] | npt.NDArray[float] | float,
             hx: list[float] | npt.NDArray[float] | float
     ):
@@ -104,6 +104,7 @@ class LikelihoodFunction:
                 self.obs_cov: float = obs_cov[0]
 
 
+
     def log_likelihood_gaussian(self) -> float:
         """
         log_likelihood_function_gaussian: The purpose of this definition is to calculate the
@@ -121,20 +122,27 @@ class LikelihoodFunction:
         elif np.ndim(innov) == 1:
             innov = float(innov[0])
 
+        if np.ndim(innov) == 0:
+            innov = float(innov)
+        elif np.ndim(innov) == 1:
+            innov = float(innov[0])
+
         if np.ndim(self.obs_cov) == 0:
             # 1D-case
             obs_cov_1: float = float(1.0 / self.obs_cov)
-
         elif np.ndim(self.obs_cov) == 1:
             obs_cov_1: float = 1.0 / float(self.obs_cov.item())
-
         else:
             # Dimension of observation is greater than 1
             obs_cov_1: npt.NDArray[float] = np.linalg.pinv(self.obs_cov)
 
         if isinstance(innov, float):
             assert isinstance(obs_cov_1, float)
-
+            log_likelihood: float = -obs_cov_1 * innov * innov
+        elif isinstance(innov, np.ndarray):
+            assert(isinstance(obs_cov_1, np.ndarray))
+        if isinstance(innov, float):
+            assert isinstance(obs_cov_1, float)
             log_likelihood: float = -obs_cov_1 * innov * innov
         elif isinstance(innov, np.ndarray):
             assert(isinstance(obs_cov_1, np.ndarray))
@@ -161,6 +169,7 @@ class LikelihoodFunction:
         likelihood: float = np.exp(log_likelihood)
 
         return likelihood
+
 
 
     def make_log_likelihood(self) -> float:

@@ -3,20 +3,13 @@ import numpy.typing as npt
 import datetime
 import os
 import sys
-import pandas as pd
+
 import xarray as xr
-from typing import TypedDict
-import json
 
 import surf.surf as S
 import surf.surf_inputs as Sin
 
-import huxt.huxt as H
 import huxt.huxt_inputs as Hin
-
-import surf.surf_analysis as SA
-from mypy.build import TypedDict
-from scipy.special.cython_special import log_wright_bessel
 
 import sunpy.coordinates.sun as sn
 
@@ -24,21 +17,11 @@ import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 
-from dotenv import load_dotenv, dotenv_values
+from dotenv import load_dotenv
 from pathlib import Path
-import matplotlib.pyplot as plt
-from cme_par_ens import CmeParEns
-import seaborn as sns
-import colorcet as cc
-import pytest
-from cme_par_dict_structure import required_dict_keys
+
 import make_prior_covariance_mat as mp_cov
 from wsa_reader import ReadWSAFiles
-
-# import numpy as np
-# import numpy.typing as npt
-# from astropy.units import Quantity
-# import datetime
 
 from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
@@ -65,7 +48,7 @@ def allowed_cov_types():
 
 
 def get_mas_wsa_const():
-    mas_wsa_const = "const"
+    mas_wsa_const = "wsa"
     
     return mas_wsa_const
 
@@ -98,8 +81,8 @@ def get_use_model():
     Function to get model we require to use
     :return: use_model: String containing either "surf", "surf_compress", "huxt"
     """
-    poss_models = ["surf", "compress_surf", "huxt"]
 
+    poss_models = ["surf", "compress_surf", "huxt"]
     use_model = "compress_surf"
 
     assert use_model.lower() in poss_models
@@ -491,7 +474,7 @@ def initialise_prior_cme_cov():
 
 
 def get_use_synthetic_obs():
-    use_synthetic_obs = True
+    use_synthetic_obs = False
 
     return use_synthetic_obs
 
@@ -534,6 +517,9 @@ def initialise_observation_parameters():
         bias_term_bool = False #True
     else:
         bias_term_bool = True
+
+    bias_term_5 = 2.5
+    bias_term_21 = 2.5
 
     bias_term_5 = 2.5
     bias_term_21 = 2.5
@@ -618,12 +604,15 @@ class RunDataAssimilationRoutine:
         # Ensure all bias terms exist, if not, set bias_term_bool to False
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
             self.bias_term_bool = False
+        self.bias_term_5rs: float = obs_par_dict["bias_term_5rs"]
+        self.bias_term_21rs: float = obs_par_dict["bias_term_21rs"]
+
+        # Ensure all bias terms exist, if not, set bias_term_bool to False
+        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
+            self.bias_term_bool = False
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
-        if self.use_synthetic_obs or (self.obs_filenames is None):
-            self.true_cme_par_dict: CmeParEns = initialise_true_cme_par_dict()
-        else:
-            self.true_cme_par_dict: CmeParEns = None
+        self.true_cme_par_dict: CmeParEns = initialise_true_cme_par_dict()
 
         if self.use_synthetic_obs:
             # Generate observations
@@ -715,6 +704,7 @@ class RunDataAssimilationRoutine:
             os.getenv("OUT_BASE_DIR"),
             f"ens_{self.n_members}", self.cme_cov_type
         )
+        model_dir = f"model_{self.use_model.upper()}"
 
         model_dir = f"model_{self.use_model.upper()}"
 
@@ -728,6 +718,7 @@ class RunDataAssimilationRoutine:
             obs_dir = (
                 f"obs_{self.craft}_{self.ssw_event}_{self.img}"
             )
+
 
         prior_dir = (
             f"prior_{self.fg_mean_cme_speed}_{self.fg_mean_cme_width}"

@@ -2,12 +2,13 @@ import numpy as np
 import numpy.typing as npt
 import datetime
 
+import huxt.huxt as H
+import surf.surf as S
+
 from huxt.huxt import Observer as Hobs
 from surf.surf import Observer as Sobs
 
-import h5py
 import pandas as pd
-import xarray as xr
 import os
 from stereo_spice.coordinates import StereoSpice
 
@@ -21,12 +22,13 @@ from sir_observation_operator import ObservationOperator
 from cme_par_dict_structure import required_dict_keys
 
 
-def get_ssw_profile(ssw_event, craft, img, pa_center, pa_wid=1.0):
+def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
     """
     Compute the Solar Stormwatch profile of the CME along a fixed position angle window, for either STA or STB.
     Parameters
     ----------
-    ssw_event: String identifier of which SWPC event to analyse. Should be ssw_007, ssw_008, ssw_009, or ssw_012.
+    use_model: Variable to determine which model to use, accepted inputs are ['huxt', 'surf', 'compress_surf']
+    ssw_event: String identifier of which SWPC ssw_event to analyse. Should be ssw_007, ssw_008, ssw_009, or ssw_012.
     craft: String identifier of which STEREO craft to analyse, should be 'STA' or 'STB'.
     img: String identifier of whether to retrieve the ssw profiles of normal, or differenced images. Should be
         'norm', or 'diff'
@@ -40,19 +42,28 @@ def get_ssw_profile(ssw_event, craft, img, pa_center, pa_wid=1.0):
 
     """
     # Open up the SSW data
-    project_dirs = S._setup_dirs_()
+    if use_model in ['huxt']:
+        project_dirs = H._setup_dirs_()
+    elif use_model in ['surf', 'compress_surf']:
+        project_dirs = S._setup_dirs_()
+    else:
+        project_dirs = {}
+        sys.exit(
+            f"Unrecognised use_model variable, {use_model}, "
+            f"accepted use_model variables = ['huxt', 'surf', 'compress_surf']"
+        )
     ssw_out = tables.open_file(project_dirs['SSW_data'], mode="r")
 
-    # Pull out event
+    # Pull out ssw_event
     ssw_path = "/".join(['', ssw_event, craft, img])
-    event = ssw_out.get_node(ssw_path)
+    ssw_event = ssw_out.get_node(ssw_path)
 
     # Now for each time, look up elongation at position angle nearest to requested pa.
     times = []
     el_best = []
     el_lo = []
     el_hi = []
-    for cme_slice in event:
+    for cme_slice in ssw_event:
         frame_time = Time(cme_slice._v_title, format='isot', scale='utc')
         # Stash time
         times.append(frame_time.datetime)
@@ -111,6 +122,7 @@ class Observations:
     ) -> None:
         """
         Class to get observations for DA from
+        :param use_model: String to determine which model to use, possible models are ['surf', 'compress_surf', 'huxt']
         :param use_model: String to determine which model to use, possible models are ['surf', 'compress_surf', 'huxt']
         :param obs_lon: Longitude of observation source
         :param obs_times_in_datetime: Times observations are taken
@@ -297,18 +309,18 @@ class Observations:
         for obs_file in self.obs_filenames:
             with tables.open_file(obs_file, mode="r") as f:#h5py.File(self.obs_filenames, 'r') as f:
 
-                # Pull out event
+                # Pull out ssw_event
                 # ssw_event = "ssw_012"
                 # craft = "stb"
                 # img = "diff"
                 pa_wid=1.0
                 ssw_path = "/".join(['', self.ssw_event, self.craft, self.img])
-                #ssw_path = "/".join(["", self.ssw_event, self.craft])
+
                 print(f"Reading observation from: {ssw_path}")
-                event = f.get_node(ssw_path)
+                ssw_event = f.get_node(ssw_path)
                 spice = StereoSpice()
 
-                for cme_slice in event:
+                for cme_slice in ssw_event:
                     frame_time = Time(cme_slice._v_title, format='isot', scale='utc')
                     #print(f"frame_time = {frame_time}")
                     ert_hpc = spice.get_lonlat(frame_time, 'earth', system='hpc', observatory=self.craft)
@@ -450,6 +462,7 @@ def main():
         "C:\\", "Users", "ss905122", "PycharmProjects",
         "SIR_SUXt", "SSW_cme_classifications.hdf5"
     )
+    use_model = "surf"
     use_model = "surf"
     ssw_event: str = "ssw_012"
     craft: str = "stb"

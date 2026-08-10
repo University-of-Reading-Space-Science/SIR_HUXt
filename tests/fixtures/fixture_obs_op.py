@@ -48,7 +48,7 @@ def get_surf_simtime() -> Quantity[u.day]:
 
 @pytest.fixture
 def get_surf_dt_scale() -> int | float:
-    dt_scale=19
+    dt_scale=10
     return dt_scale
 
 @pytest.fixture
@@ -88,10 +88,13 @@ def get_obs_times(obs_op_tests) -> list[datetime.datetime]:
 
     return obs_times
 
+
 @pytest.fixture
 def get_use_model() -> str:
-    use_model = "compress_surf"
+    use_model = "huxt"
+
     return use_model
+
 
 @pytest.fixture
 def get_obs_cov() -> float:

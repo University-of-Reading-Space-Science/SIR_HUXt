@@ -8,6 +8,8 @@ import datetime
 import huxt.huxt as H
 import surf.surf as S
 
+import surf.surf as S
+
 import sunpy.coordinates.sun as sn
 
 import astropy.units as u
@@ -28,13 +30,13 @@ def setup_huxt(
 #        accel_limit: bool = False
 ) -> H.HUXt:
     """
-    Initialise SURF with some predetermined boundary/initial conditions
-    Here a uniform 400km/s wind is used, and SURF time is set to 2008-01-01T00:00:00.
-    :param start_datetime: Initial datetime of SURF simulation
+    Initialise HUXt with some predetermined boundary/initial conditions
+    Here a uniform 400km/s wind is used, and HUXt time is set to 2008-01-01T00:00:00.
+    :param start_datetime: Initial datetime of HUXt simulation
     :param vr_in: Initial radial solar wind speed in km/s
-    :param lon_start: Initial longitude of SURF simulation in degrees
-    :param lon_stop: Final longitude of SURF simulation in degrees
-    :param sim_time: SURF simulation time in seconds
+    :param lon_start: Initial longitude of HUXt simulation in degrees
+    :param lon_stop: Final longitude of HUXt simulation in degrees
+    :param sim_time: HUXt simulation time in seconds
     :param dt_scale: Scalar specifying cadence of output timesteps
     :param r_min: Inner boundary radius in solar radii
 
@@ -48,7 +50,7 @@ def setup_huxt(
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
     ert: Observer = H.Observer("EARTH", start_time)
 
-    # Set up SURF for a sim_time-day simulation, outputting every dt_scale
+    # Set up HUXt for a sim_time-day simulation, outputting every dt_scale
     model: HUXt = H.HUXt(
         v_boundary=vr_in,
         cr_num=cr_num,
