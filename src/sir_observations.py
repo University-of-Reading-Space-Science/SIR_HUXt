@@ -98,7 +98,9 @@ class Observations:
     def __init__(
             self,
             use_model: str,
+            obs_radius: Quantity[u.AU] | list[Quantity[u.AU]]=None,
             obs_lon: Quantity[u.deg] | list[Quantity[u.deg]]=None,
+            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = None,
             obs_times_in_datetime: datetime.datetime | list[datetime.datetime]=None,
             obs_filenames: list[str] | str =None,
             use_synthetic_obs: bool=False,
@@ -169,10 +171,20 @@ class Observations:
             self.craft: str = craft
             self.img: str = img
 
+        if obs_radius is None:
+            self.obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] = 1.0 * u.AU
+        else:
+            self.obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] = obs_radius
+
         if obs_lon is None:
             self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = 0 * u.deg
         else:
             self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = obs_lon
+
+        if obs_lat is None:
+            self.obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = 0 * u.deg
+        else:
+            self.obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = obs_lat
 
         # If we are using synthetic observations, ensure all variables required to initialise them are provided
         if self.use_synth_obs:
@@ -272,7 +284,9 @@ class Observations:
         obs_op_obj = ObservationOperator(
             use_model=self.use_model,
             cme_par_dict = self.true_cme_par_dict,
+            obs_radius=self.obs_radius,
             obs_lon = self.obs_lon,
+            obs_lat = self.obs_lat,
             obs_time_in_datetime=self.obs_times_in_datetime,
             obs_cov = self.obs_cov,
             surf_init_time = self.surf_init_time,

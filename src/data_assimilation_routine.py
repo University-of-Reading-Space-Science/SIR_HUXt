@@ -28,6 +28,8 @@ from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 
+from multiprocessing import Pool
+
 env_path = Path('.', '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
@@ -48,9 +50,24 @@ def allowed_cov_types():
 
 
 def get_mas_wsa_const():
-    mas_wsa_const = "wsa"
+    mas_wsa_const = "const"
     
     return mas_wsa_const
+
+
+def get_use_synthetic_obs():
+    use_synthetic_obs = True
+
+    return use_synthetic_obs
+
+
+def get_ssw_event_craft():
+    ssw_event = "ssw_012"
+    craft = "stb"
+    img = "diff"
+
+    return ssw_event, craft, img
+
 
 def get_surf_init_time():
 
@@ -471,29 +488,16 @@ def initialise_prior_cme_cov():
     }
 
     return prior_cme_cov_dict
-
-
-def get_use_synthetic_obs():
-    use_synthetic_obs = False
-
-    return use_synthetic_obs
-
-
-def get_ssw_event_craft():
-    ssw_event = "ssw_012"
-    craft = "stb"
-    img = "diff"
-    
-    return ssw_event, craft, img
     
     
 def initialise_observation_parameters():
-    n_obs: int = 8
-    obs_cadence_hr = 3 # Observations cadence in hours
+    n_obs: int = 3
+    obs_cadence_hr = 8 # Observations cadence in hours
     true_cme_dict = initialise_true_cme_par_dict()
     true_cme_t_init: datetime.datetime = true_cme_dict["t_init"]
 
     surf_init_time = get_surf_init_time()
+    obs_radius: Quantity[u.AU] = 1.0 * u.AU
     obs_lon: Quantity[u.deg] = 300 * u.deg
     obs_lat: Quantity[u.deg] = 0 * u.deg
 
@@ -526,6 +530,7 @@ def initialise_observation_parameters():
 
     obs_par_dict = {
         "n_obs": n_obs,
+        "obs_radius": obs_radius,
         "obs_lon": obs_lon,
         "obs_lat": obs_lat,
         "obs_cov": obs_cov,
@@ -546,7 +551,7 @@ def initialise_observation_parameters():
 
 def initialise_da_parameters():
     n_members: int = 50
-    n_runs: int = 1
+    n_runs: int = 25
 
     delta_aux_pf: float = 0.98
     if get_use_synthetic_obs():
@@ -587,8 +592,9 @@ class RunDataAssimilationRoutine:
         # Initialise observation variables
         obs_par_dict = initialise_observation_parameters()
         self.n_obs: int = obs_par_dict["n_obs"]
+        self.obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] = obs_par_dict["obs_radius"]
         self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = obs_par_dict["obs_lon"]
-        self.obs_lat: Quantity[u.deg] = obs_par_dict["obs_lat"]
+        self.obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = obs_par_dict["obs_lat"]
         self.obs_cov: float | npt.NDArray[float] = obs_par_dict["obs_cov"]
         self.obs_times: list[datetime.datetime] = obs_par_dict["obs_times"]
         self.use_synthetic_obs: bool = obs_par_dict["use_synthetic_obs"]
@@ -617,8 +623,15 @@ class RunDataAssimilationRoutine:
         if self.use_synthetic_obs:
             # Generate observations
             self.observations: list[float] = self.get_observations()
+            if not isinstance(self.obs_radius, list):
+                print("Hi")
+                self.obs_radius = [self.obs_radius for _ in range(self.n_obs)]
+
             if not isinstance(self.obs_lon, list):
                 self.obs_lon = [self.obs_lon for _ in range(self.n_obs)]
+
+            if not isinstance(self.obs_lat, list):
+                self.obs_lat = [self.obs_lat for _ in range(self.n_obs)]
         else:
             obs_tuple: tuple[
                 list[datetime.datetime], list[Quantity[u.deg]], list[float], int
@@ -661,7 +674,7 @@ class RunDataAssimilationRoutine:
         # Get DA parameters
         da_par_dict = initialise_da_parameters()
         self.n_members: int = da_par_dict["n_members"]
-        self.n_runs: int = da_par_dict["n_runs"]
+        self.n_runs: int = 1 #da_par_dict["n_runs"]
         self.delta_aux_pf: float = da_par_dict["delta_aux_pf"]
         self.pars_in_state: list[str] = da_par_dict["pars_in_state"]
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
@@ -719,11 +732,10 @@ class RunDataAssimilationRoutine:
                 f"obs_{self.craft}_{self.ssw_event}_{self.img}"
             )
 
-
         prior_dir = (
-            f"prior_{self.fg_mean_cme_speed}_{self.fg_mean_cme_width}"
-            f"_{self.fg_mean_cme_lon}_{self.fg_mean_cme_lat}"
-            f"_{self.fg_mean_cme_thick}"
+            f"prior_{self.fg_mean_cme_speed:.1f}_{self.fg_mean_cme_width:.1f}"
+            f"_{self.fg_mean_cme_lon:.1f}_{self.fg_mean_cme_lat:.1f}"
+            f"_{self.fg_mean_cme_thick:.1f}"
         )
         run_dir = f"run_{run_no:03d}"
 
@@ -1021,16 +1033,18 @@ class RunDataAssimilationRoutine:
                 cme_par_dict=cme_par_dict, run_no=run_no
             )
             #print(f"obs={self.observations}")
-            print(f"Input bias_term_bool = {self.bias_term_bool}")
+            #print(f"Input bias_term_bool = {self.bias_term_bool}")
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
-                print(f"obs = {obs}, obs_lon = {self.obs_lon[yi]}, obs_time = {self.obs_times[yi]}")
+                #print(f"obs = {obs}, obs_lon = {self.obs_lon[yi]}, obs_time = {self.obs_times[yi]}")
                 aux_pf_class = AuxPF(
                     use_model=self.use_model,
                     cme_par_dict=cme_par_dict,
                     obs=obs,
                     obs_cov=self.obs_cov,
+                    obs_radius=self.obs_radius[yi],
                     obs_lon=self.obs_lon[yi],
+                    obs_lat=self.obs_lat[yi],
                     obs_time=self.obs_times[yi],
                     true_cme_par_dict=self.true_cme_par_dict,
                     infl_fact=1,
@@ -1115,8 +1129,18 @@ def main():
     print_environment_variables()
     run_da_class = RunDataAssimilationRoutine()
 
+    run_start = 0
+    da_par_dict = initialise_da_parameters()
+    n_runs = da_par_dict["n_runs"]
+    pool_size = os.cpu_count() - 1
+
+
     if get_use_synthetic_obs():
-        run_da_class.run_data_assimilation(run_start=0)
+        with Pool(pool_size) as pool:
+            pool.map(
+                run_da_class.run_data_assimilation,
+                range(run_start, run_start + n_runs)
+            )
     else:
         run_da_class.run_data_assimilation(run_start=-1)
 

@@ -204,18 +204,37 @@ def plot_par_values_over_mult_runs(
 
     return None
 
-
-def get_cme_arrival_time(
+def get_true_cme_arrival_time(
         ds,
         use_model,
-        runNo=0,
-        n_ens=50,
-        real_arrival_time=None,
-        cme_hit_object="EARTH",
-        base_file_path=None
+        true_cme_t_init,
+        true_cme_speed,
+        true_cme_width,
+        true_cme_lat,
+        true_cme_lon,
+        true_cme_thick,
+        cme_hit_object="EARTH"
 ):
     print(ds["model_init_time"].values)
-    start_time = datetime.datetime.strptime(str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000')
+    try:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values * u.solRad
+        v_bound_val = ds["ambient_vr"].values * u.km / u.s
+    except:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values[0]), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values[0] * u.solRad
+        v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
+    else:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values * u.solRad
+        v_bound_val = ds["ambient_vr"].values * u.km / u.s
+
     print(start_time)
     start_time_astro = Time(start_time, format='datetime')
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
@@ -240,7 +259,7 @@ def get_cme_arrival_time(
 
     if use_model in ["surf", "compress_surf"]:
         model: SURF = S.SURF(
-            v_boundary=ds["ambient_vr"].values * u.km / u.s,
+            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
             latitude=ert.lat.to(u.deg),
@@ -248,12 +267,27 @@ def get_cme_arrival_time(
             lon_stop=lon_end.to(u.rad),
             simtime=5 * u.day,
             dt_scale=20,
-            r_min=ds["r_min"].values * u.solRad,
-            #        accel_limit=accel_limit
+            r_min=r_min_value,#ds["r_min"].values * u.solRad,
+            solver='huxt',
+            # accel_limit=accel_limit
+        )
+    elif use_model in ["compress_surf"]:
+        model: SURF = S.SURF(
+            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=r_min_value,#ds["r_min"].values * u.solRad,
+            solver='hydro',
+            # accel_limit=accel_limit
         )
     elif use_model in ["huxt"]:
         model: HUXt = H.HUXt(
-            v_boundary=ds["ambient_vr"].values * u.km / u.s,
+            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
             latitude=ert.lat.to(u.deg),
@@ -261,58 +295,298 @@ def get_cme_arrival_time(
             lon_stop=lon_end.to(u.rad),
             simtime=5 * u.day,
             dt_scale=20,
-            r_min=ds["r_min"].values * u.solRad,
-            #        accel_limit=accel_limit
+            r_min=r_min_value,#ds["r_min"].values * u.solRad,
+            # accel_limit=accel_limit
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
+    # Generate CME object
+    sec_to_cme_true = float(
+        (true_cme_t_init - start_time).total_seconds()
+    ) * u.s
+    v_true = float(true_cme_speed) * u.km / u.s
+    width_true = float(true_cme_width) * u.deg
+    lon_true =  float(true_cme_lon) * u.deg
+    lat_true =  float(true_cme_lat) * u.deg
+    thick_true = float(true_cme_thick) * u.solRad
+
+    if use_model in ["surf", "compress_surf"]:
+        cme_object: S.ConeCME = S.ConeCME(
+            t_launch=sec_to_cme_true,
+            v=v_true,
+            width=width_true,
+            longitude=lon_true,
+            latitude=lat_true,
+            thickness=thick_true,
+            cme_fixed_duration=True,
+            fixed_duration=12 * 3600 * u.s
+        )
+
+    elif use_model in ["huxt"]:
+        cme_object: H.ConeCME = H.ConeCME(
+            t_launch=sec_to_cme_true,
+            v=v_true,
+            width=width_true,
+            longitude=lon_true,
+            latitude=lat_true,
+            thickness=thick_true,
+            cme_fixed_duration=True,
+            fixed_duration=12 * 3600 * u.s
+        )
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
+    # Make true CME arrival time
+    model.solve([cme_object])
+    cme = model.cmes[0]
+    true_stats = cme.compute_arrival_at_body(cme_hit_object)
+    # print(f"prior_stats_{i}={prior_stats}")
+
+    if true_stats['hit']:
+        cme_arrival_time = true_stats['t_arrive'].datetime
+        cme_arrival_speed = (true_stats["v"].to(u.km / u.s)).value
+    else:
+        cme_arrival_time = np.nan
+        cme_arrival_speed = np.nan
+
+    print(f"True CME arrival time at {cme_hit_object}: {cme_arrival_time}")
+    print(f"True CME arrival speed at {cme_hit_object}: {cme_arrival_speed}")
+
+    return cme_arrival_time, cme_arrival_speed
+
+
+def get_cme_arrival_time(
+        ds,
+        use_model,
+        runNo=0,
+        n_ens=50,
+        real_arrival_time=None,
+        cme_hit_object="EARTH",
+        base_file_path=None
+):
+    print(ds["model_init_time"].values)
+    try:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values * u.solRad
+        v_bound_val = ds["ambient_vr"].values * u.km / u.s
+    except:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values[0]), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values[0] * u.solRad
+        v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
+    else:
+        start_time = datetime.datetime.strptime(
+            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+        )
+        r_min_value = ds["r_min"].values * u.solRad
+        v_bound_val = ds["ambient_vr"].values * u.km / u.s
+
+    #start_time = datetime.datetime.strptime(str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000')
+    print(start_time)
+    start_time_astro = Time(start_time, format='datetime')
+    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
+
+    if use_model in ["surf", "compress_surf"]:
+        ert = S.Observer("EARTH", start_time_astro)
+    elif use_model in ["huxt"]:
+        ert = H.Observer("EARTH", start_time_astro)
+    else:
+        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+
+    lon_start = 300 * u.deg
+    lon_end = 420 * u.deg
+
+    # Initialise list
+    cme_arrival_prior = []
+    cme_arr_prior_speed = []
+    cme_arrival_post = []
+    cme_arr_post_speed = []
+
+    n_members = len(ds["ens_no"].values)
+
+    if use_model in ["surf", "compress_surf"]:
+        model: SURF = S.SURF(
+            v_boundary=ds["ambient_vr"].values[runNo] * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=ds["r_min"].values[runNo] * u.solRad,
+            solver='huxt',
+            # accel_limit=accel_limit
+        )
+    elif use_model in ["compress_surf"]:
+        model: SURF = S.SURF(
+            v_boundary=ds["ambient_vr"].values[runNo] * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=ds["r_min"].values[runNo] * u.solRad,
+            solver='hydro',
+            # accel_limit=accel_limit
+        )
+    elif use_model in ["huxt"]:
+        model: HUXt = H.HUXt(
+            v_boundary=ds["ambient_vr"].values[runNo] * u.km / u.s,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=5 * u.day,
+            dt_scale=20,
+            r_min=ds["r_min"].values[runNo] * u.solRad,
+            # accel_limit=accel_limit
         )
     else:
         sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
 
     # Generate CME object
     # print(f"cme_launch_time = {cme_launch_time}")
-    sec_to_cme_prior = [
-        float(ds["t_init"][0, i].values) * u.s for i in range(n_members)
-    ]
-    v_prior = [
-        ds["v"][0, i].values * u.km / u.s for i in range(n_members)
-    ]
-    width_prior = [
-        ds["width"][0, i].values * u.deg for i in range(n_members)
-    ]
-    lon_prior = [
-        ds["lon"][0, i].values * u.deg for i in range(n_members)
-    ]
-    lat_prior = [
-        ds["lat"][0, i].values * u.deg for i in range(n_members)
-    ]
-    thick_prior = [
-        ds["thick"][0, i].values * u.solRad for i in range(n_members)
-    ]
+    try:
+        sec_to_cme_prior = [
+            float(ds["t_init"][0, i].values) * u.s for i in range(n_members)
+        ]
+        v_prior = [
+            ds["v"][0, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_prior = [
+            ds["width"][0, i].values * u.deg for i in range(n_members)
+        ]
+        lon_prior = [
+            ds["lon"][0, i].values * u.deg for i in range(n_members)
+        ]
+        lat_prior = [
+            ds["lat"][0, i].values * u.deg for i in range(n_members)
+        ]
+        thick_prior = [
+            ds["thick"][0, i].values * u.solRad for i in range(n_members)
+        ]
 
 
-    sec_to_cme_post = [
-        float(ds["t_init"][-1, i].values) * u.s for i in range(n_members)
-    ]
-    v_post = [
-        ds["v"][-1, i].values * u.km / u.s for i in range(n_members)
-    ]
-    width_post = [
-        ds["width"][-1, i].values * u.deg for i in range(n_members)
-    ]
-    lon_post = [
-        ds["lon"][-1, i].values * u.deg for i in range(n_members)
-    ]
-    lat_post = [
-        ds["lat"][-1, i].values * u.deg for i in range(n_members)
-    ]
-    thick_post = [
-        ds["thick"][-1, i].values * u.solRad for i in range(n_members)
-    ]
-    log_weights_post = [
-        ds["log_weight"][-1, i].values for i in range(n_members)
-    ]
-    weights_post = np.array([
-        np.exp(log_weights_post[i]) for i in range(n_members)
-    ])
+        sec_to_cme_post = [
+            float(ds["t_init"][-1, i].values) * u.s for i in range(n_members)
+        ]
+        v_post = [
+            ds["v"][-1, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_post = [
+            ds["width"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        lon_post = [
+            ds["lon"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        lat_post = [
+            ds["lat"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        thick_post = [
+            ds["thick"][-1, i].values * u.solRad for i in range(n_members)
+        ]
+        log_weights_post = [
+            ds["log_weight"][-1, i].values for i in range(n_members)
+        ]
+        weights_post = np.array([
+            np.exp(log_weights_post[i]) for i in range(n_members)
+        ])
+    except:
+        sec_to_cme_prior = [
+            float(ds["t_init"][runNo, 0, i].values) * u.s for i in range(n_members)
+        ]
+        v_prior = [
+            ds["v"][runNo, 0, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_prior = [
+            ds["width"][runNo, 0, i].values * u.deg for i in range(n_members)
+        ]
+        lon_prior = [
+            ds["lon"][runNo, 0, i].values * u.deg for i in range(n_members)
+        ]
+        lat_prior = [
+            ds["lat"][runNo, 0, i].values * u.deg for i in range(n_members)
+        ]
+        thick_prior = [
+            ds["thick"][runNo, 0, i].values * u.solRad for i in range(n_members)
+        ]
+
+        sec_to_cme_post = [
+            float(ds["t_init"][runNo, -1, i].values) * u.s for i in range(n_members)
+        ]
+        v_post = [
+            ds["v"][runNo, -1, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_post = [
+            ds["width"][runNo, -1, i].values * u.deg for i in range(n_members)
+        ]
+        lon_post = [
+            ds["lon"][runNo, -1, i].values * u.deg for i in range(n_members)
+        ]
+        lat_post = [
+            ds["lat"][runNo, -1, i].values * u.deg for i in range(n_members)
+        ]
+        thick_post = [
+            ds["thick"][runNo, -1, i].values * u.solRad for i in range(n_members)
+        ]
+        log_weights_post = [
+            ds["log_weight"][runNo, -1, i].values for i in range(n_members)
+        ]
+        weights_post = np.array([
+            np.exp(log_weights_post[i]) for i in range(n_members)
+        ])
+    else:
+        sec_to_cme_prior = [
+            float(ds["t_init"][0, i].values) * u.s for i in range(n_members)
+        ]
+        v_prior = [
+            ds["v"][0, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_prior = [
+            ds["width"][0, i].values * u.deg for i in range(n_members)
+        ]
+        lon_prior = [
+            ds["lon"][0, i].values * u.deg for i in range(n_members)
+        ]
+        lat_prior = [
+            ds["lat"][0, i].values * u.deg for i in range(n_members)
+        ]
+        thick_prior = [
+            ds["thick"][0, i].values * u.solRad for i in range(n_members)
+        ]
+
+        sec_to_cme_post = [
+            float(ds["t_init"][-1, i].values) * u.s for i in range(n_members)
+        ]
+        v_post = [
+            ds["v"][-1, i].values * u.km / u.s for i in range(n_members)
+        ]
+        width_post = [
+            ds["width"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        lon_post = [
+            ds["lon"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        lat_post = [
+            ds["lat"][-1, i].values * u.deg for i in range(n_members)
+        ]
+        thick_post = [
+            ds["thick"][-1, i].values * u.solRad for i in range(n_members)
+        ]
+        log_weights_post = [
+            ds["log_weight"][-1, i].values for i in range(n_members)
+        ]
+        weights_post = np.array([
+            np.exp(log_weights_post[i]) for i in range(n_members)
+        ])
 
     if use_model in ["surf", "compress_surf"]:
         prior_cme_objects: list[S.ConeCME] = [
@@ -670,9 +944,9 @@ def plot_par_histograms_over_mult_runs(
 
     # Add constraints on colorbar if provided
     if np.isnan(cbarMin + cbarMax):
-        im = ax.hexbin(xValues, yValues, gridsize=30, cmap=cmap)
+        im = ax.hexbin(xValues, yValues, gridsize=10, cmap=cmap)
     else:
-        im = ax.hexbin(xValues, yValues, gridsize=30, cmap=cmap, vmin=cbarMin, vmax=cbarMax)
+        im = ax.hexbin(xValues, yValues, gridsize=10, cmap=cmap, vmin=cbarMin, vmax=cbarMax)
 
     ax.plot(
         [xMin, xMax], [yTruth, yTruth],
@@ -768,11 +1042,11 @@ def plot_sample_cov(
 
 
 def main():
-    nRuns = 1
-    start_run = -1
-    vTruth = None#495
-    widthTruth = None#37.4
-    lonTruth = None#0
+    nRuns = 25
+    start_run = 0
+    vTruth = 495
+    widthTruth = 37.4
+    lonTruth = 0
 
     #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
@@ -781,11 +1055,12 @@ def main():
     #     "mo_cone",# "New folder",
     #     "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     # )
-    event_list = ["ssw_008", "ssw_009", "ssw_012"]#["ssw_007", "ssw_008", "ssw_009", "ssw_012"]
-    craft_list = ["sta", "stb"]
+    event_list = ["ssw_008"]#, "ssw_009", "ssw_012"]#["ssw_007", "ssw_008", "ssw_009", "ssw_012"]
+    event_list = ["twin"]
+    craft_list = ["sta"]#, "stb"]
     img_list = ["diff"] # ["norm", "diff"]
     par_type = "donki"
-    use_model = "surf"
+    use_model = "compress_surf"
     bias_folder_name = "bias5_2.5_bias21_2.5"
     n_ens = 50
     all_comb_list = [
@@ -977,7 +1252,14 @@ def main():
 
 
         elif event == "twin":
-            prior_dir = "prior_495_37.4_0_0_0"
+            true_cme_t_init = datetime.datetime(2012, 1, 1, 1, 0, 0, 0)
+            true_cme_speed = 495.0
+            true_cme_width = 37.4
+            true_cme_lon = 0.0
+            true_cme_lat = 0.0
+            true_cme_thick = 0.0
+            truth_dir = "truth_495.0_37.4_0.0_0.0_0.0"
+            prior_dir = "prior_495.0_37.4_0.0_-2.9_0.0"
 
         else:
             sys.exit(f"Unknown event {event}.")
@@ -993,6 +1275,12 @@ def main():
             "bias_correction", bias_folder_name,
             obs_dir_name, # "New folder",
             prior_dir, "0.98",
+        )
+        #C:\Users\ss905122\PycharmProjects\SIR_HUXt\output\compress_huxt\WSA_v\ens_50\uncorr\model_COMPRESS_SURF
+        baseFilePath = os.path.join(
+            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
+            "compress_huxt", "test", "WSA_v", f"ens_{n_ens}", "uncorr", f"model_{use_model.upper()}",
+            truth_dir, prior_dir, "0.98",
         )
         """baseFilePath = os.path.join(
             "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output3",
@@ -1017,14 +1305,28 @@ def main():
                     ds = xr.concat([ds, dsTemp], "run")
 
         #print(ds)
+
+        if event == "twin":
+            real_arrival_time, real_arrival_speed = get_true_cme_arrival_time(
+                ds=ds,
+                use_model=use_model,
+                true_cme_t_init=true_cme_t_init,
+                true_cme_speed=true_cme_speed,
+                true_cme_width=true_cme_width,
+                true_cme_lat=true_cme_lat,
+                true_cme_lon=true_cme_lon,
+                true_cme_thick=true_cme_thick,
+                cme_hit_object="EARTH"
+            )
+
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             get_cme_arrival_time(
-                ds,
-                runNo,
+                ds=ds,
+                runNo=runNo,
                 use_model=use_model,
                 n_ens=n_ens,
                 real_arrival_time=real_arrival_time,
-                cme_hit_object=cme_hit_object,
+                cme_hit_object="EARTH",
                 base_file_path=baseFilePath
             )
 
@@ -1036,7 +1338,7 @@ def main():
         # # plot_sample_cov(
         #     ds, "all", -1, vars_req=["v", "lon", "width"]
         # )
-
+    """
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             if event == "twin":
                 fig_title = f"Twin experiment, Run no. = {runNo}"
@@ -1090,8 +1392,7 @@ def main():
                 base_file_path=baseFilePath,
                 craft=craft,
             )
-    sys.exit()
-
+    """
     colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
     plot_par_values_over_mult_runs(
         ds,
@@ -1132,11 +1433,11 @@ def main():
     xLab = ["CME speed (km/s)", "CME speed (km/s)", "CME Width (deg)", "CME speed (km/s)","CME speed (km/s)", "CME width (deg)"]
     yLab = ["CME Width (deg)", "CME Longitude (deg)", "CME Longitude (deg)", "CME Width (deg)", "CME Longitude (deg)", "CME Longitude (deg)"]
 
-    xMin = [300, 300, 25, 300, 300, 25]
-    yMin = [25, -20, -20, 25, -20, -20]
+    xMin = [400, 400, 25, 400, 400, 25]
+    yMin = [25, -15, -15, 25, -15, -15]
 
-    xMax = [700, 700, 60, 700, 700, 60]
-    yMax = [55, 20, 20, 55, 20, 20]
+    xMax = [600, 600, 50, 600, 600, 50]
+    yMax = [50, 15, 15, 50, 15, 20]
 
     """xMin = [380, 380, 24, 380, 380, 24]
     yMin = [24, -14, -14, 24, -14, -14]
@@ -1145,7 +1446,7 @@ def main():
     yMax = [52, 14, 14, 52, 14, 14]"""
 
     cbarMin = 0
-    cbarMax = 50
+    cbarMax = 40
 
     for i in range(6):
         if i < 3:

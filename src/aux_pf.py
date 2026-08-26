@@ -22,6 +22,10 @@ import colorcet as cc
 import pytest
 from cme_par_dict_structure import required_dict_keys
 
+import warnings
+warnings.filterwarnings(
+    "ignore", message="invalid value encountered in divide"
+)
 
 class AuxPF:
     """
@@ -33,7 +37,9 @@ class AuxPF:
             cme_par_dict: CmeParEns,
             obs: list[float] | float,
             obs_cov: list[float] | float,
+            obs_radius: Quantity[u.AU] | list[Quantity[u.AU]],
             obs_lon: Quantity[u.deg] | list[Quantity[u.deg]],
+            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]],
             obs_time: datetime.datetime,
             true_cme_par_dict: CmeParEns = None,
             infl_fact: float = 1,
@@ -59,7 +65,9 @@ class AuxPF:
 
         self.obs = obs
         self.obs_cov = obs_cov
+        self.obs_radius = obs_radius
         self.obs_lon = obs_lon
+        self.obs_lat = obs_lat
         self.obs_time = obs_time
         self.true_cme_par_dict: CmeParEns = true_cme_par_dict
         self.infl_fact = infl_fact
@@ -297,7 +305,9 @@ class AuxPF:
         obs_op_class = ObservationOperator(
             use_model=self.use_model,
             cme_par_dict=state_dict_in,
+            obs_radius=self.obs_radius,
             obs_lon=self.obs_lon,
+            obs_lat=self.obs_lat,
             obs_time_in_datetime=self.obs_time,
             obs_cov=self.obs_cov,
             surf_init_time=self.surf_init_time,
@@ -465,8 +475,8 @@ class AuxPF:
             self.log_weights = [-np.log(self.n_members) for _ in range(self.n_members)]
 
         ess_prior2 = self.calc_ess_log_weights(self.log_weights)
-        print(f"ess_prior: {ess_prior}")
-        print(f"ess_prior2 = {ess_prior2}")
+        #print(f"ess_prior: {ess_prior}")
+        #print(f"ess_prior2 = {ess_prior2}")
 
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         #print(f"self.state_vector_shrunk_dict = {self.state_vector_shrunk_dict}")
@@ -491,11 +501,11 @@ class AuxPF:
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob_log_weights(log_likelihood_shrunk_ens)
-        print(f"log_aux_prob1 = {log_aux_prob}")
+        #print(f"log_aux_prob1 = {log_aux_prob}")
         log_aux_prob = [
             x if ~np.isnan(x) else -1e31 for x in log_aux_prob
         ]
-        print(f"log_aux_prob2 = {log_aux_prob}")
+        #print(f"log_aux_prob2 = {log_aux_prob}")
 
         # Get indices to resample
         resample_class = ResampleParsLogWeights(
@@ -550,7 +560,7 @@ class AuxPF:
 
         # Calculate the effective sample size from the posterior weights
         ess_post = self.calc_ess_lin_weights(weights_post)
-        print(f"ess_post = {ess_post}")
+        #print(f"ess_post = {ess_post}")
         ess_post_log = self.calc_ess_log_weights(log_weights_post)
         print(f"ess_post_log = {ess_post_log}")
 
