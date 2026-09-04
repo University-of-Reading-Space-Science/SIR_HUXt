@@ -26,7 +26,7 @@ import weightedstats as wst
 
 from colorcet.plotting import sine_combs
 from sunpy.coordinates.sun import orientation
-
+from multiprocessing import Pool
 
 #hv.extension('matplotlib')
 
@@ -648,6 +648,8 @@ def get_cme_arrival_time(
     prior_stat_dict = {}
     post_stat_dict = {}
 
+    #nProc = int(os.cpu_count() - 1)
+    #pool = Pool(processes=nProc)
     for i in range(n_members):
         if np.mod(i, 50) == 0:
             print(f"{i}/{n_members}")
@@ -880,6 +882,7 @@ def get_cme_arrival_time(
         #ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
         #ax[2].set_ylim([0, 1])
         ax[-1].set_xlabel("Arrival time error (hours)", fontsize=20)
+
         if base_file_path is None:
             plt.show()
         else:
@@ -930,7 +933,7 @@ def get_cme_arrival_time(
 
 def plot_par_histograms_over_mult_runs(
     ds, ax, xVarName, yVarName, xTruth, yTruth, xLabel, yLabel,
-        plotPrior=False, cmap=cc.m_gouldian,
+        plotPrior=False, cmap=cc.m_gouldian, grid_size=10,
         xMin=np.nan, xMax=np.nan, yMin=np.nan, yMax=np.nan, cbarMin=np.nan, cbarMax=np.nan
 ):
     ax.set_facecolor(cmap(0))
@@ -943,19 +946,43 @@ def plot_par_histograms_over_mult_runs(
         yValues = ds[yVarName][:, -1, :].values
 
     # Add constraints on colorbar if provided
+    axMinMaxCond = np.isnan(xMin) or np.isnan(xMax) or np.isnan(yMin) or np.isnan(yMax)
     if np.isnan(cbarMin + cbarMax):
-        im = ax.hexbin(xValues, yValues, gridsize=10, cmap=cmap)
+        if axMinMaxCond:
+            im = ax.hexbin(
+                xValues, yValues,
+                gridsize=grid_size,
+                cmap=cmap
+            )
+        else:
+            im = ax.hexbin(
+                xValues, yValues,
+                gridsize=grid_size, extent=(xMin, xMax, yMin, yMax),
+                cmap=cmap
+            )
     else:
-        im = ax.hexbin(xValues, yValues, gridsize=10, cmap=cmap, vmin=cbarMin, vmax=cbarMax)
+        if axMinMaxCond:
+            im = ax.hexbin(
+                xValues, yValues,
+                gridsize=grid_size,
+                cmap=cmap, vmin=cbarMin, vmax=cbarMax
+            )
+        else:
+            im = ax.hexbin(
+                xValues, yValues,
+                gridsize=grid_size, extent=(xMin, xMax, yMin, yMax),
+                cmap=cmap, vmin=cbarMin, vmax=cbarMax
+            )
 
-    ax.plot(
-        [xMin, xMax], [yTruth, yTruth],
-        color='r', linestyle='dashed', label=f"True {yVarName}"
-    )
-    ax.plot(
-        [xTruth, xTruth], [yMin, yMax],
-        color='r', linestyle='dashed', label=f"True {yVarName}"
-    )
+    if not axMinMaxCond:
+        ax.plot(
+            [xMin, xMax], [yTruth, yTruth],
+            color='r', linestyle='dashed', label=f"True {yVarName}"
+        )
+        ax.plot(
+            [xTruth, xTruth], [yMin, yMax],
+            color='r', linestyle='dashed', label=f"True {yVarName}"
+        )
     plt.colorbar(im, label='count', ax=ax, orientation='vertical')
 
     # Set limits if provided
@@ -1042,7 +1069,7 @@ def plot_sample_cov(
 
 
 def main():
-    nRuns = 25
+    nRuns = 100
     start_run = 0
     vTruth = 495
     widthTruth = 37.4
@@ -1279,7 +1306,7 @@ def main():
         #C:\Users\ss905122\PycharmProjects\SIR_HUXt\output\compress_huxt\WSA_v\ens_50\uncorr\model_COMPRESS_SURF
         baseFilePath = os.path.join(
             "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
-            "compress_huxt", "test", "WSA_v", f"ens_{n_ens}", "uncorr", f"model_{use_model.upper()}",
+            "compress_huxt", "parallel", "WSA_v", f"ens_{n_ens}", "uncorr", f"model_{use_model.upper()}",
             truth_dir, prior_dir, "0.98",
         )
         """baseFilePath = os.path.join(
@@ -1318,17 +1345,30 @@ def main():
                 true_cme_thick=true_cme_thick,
                 cme_hit_object="EARTH"
             )
+        print(f"real_arrival_time = {real_arrival_time}")
+        print(f"real_arrival_speed = {real_arrival_speed}")
+        sys.exit()
 
+        nProc = int(os.cpu_count() - 1)
+        if nProc < 1:
+            nProc = 1
+        pool = Pool(processes=nProc)
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-            get_cme_arrival_time(
-                ds=ds,
-                runNo=runNo,
-                use_model=use_model,
-                n_ens=n_ens,
-                real_arrival_time=real_arrival_time,
-                cme_hit_object="EARTH",
-                base_file_path=baseFilePath
+            pool.apply_async(
+                get_cme_arrival_time,
+                kwds={
+                    'ds': ds,
+                    'runNo': runNo,
+                    'use_model': use_model,
+                    'n_ens': n_ens,
+                    'real_arrival_time':real_arrival_time,
+                    'cme_hit_object': "EARTH",
+                    'base_file_path': baseFilePath,
+                },
             )
+        pool.close()
+        pool.join()
+
 
         n_obs = len(ds["obs_no"][:])
         # for i in range(n_obs):
@@ -1338,7 +1378,7 @@ def main():
         # # plot_sample_cov(
         #     ds, "all", -1, vars_req=["v", "lon", "width"]
         # )
-    """
+
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             if event == "twin":
                 fig_title = f"Twin experiment, Run no. = {runNo}"
@@ -1392,7 +1432,7 @@ def main():
                 base_file_path=baseFilePath,
                 craft=craft,
             )
-    """
+
     colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
     plot_par_values_over_mult_runs(
         ds,
@@ -1436,9 +1476,10 @@ def main():
     xMin = [400, 400, 25, 400, 400, 25]
     yMin = [25, -15, -15, 25, -15, -15]
 
-    xMax = [600, 600, 50, 600, 600, 50]
+    xMax = [650, 650, 50, 650, 650, 50]
     yMax = [50, 15, 15, 50, 15, 20]
 
+    grid_size = 15
     """xMin = [380, 380, 24, 380, 380, 24]
     yMin = [24, -14, -14, 24, -14, -14]
 
@@ -1446,20 +1487,20 @@ def main():
     yMax = [52, 14, 14, 52, 14, 14]"""
 
     cbarMin = 0
-    cbarMax = 40
+    cbarMax = 200
 
     for i in range(6):
         if i < 3:
             plot_par_histograms_over_mult_runs(
                 ds, axes[i], xNames[i], yNames[i],
-                xTruth[i], yTruth[i], xLab[i], yLab[i],
+                xTruth[i], yTruth[i], xLab[i], yLab[i], grid_size=grid_size,
                 plotPrior=True, cmap=cc.m_gouldian, cbarMin=cbarMin, cbarMax=cbarMax,
                 xMin=xMin[i], xMax=xMax[i], yMin=yMin[i], yMax=yMax[i]
             )
         else:
             plot_par_histograms_over_mult_runs(
                 ds, axes[i], xNames[i], yNames[i],
-                xTruth[i], yTruth[i], xLab[i], yLab[i],
+                xTruth[i], yTruth[i], xLab[i], yLab[i], grid_size=grid_size,
                 plotPrior=False, cmap=cc.m_gouldian, cbarMin=cbarMin, cbarMax=cbarMax,
                 xMin=xMin[i], xMax=xMax[i], yMin=yMin[i], yMax=yMax[i]
             )

@@ -28,6 +28,8 @@ from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 
+from da_surf_setup import Setup
+
 from multiprocessing import Pool
 
 env_path = Path('.', '.env')
@@ -45,537 +47,12 @@ def print_environment_variables():
     return None
 
 
-def allowed_cov_types():
-    return {"uncorr", "donki", "mo_cone"}
-
-
-def get_mas_wsa_const():
-    mas_wsa_const = "const"
-    
-    return mas_wsa_const
-
-
-def get_use_synthetic_obs():
-    use_synthetic_obs = True
-
-    return use_synthetic_obs
-
-
-def get_ssw_event_craft():
-    ssw_event = "ssw_012"
-    craft = "stb"
-    img = "diff"
-
-    return ssw_event, craft, img
-
-
-def get_surf_init_time():
-
-    ssw_event, _, _ = get_ssw_event_craft()
-    if get_use_synthetic_obs():
-        surf_init_time: datetime.datetime = datetime.datetime(2012, 1, 1, 0, 0)
-    else:
-        if ssw_event == "ssw_007":
-            surf_init_time: datetime.datetime = datetime.datetime(2012, 8, 31, 0, 0, 0)
-
-        elif ssw_event == "ssw_008":
-            surf_init_time: datetime.datetime = datetime.datetime(2012, 9, 27, 15, 0, 0)
-
-        elif ssw_event == "ssw_009":
-            surf_init_time: datetime.datetime = datetime.datetime(2012, 10, 4, 20, 0, 0)
-
-        elif ssw_event == "ssw_012":
-            surf_init_time: datetime.datetime = datetime.datetime(2012, 11, 20, 0, 0, 0)
-
-        else:
-            sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
-
-    return surf_init_time
-
-
-def get_use_model():
-    """
-    Function to get model we require to use
-    :return: use_model: String containing either "surf", "surf_compress", "huxt"
-    """
-
-    poss_models = ["surf", "compress_surf", "huxt"]
-    use_model = "compress_surf"
-
-    assert use_model.lower() in poss_models
-
-    return use_model.lower()
-
-
-def initialise_surf_parameters():
-    """
-    Function to initialise the SURF parameters for simulation
-    :return:
-    """
-    mas_or_wsa = get_mas_wsa_const()
-
-    surf_init_time = get_surf_init_time()
-    use_model = get_use_model().lower()
-
-    surf_init_time_astro = Time(surf_init_time, format="datetime")
-    ert = S.Observer("EARTH", surf_init_time_astro)
-    earth_lat = ert.lat.to(u.deg)
-    earth_lon = ert.lat.to(u.deg)
-
-    lon_start: Quantity[u.deg] = -70 * u.deg
-    lon_stop: Quantity[u.deg] = 70 * u.deg
-    sim_time: Quantity[u.day] = 3 * u.day
-    dt_scale: int = 1
-    cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
-    r_min: Quantity[u.solRad] = 21.5 * u.solRad
-    cme_fixed_duration: bool = True
-    fixed_duration: Quantity[u.s] = 12 * 3600 * u.s
-
-
-    if mas_or_wsa.upper() == "MAS":
-        cr_num: int = np.trunc(sn.carrington_rotation_number(surf_init_time))
-
-        if use_model in ["surf", "compress_surf"]:
-            vr_in = Sin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
-        elif use_model in ["huxt"]:
-            vr_in = Hin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
-        else:
-            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
-
-    elif mas_or_wsa.upper() == "WSA":
-        wsa_dir = os.getenv('WSA_DIR')
-        readWSAClass = ReadWSAFiles(surf_init_time, output_dir=wsa_dir)
-        output_path = readWSAClass.download_file()
-
-        # Get input speeds for all longitudes for input into surf
-        # Decelerate the WSA map from 1-AU calibrated speeds to expected 21.5 rS values
-        # Load in map and Earth lon cut, decaccelerate both from 215 to 21.5.
-        surf_init_time_astro = Time(surf_init_time, format="datetime")
-        ert = S.Observer("EARTH", surf_init_time_astro)
-        earth_lat = ert.lat.to(u.deg)
-
-        # Can't use hin.map_vmap_inwards as that shifts the longitudes and interpolates, which we do not want for
-        # WSA
-        if use_model in ["surf", "compress_surf"]:
-            vr_in = Sin.get_WSA_long_profile(output_path, lat=earth_lat)
-            n_lon = len(vr_in)
-            v_lon_grid_step = 2 * np.pi / n_lon
-            v_lons = np.array([
-                i * v_lon_grid_step for i in range(n_lon)
-            ]) * u.rad
-
-            vr_in, lon_temp = Sin.map_v_inwards(vr_in, 215 * u.solRad, v_lons, r_min)
-        elif use_model in ["huxt"]:
-            vr_in = Hin.get_WSA_long_profile(output_path, lat=earth_lat)
-            n_lon = len(vr_in)
-            v_lon_grid_step = 2 * np.pi / n_lon
-            v_lons = np.array([
-                i * v_lon_grid_step for i in range(n_lon)
-            ]) * u.rad
-
-            vr_in, lon_temp = Hin.map_v_inwards(vr_in, 215 * u.solRad, v_lons, r_min)
-        else:
-            sys.exit("Unknown model name, expected either 'surf', 'compress_surf' or 'huxt'")
-
-
-    elif mas_or_wsa.upper() == "CONST":
-        vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
-    else:
-        print("Defaulting to constant ambient solar wind of 400 km/s")
-        vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.zeros(128) + 400 * u.km / u.s
-
-    out_surf_par = {
-        "use_model": use_model,
-        "surf_init_time": surf_init_time,
-        "vr_in": vr_in,
-        "lon_start": lon_start,
-        "lon_stop": lon_stop,
-        "sim_time": sim_time,
-        "dt_scale": dt_scale,
-        "r_min": r_min,
-        "cme_init_rad": cme_init_rad,
-        "cme_fixed_duration": cme_fixed_duration,
-        "fixed_duration": fixed_duration,
-    }
-
-    return out_surf_par
-
-
-def initialise_true_cme_par_dict():
-    surf_init_time = get_surf_init_time()
-    true_cme_par_dict = initialise_cme_parameter_ensemble_dict(
-        1, surf_init_time
-    )
-
-    # Initialise true CME parameters
-    true_cme_t_init: datetime.datetime = surf_init_time + datetime.timedelta(hours=1)
-    true_cme_speed: float = 495
-    true_cme_width: float = 37.4
-    true_cme_lon: float = 0
-    true_cme_lat: float = 0
-    true_cme_thick: float = 0
-
-    true_cme_par_dict["t_init"]: datetime.datetime = true_cme_t_init
-    true_t_init_str: str = true_cme_par_dict["t_init"].strftime("%Y%m%d-%H%M")
-
-    true_cme_par_dict["v"]: Quantity[u.km / u.s] = true_cme_speed * u.km / u.s
-    true_cme_par_dict["width"]: Quantity[u.deg] = true_cme_width * u.deg
-    true_cme_par_dict["lon"]: Quantity[u.deg] = true_cme_lon * u.deg
-    true_cme_par_dict["lat"]: Quantity[u.deg] = true_cme_lat * u.deg
-    true_cme_par_dict["thick"]: Quantity[u.solRad] = true_cme_thick * u.solRad
-
-    return true_cme_par_dict
-
-
-def initialise_fg_cme_parameters():
-    # Initialise CME parameters
-    ssw_event, _, _ = get_ssw_event_craft()
-    donki_cme = True
-
-    if get_use_synthetic_obs():
-        surf_init_time = get_surf_init_time()
-        cme_at_12rs: datetime.datetime = (
-                surf_init_time + datetime.timedelta(hours=1)
-        )
-        surf_init_time_astro = Time(surf_init_time, format="datetime")
-        ert = S.Observer("EARTH", surf_init_time_astro)
-        earth_lat = ert.lat.to(u.deg)
-        earth_lon = ert.lon.to(u.deg)
-
-        fg_cme_speed: float = 495
-        fg_cme_width: float = 37.4
-        fg_cme_lon: float = earth_lon.value
-        fg_cme_lat: float = earth_lat.value
-        fg_cme_thick: float = 0
-    else:
-        if donki_cme:
-            if ssw_event == "ssw_007":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 8, 31, 22, 43, 0)
-                print(f"CR = {sn.carrington_rotation_number(cme_at_21rs)}")
-                fg_cme_speed: float = 1498
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                    cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 150
-                fg_cme_lon: float = -63
-                fg_cme_lat: float = -15
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_008":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 9, 28, 1, 56, 0)
-
-                fg_cme_speed: float = 1160
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 170
-                fg_cme_lon: float = 30
-                fg_cme_lat: float = 5
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_009":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 10, 5, 9, 15, 0)
-
-                fg_cme_speed: float = 650
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 94
-                fg_cme_lon: float = 10
-                fg_cme_lat: float = -28
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_012":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 11, 20, 17, 32, 0)
-
-                fg_cme_speed: float = 725
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 60
-                fg_cme_lon: float = 90
-                fg_cme_lat: float = 5
-                fg_cme_thick: float = 0
-
-            else:
-                sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
-        else:
-            if ssw_event == "ssw_007":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 8, 31, 22, 46, 0)
-                print(f"CR = {sn.carrington_rotation_number(cme_at_21rs)}")
-                fg_cme_speed: float = 1010
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 66
-                fg_cme_lon: float = -30
-                fg_cme_lat: float = 0
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_008":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 9, 28, 3, 49, 0)
-
-                fg_cme_speed: float = 872
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 110
-                fg_cme_lon: float = 20
-                fg_cme_lat: float = 4
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_009":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 10, 5, 8, 47, 0)
-
-                fg_cme_speed: float = 698
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 84
-                fg_cme_lon: float = 9
-                fg_cme_lat: float = -24
-                fg_cme_thick: float = 0
-
-            elif ssw_event == "ssw_012":
-                cme_at_21rs: datetime.datetime = datetime.datetime(2012, 11, 20, 17, 40, 0)
-
-                fg_cme_speed: float = 664
-
-                dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                cme_at_12rs: datetime.datetime = (
-                        cme_at_21rs - datetime.timedelta(seconds=time_from_12_to_21rs)
-                )
-
-                fg_cme_width: float = 94
-                fg_cme_lon: float = 22
-                fg_cme_lat: float = 20
-                fg_cme_thick: float = 0
-
-            else:
-                sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
-
-    # Time taken to get from cme_init_rad to r_min
-    surf_dict = initialise_surf_parameters()
-    surf_cme_ir: Quantity[u.solRad] = surf_dict["cme_init_rad"]
-    surf_r_min: Quantity[u.solRad] = surf_dict["r_min"]
-
-    dist_in_km: Quantity[u.km] = (surf_r_min - surf_cme_ir).to(u.km)
-    seconds_to_r_min: float = dist_in_km.to(u.km).value / fg_cme_speed
-
-    fg_cme_t_init: datetime.datetime = (
-        cme_at_12rs + datetime.timedelta(seconds=seconds_to_r_min)
-    )
-
-    if get_use_synthetic_obs():
-        sd_cme_t_init: float = 0  # In seconds
-        sd_cme_speed: float = 50  # In km/s
-        sd_cme_width: float = 5  # In deg
-        sd_cme_lon: float = 5  # In deg
-        sd_cme_lat: float = 0 # In deg
-        sd_cme_thick: float = 0  # In solRad
-    else:
-        sd_cme_t_init: float = 3600  # In seconds
-        sd_cme_speed: float = 50  # In km/s
-        sd_cme_width: float = 5  # In deg
-        sd_cme_lon: float = 5  # In deg
-        sd_cme_lat: float = 5  # In deg
-        sd_cme_thick: float = 0  # In solRad
-
-    fg_cme_par_dict = {
-        "fg_cme_t_init": fg_cme_t_init,
-        "fg_cme_speed": fg_cme_speed,
-        "fg_cme_width": fg_cme_width,
-        "fg_cme_lon": fg_cme_lon,
-        "fg_cme_lat": fg_cme_lat,
-        "fg_cme_thick": fg_cme_thick,
-        "sd_cme_t_init": sd_cme_t_init,
-        "sd_cme_speed": sd_cme_speed,
-        "sd_cme_width": sd_cme_width,
-        "sd_cme_lon": sd_cme_lon,
-        "sd_cme_lat": sd_cme_lat,
-        "sd_cme_thick": sd_cme_thick
-    }
-
-    return fg_cme_par_dict
-
-
-def initialise_prior_cme_cov():
-    if get_use_synthetic_obs():
-        cme_cov_type = "uncorr"
-    else:
-        cme_cov_type = "mo_cone"
-
-    """# Initialise how to build the prior CME covariance matrix
-    if cme_cov_type is None:
-        cme_cov_type = "uncorr"
-    
-    try:
-        assert cme_cov_type.lower() in allowed_cov_types()
-    except AssertionError:
-        print("Defaulting to uncorrelated covariance matrix")
-        cme_cov_type = "uncorr"
-    else:
-        cme_cov_type = cme_cov_type.lower()"""
-
-    # Scale correlation matrix to make covariance matrix
-    scale_corr = True
-    use_log_v = True
-
-    if get_use_synthetic_obs():
-        # Initialise CME parameters for uniform distribution
-        sd_t_init: float = 0  # In seconds
-
-        if use_log_v:
-            sd_speed: float = 0.1  # Multiplicative variance
-        else:
-            sd_speed: float = 50  # In km/s
-        sd_width: float = 5  # In deg
-        sd_lon: float = 5  # In deg
-        sd_lat: float = 0  # In deg
-        sd_thick: float = 0  # In solRad
-    else:
-        # Initialise CME parameters for uniform distribution
-        sd_t_init: float = 3600  # In seconds
-
-        if use_log_v:
-            sd_speed: float = 0.1 # Multiplicative variance
-        else:
-            sd_speed: float = 50 # In km/s
-        sd_width: float = 5  # In deg
-        sd_lon: float = 5  # In deg
-        sd_lat: float = 5  # In deg
-        sd_thick: float = 0  # In solRad
-
-    prior_cme_cov_dict = {
-        "cme_cov_type": cme_cov_type,
-        "scale_corr": scale_corr,
-        "use_log_v": use_log_v,
-        "sd_t_init": sd_t_init,
-        "sd_speed": sd_speed,
-        "sd_width": sd_width,
-        "sd_lon": sd_lon,
-        "sd_lat": sd_lat,
-        "sd_thick": sd_thick
-    }
-
-    return prior_cme_cov_dict
-    
-    
-def initialise_observation_parameters():
-    n_obs: int = 3
-    obs_cadence_hr = 8 # Observations cadence in hours
-    true_cme_dict = initialise_true_cme_par_dict()
-    true_cme_t_init: datetime.datetime = true_cme_dict["t_init"]
-
-    surf_init_time = get_surf_init_time()
-    obs_radius: Quantity[u.AU] = 1.0 * u.AU
-    obs_lon: Quantity[u.deg] = 300 * u.deg
-    obs_lat: Quantity[u.deg] = 0 * u.deg
-
-    obs_cov: list[float] = [0.5]  # * np.eye(len(obs))
-
-    obs_times: list[datetime.datetime] = [
-        true_cme_t_init + datetime.timedelta(hours=10 + (obs_cadence_hr * i))
-        for i in range(1, 1 + n_obs)
-    ]
-
-    use_synthetic_obs: bool = get_use_synthetic_obs()
-    obs_rng_seed: int = 4096
-    obs_filenames: list[str] = [
-        os.path.join(
-            str(os.getenv("OBS_DIR")), "SSW_cme_classifications.hdf5"
-        )
-    ]
-
-    ssw_event, craft, img = get_ssw_event_craft()
-    if use_synthetic_obs:
-        bias_term_bool = False #True
-    else:
-        bias_term_bool = True
-
-    bias_term_5 = 2.5
-    bias_term_21 = 2.5
-
-    bias_term_5 = 2.5
-    bias_term_21 = 2.5
-
-    obs_par_dict = {
-        "n_obs": n_obs,
-        "obs_radius": obs_radius,
-        "obs_lon": obs_lon,
-        "obs_lat": obs_lat,
-        "obs_cov": obs_cov,
-        "obs_times": obs_times,
-        "use_synthetic_obs": use_synthetic_obs,
-        "obs_filenames": obs_filenames,
-        "obs_rng_seed": obs_rng_seed,
-        "ssw_event": ssw_event,
-        "craft": craft,
-        "img": img,
-        "bias_term_bool": bias_term_bool,
-        "bias_term_5rs": bias_term_5,
-        "bias_term_21rs": bias_term_21,
-    }
-
-    return obs_par_dict
-
-
-def initialise_da_parameters():
-    n_members: int = 50
-    n_runs: int = 25
-
-    delta_aux_pf: float = 0.98
-    if get_use_synthetic_obs():
-        pars_in_state_vector: list[str] = ["v", "width", "lon"]
-    else:
-        pars_in_state_vector: list[str] = ["t_init", "v", "width", "lon", "lat"]
-    time_tolerance: Quantity[u.day] = 0.5 * u.day
-
-    da_par_dict = {
-        "n_members": n_members,
-        "n_runs": n_runs,
-        "delta_aux_pf": delta_aux_pf,
-        "pars_in_state": pars_in_state_vector,
-        "time_tolerance": time_tolerance
-    }
-
-    return da_par_dict
-
-
 class RunDataAssimilationRoutine:
     def __init__(self):
+        self.setup_class = Setup()
 
         # Get SURF parameters
-        surf_par_dict = initialise_surf_parameters()
+        surf_par_dict = self.setup_class.surf_par_dict
         self.use_model: str = surf_par_dict["use_model"]
         self.surf_init_time: datetime.datetime = surf_par_dict["surf_init_time"]
         self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = surf_par_dict["vr_in"]
@@ -590,7 +67,7 @@ class RunDataAssimilationRoutine:
         self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
 
         # Initialise observation variables
-        obs_par_dict = initialise_observation_parameters()
+        obs_par_dict = self.setup_class.obs_par_dict
         self.n_obs: int = obs_par_dict["n_obs"]
         self.obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] = obs_par_dict["obs_radius"]
         self.obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] = obs_par_dict["obs_lon"]
@@ -606,6 +83,7 @@ class RunDataAssimilationRoutine:
         self.bias_term_bool: bool = obs_par_dict["bias_term_bool"]
         self.bias_term_5rs: float = obs_par_dict["bias_term_5rs"]
         self.bias_term_21rs: float = obs_par_dict["bias_term_21rs"]
+        self.use_parallel: bool = obs_par_dict["use_parallel"]
 
         # Ensure all bias terms exist, if not, set bias_term_bool to False
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
@@ -618,7 +96,7 @@ class RunDataAssimilationRoutine:
             self.bias_term_bool = False
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
-        self.true_cme_par_dict: CmeParEns = initialise_true_cme_par_dict()
+        self.true_cme_par_dict: CmeParEns = self.setup_class.true_cme_par_dict
 
         if self.use_synthetic_obs:
             # Generate observations
@@ -643,8 +121,8 @@ class RunDataAssimilationRoutine:
             self.n_obs: int = obs_tuple[3]
 
 
-        # Generate prior cme_parameters
-        fg_cme_par_dict = initialise_fg_cme_parameters()
+        # Generate first-guess cme_parameters (which OSSE draws priors around)
+        fg_cme_par_dict = self.setup_class.fg_cme_par_dict
         self.fg_mean_cme_t_init: datetime.datetime = fg_cme_par_dict["fg_cme_t_init"]
         self.fg_mean_cme_speed: float = fg_cme_par_dict["fg_cme_speed"]
         self.fg_mean_cme_width: float = fg_cme_par_dict["fg_cme_width"]
@@ -659,8 +137,9 @@ class RunDataAssimilationRoutine:
         self.fg_sd_cme_lat: float = fg_cme_par_dict["sd_cme_lat"]
         self.fg_sd_cme_thick: float = fg_cme_par_dict["sd_cme_thick"]
 
-        # Get prior CME standard deviations
-        prior_cme_par_dict = initialise_prior_cme_cov()
+        # Get prior CME parameters
+        #  (in case of OSSE, may be perturbed from the first-guess parameters)
+        prior_cme_par_dict = self.setup_class.prior_cme_cov
         self.cme_cov_type: str = prior_cme_par_dict["cme_cov_type"]
         self.scale_corr: bool = prior_cme_par_dict["scale_corr"]
         self.use_log_v: bool = prior_cme_par_dict["use_log_v"]
@@ -672,9 +151,9 @@ class RunDataAssimilationRoutine:
         self.prior_sd_thick: float = prior_cme_par_dict["sd_thick"]
 
         # Get DA parameters
-        da_par_dict = initialise_da_parameters()
+        da_par_dict = self.setup_class.da_par_dict #initialise_da_parameters()
         self.n_members: int = da_par_dict["n_members"]
-        self.n_runs: int = 1 #da_par_dict["n_runs"]
+        self.n_runs: int = da_par_dict["n_runs"]
         self.delta_aux_pf: float = da_par_dict["delta_aux_pf"]
         self.pars_in_state: list[str] = da_par_dict["pars_in_state"]
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
@@ -789,6 +268,7 @@ class RunDataAssimilationRoutine:
             ssw_event=self.ssw_event,
             craft=self.craft,
             img=self.img,
+            use_parallel=self.use_parallel,
         )
 
         # Get observations and update obs_times, n_obs and obs_lon if necessary
@@ -809,7 +289,7 @@ class RunDataAssimilationRoutine:
 
     def initialise_mean_cme_pars(self, rng):
         #######################################################################
-        if get_use_synthetic_obs():
+        if self.setup_class.get_use_synthetic_obs():
             # Initialise CME parameters
             mean_cme_t_init = self.fg_mean_cme_t_init
             mean_cme_speed = self.fg_mean_cme_speed + (
@@ -890,17 +370,7 @@ class RunDataAssimilationRoutine:
                 sd_lat=self.prior_sd_lat,
                 sd_thick=self.prior_sd_thick,
             )
-            # samples = mp_cov.make_uncorrelated_samples(
-            #     n_ens=self.n_members,
-            #     mean_cme_pars=mean_cme_par_array,
-            #     rng=rng,
-            #     sd_t_init=self.prior_sd_t_init,
-            #     sd_v=self.prior_sd_speed,
-            #     sd_width=self.prior_sd_width,
-            #     sd_lon=self.prior_sd_lon,
-            #     sd_lat=self.prior_sd_lat,
-            #     sd_thick=self.prior_sd_thick,
-            # )
+
 
         elif self.cme_cov_type == "donki":
             start_time_donki = datetime.datetime(2017, 1, 1, 0, 0, 0)
@@ -987,7 +457,12 @@ class RunDataAssimilationRoutine:
         else:
             step = 1
 
-        for run_no in range(run_start, run_start + self.n_runs, step):
+        if self.use_parallel:
+            n_runs_req = self.n_runs
+        else:
+            n_runs_req = self.n_runs
+
+        for run_no in range(run_start, run_start + n_runs_req, step):
             print(f"run_no = {run_no}")
             if run_no < 0:
                 self.fg_sd_cme_t_init: float = 0
@@ -1032,11 +507,10 @@ class RunDataAssimilationRoutine:
             output_dir = self.make_output_dir(
                 cme_par_dict=cme_par_dict, run_no=run_no
             )
-            #print(f"obs={self.observations}")
-            #print(f"Input bias_term_bool = {self.bias_term_bool}")
+
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
-                #print(f"obs = {obs}, obs_lon = {self.obs_lon[yi]}, obs_time = {self.obs_times[yi]}")
+
                 aux_pf_class = AuxPF(
                     use_model=self.use_model,
                     cme_par_dict=cme_par_dict,
@@ -1062,6 +536,7 @@ class RunDataAssimilationRoutine:
                     bias_term_bool=self.bias_term_bool,
                     bias_term_5rs=self.bias_term_5rs,
                     bias_term_21rs=self.bias_term_21rs,
+                    use_parallel=self.use_parallel,
                     rng=rng
                 )
 
@@ -1074,7 +549,6 @@ class RunDataAssimilationRoutine:
                     ).total_seconds()
                     for i in range(self.n_members)
                 ]
-                # print(cme_par_dict['width'])
                 cme_saved_pars[yi + 1, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
                 cme_saved_pars[yi + 1, :, 2] = cme_par_dict["width"].to(u.deg).value
 
@@ -1087,9 +561,6 @@ class RunDataAssimilationRoutine:
                 cme_saved_pars[yi + 1, :, 4] = cme_par_dict["lat"].to(u.deg).value
                 cme_saved_pars[yi + 1, :, 5] = cme_par_dict["thick"].to(u.solRad).value
                 cme_saved_pars[yi + 1, :, 6] = cme_par_dict["log_weight"]
-
-                # for par_ind in [1, 2, 3]:
-                #     print(f"cme_saved_pars[{yi + 1}] = {cme_saved_pars[yi + 1, :, par_ind]}")
 
             for par_ind in range(7):
                 if par_ind == 6:
@@ -1127,20 +598,13 @@ class RunDataAssimilationRoutine:
 
 def main():
     print_environment_variables()
+    setup_class = Setup()
     run_da_class = RunDataAssimilationRoutine()
 
-    run_start = 0
-    da_par_dict = initialise_da_parameters()
-    n_runs = da_par_dict["n_runs"]
-    pool_size = os.cpu_count() - 1
+    run_start = 75
 
-
-    if get_use_synthetic_obs():
-        with Pool(pool_size) as pool:
-            pool.map(
-                run_da_class.run_data_assimilation,
-                range(run_start, run_start + n_runs)
-            )
+    if setup_class.get_use_synthetic_obs():
+        run_da_class.run_data_assimilation(run_start=run_start)
     else:
         run_da_class.run_data_assimilation(run_start=-1)
 

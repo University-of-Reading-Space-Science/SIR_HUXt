@@ -102,7 +102,6 @@ def uncorrelated_cov_mat(
         uncorr_cov_mat,
         np.identity(6),
         "Uncorrelated covariance matrix",
-        #vars_req=["t_init", "v", "width", "lon", "lat", "thick"],
     )
     return uncorr_cov_mat
 
@@ -280,7 +279,6 @@ def make_cov_blair(
     blair_corr.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
     blair_corr.loc["t_init", "t_init"] = 1.0
     blair_corr.loc["thick", "thick"] = 1.0
-    #print(f"blair_corr={blair_corr}")
 
     ####################################################
     # Transform to an array for output
@@ -462,7 +460,6 @@ def make_donki_cov(
         dfCMEpar.loc[i, "width"] = 2 * donki_cone_cme_dict[i]["rmajor"]
         dfCMEpar.loc[i, "lon"] = donki_cone_cme_dict[i]["lon"]
         dfCMEpar.loc[i, "lat"] = donki_cone_cme_dict[i]["lat"]
-        #dfCMEpar.loc[i, "thick"] = donki_cone_cme_dict[i]["vcld"]
 
     cme_par_keys_ordered = cme_par_key_to_index().keys()
     list_req_order = [
@@ -566,9 +563,6 @@ def make_donki_cov(
             dfCMEpar, "DONKI", use_log_v=use_log_v
         )
 
-    print(f"donki_cov_out={cov_out}")
-    print(f"donki_corr_out={corr_out}")
-
     return cov_out, corr_out
 
 
@@ -637,34 +631,23 @@ def make_donki_samples(
         catalog=catalog,
         feature=feature
     )
-    """make_cov_blair(
-        blair_file_path=blair_file_path,
-        vars_req=vars_req,
-        sd_t_init=sd_t_init,
-        sd_thick=sd_thick
-    ))"""
+
     donki_cov: npt.NDArray[float] = donki_tuple[0]
     donki_corr: npt.NDArray[float] = donki_tuple[1]
-    print(f"use_log_v={use_log_v}")
+
     # Take exponential of speed values
     v_index = cme_par_get_indices("v")
 
-    print(f"mean_cme_pars = {mean_cme_pars}")
     if use_log_v:
         mean_cme_pars[v_index]: list[float] = np.log(mean_cme_pars[v_index])
-
-    print(f"mean_cme_pars2 = {mean_cme_pars}")
 
     for m in range(n_ens):
         donki_samples[:, m] = rng.multivariate_normal(
             mean=mean_cme_pars, cov=donki_cov
         )
-    print(f"donki_samples = {donki_samples}")
 
     if use_log_v:
         donki_samples[v_index, :]: npt.NDArray[float] = np.exp(donki_samples[v_index, :])
-
-    print(f"donki_samples2 = {donki_samples}")
 
     return donki_samples
 
@@ -701,7 +684,6 @@ def filter_first_mo_cone_cme(
     ]
     path_list.extend(glob_file_paths)
 
-    print(f"first_mo_cone_cme = {glob_file_paths}")
     return path_list
 
 
@@ -737,7 +719,6 @@ def filter_final_mo_cone_cme(
     ]
     path_list.extend(glob_file_paths)
 
-    print(f"end_glob = {glob_file_paths}")
     return path_list
 
 
@@ -778,7 +759,7 @@ def filter_mo_cone_cme_1month(
         gl for i, gl in enumerate(glob_lists)
         if ((glob_dates[i] >= start_time) and (glob_dates[i] <= end_time))
     ]
-    print(f"1 month: {path_list}")
+
     return path_list
 
 
@@ -867,8 +848,6 @@ def make_mo_cone_file_list(
                     ))
                     path_list.extend(glob_lists)
 
-
-    # print(path_list)
     return path_list
 
 
@@ -976,14 +955,6 @@ def make_mo_cone_cme_cov(
                 columns=["v", "width", "lon", "lat"], index=range(len_mo_dict)
             )
             for i in range(len_mo_dict):
-                # dfCMEpar.loc[i, "t_init"] = donki_cone_cme_dict[i]["vcld"]
-                """
-                if np.isnan(mo_cone_dict[i + 1]['vcld']):
-                    print(f"v[{i + 1}] = {mo_cone_dict[i + 1]['vcld']}")
-    
-                if (mo_cone_dict[i + 1]['vcld'] < 200):
-                    print(f"v[{i + 1}] = {mo_cone_dict[i + 1]['vcld']}")
-                """
                 if use_log_v:
                     dfCMEpar.loc[i, "v"] = np.log(mo_cone_dict[i + 1]["vcld"])
                 else:
@@ -992,7 +963,6 @@ def make_mo_cone_cme_cov(
                 dfCMEpar.loc[i, "width"] = 2 * mo_cone_dict[i + 1]["rmajor"]
                 dfCMEpar.loc[i, "lon"] = mo_cone_dict[i + 1]["lon"]
                 dfCMEpar.loc[i, "lat"] = mo_cone_dict[i + 1]["lat"]
-                #dfCMEpar.loc[i, "thick"] = mo_cone_dict[i + 1]["tcld"]
 
                 # Reorder the parameters so they're in the correct order
                 cme_par_keys_ordered = cme_par_key_to_index().keys()
@@ -1013,13 +983,11 @@ def make_mo_cone_cme_cov(
             r for r in cme_par_keys_ordered if r in mo_cone_cme_df.columns
         ]
         mo_cone_cme_df = mo_cone_cme_df[list_req_order]
-        # print(f"mo_cone_cme_df={mo_cone_cme_df}")
 
         ###############################################################
         # Calculate covariance matrix from mo_cone_cme_df
         ###############################################################
         mo_cone_cme_cov = mo_cone_cme_df.cov(numeric_only=False)
-        # print(f"mo_cone_cme_cov={mo_cone_cme_cov}")
 
         # Add in t_init and thick rows
         mo_cone_cme_cov = mo_cone_cme_cov.reindex(cme_par_keys_ordered, fill_value=0.0)
@@ -1027,8 +995,6 @@ def make_mo_cone_cme_cov(
         mo_cone_cme_cov.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
         mo_cone_cme_cov.loc["t_init", "t_init"] = sd_t_init * sd_t_init
         mo_cone_cme_cov.loc["thick", "thick"] = sd_thick * sd_thick
-
-        # print(f"mo_cone_cme_cov={mo_cone_cme_cov}")
 
         ################################################################
         # Calculate correlation matrix from mo_cone_df
@@ -1041,9 +1007,6 @@ def make_mo_cone_cme_cov(
         mo_cone_cme_corr.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
         mo_cone_cme_corr.loc["t_init", "t_init"] = 1.0
         mo_cone_cme_corr.loc["thick", "thick"] = 1.0
-
-        #print(f"mo_cone_cme_corr={mo_cone_cme_corr}")
-
 
         # Write the CME parameters and the covariance/correlation matrices to predefined files
         if not os.path.exists(mo_cone_cov_dir):
@@ -1067,7 +1030,6 @@ def make_mo_cone_cme_cov(
         # Calculate covariance matrix from mo_cone_cme_df
         ###############################################################
         mo_cone_cme_cov = mo_cone_cme_df.cov(numeric_only=False)
-        # print(f"mo_cone_cme_cov={mo_cone_cme_cov}")
 
         # Add in t_init and thick rows
         mo_cone_cme_cov = mo_cone_cme_cov.reindex(cme_par_keys_ordered, fill_value=0.0)
@@ -1075,8 +1037,6 @@ def make_mo_cone_cme_cov(
         mo_cone_cme_cov.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
         mo_cone_cme_cov.loc["t_init", "t_init"] = sd_t_init * sd_t_init
         mo_cone_cme_cov.loc["thick", "thick"] = sd_thick * sd_thick
-
-        # print(f"mo_cone_cme_cov={mo_cone_cme_cov}")
 
         ################################################################
         # Calculate correlation matrix from mo_cone_df
@@ -1110,7 +1070,6 @@ def make_mo_cone_cme_cov(
 
         # Make matrix with diagonal equal to the standard deviation of the parameters as required
         sd_diag = np.diag(sd_diag_elements)
-        print(sd_diag)
         mo_cone_cme_cov = sd_diag.dot(mo_cone_cme_corr).dot(sd_diag)
 
     #########################################################################
@@ -1134,23 +1093,14 @@ def make_mo_cone_cme_cov(
             # Remove all non-diagonal entries from longitudinal covariances
             lon_var = cov_out[m, m]
 
-            cov_out[m, :] = 0#np.zeros(len_cov_out)
-            cov_out[:, m] = 0#np.zeros(len_cov_out)
+            cov_out[m, :] = 0
+            cov_out[:, m] = 0
             cov_out[m, m] = lon_var
-
-            # corr_out[m, :] = 0
-            # corr_out[:, m] = 0
-            # corr_out[m, m] = 1
 
         # Remove any covariance from variables that do not need to be perturbed
         if par_key not in vars_req:
             cov_out[m, :] = 0
             cov_out[:, m] = 0
-
-            # print(f"m = {m}, corr_out={type(corr_out[m, :])}")
-            # corr_out[m, :] = 0
-            # corr_out[:, m] = 0
-            # corr_out[m, m] = 0
 
     #################################################################
     # Plot CME covariance and correlation matrices, if necessary
@@ -1238,12 +1188,7 @@ def make_mo_cone_samples(
         use_log_v=use_log_v,
         plot_cme_cov=plot_cme_cov,
     )
-    """make_cov_blair(
-        blair_file_path=blair_file_path,
-        vars_req=vars_req,
-        sd_t_init=sd_t_init,
-        sd_thick=sd_thick
-    ))"""
+
     mo_cone_cov: npt.NDArray[float] = mo_cone_tuple[0]
     mo_cone_corr: npt.NDArray[float] = mo_cone_tuple[1]
 
@@ -1261,88 +1206,6 @@ def make_mo_cone_samples(
     print(mo_cone_samples)
 
     return mo_cone_samples
-
-'''
-    """# Use routine in surf.surf_inputs to retrieve DONKI ConeCME parameters
-    donki_cone_cme_dict = surf_inputs.get_DONKI_coneCMEs(
-        startdate=start_time,
-        enddate=end_time,
-        mostAccOnly=most_acc_only,
-        catalog=catalog,
-        feature=feature
-    )"""
-
-    # Put CME parameters into a dataframe
-    len_cme_dict = len(donki_cone_cme_dict)
-    dfCMEpar = pd.DataFrame(
-        columns=["v", "width", "lon", "lat"], index=np.arange(len_cme_dict)
-    )
-    for i in range(len_cme_dict):
-        # dfCMEpar.loc[i, "t_init"] = donki_cone_cme_dict[i]["vcld"]
-        if np.isnan(donki_cone_cme_dict[i]['vcld']):
-            print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
-
-        if (donki_cone_cme_dict[i]['vcld'] < 200):
-            print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
-
-        dfCMEpar.loc[i, "v"] = np.log(donki_cone_cme_dict[i]["vcld"])
-        dfCMEpar.loc[i, "width"] = 2 * donki_cone_cme_dict[i]["rmajor"]
-        dfCMEpar.loc[i, "lon"] = donki_cone_cme_dict[i]["lon"]
-        dfCMEpar.loc[i, "lat"] = donki_cone_cme_dict[i]["lat"]
-        # dfCMEpar.loc[i, "thick"] = donki_cone_cme_dict[i]["vcld"]
-
-    cme_par_keys_ordered = cme_par_key_to_index().keys()
-    list_req_order = [
-        r for r in cme_par_keys_ordered if r in dfCMEpar.columns
-    ]
-    print(list_req_order)
-    dfCMEpar = dfCMEpar[list_req_order]
-    print(f"dfCMEpar={dfCMEpar}")
-
-    # Calculate covariance matrix from dfCMEpar
-    donki_cov = dfCMEpar.cov(numeric_only=False)
-    print(f"donki_cov={donki_cov}")
-
-    # Add in t_init and thick rows
-    donki_cov = donki_cov.reindex(cme_par_keys_ordered, fill_value=0.0)
-    donki_cov.insert(loc=cme_par_get_indices("t_init"), column="t_init", value=0.0)
-    donki_cov.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
-    donki_cov.loc["t_init", "t_init"] = sd_t_init * sd_t_init
-    donki_cov.loc["thick", "thick"] = sd_thick * sd_thick
-
-    print(f"donki_cov={donki_cov}")
-    donki_corr = dfCMEpar.corr(numeric_only=False)
-
-    # Add in t_init and thick rows
-    donki_corr = donki_corr.reindex(cme_par_keys_ordered, fill_value=0.0)
-    donki_corr.insert(loc=cme_par_get_indices("t_init"), column="t_init", value=0.0)
-    donki_corr.insert(loc=cme_par_get_indices("thick"), column="thick", value=0.0)
-    donki_corr.loc["t_init", "t_init"] = 1.0
-    donki_corr.loc["thick", "thick"] = 1.0
-    print(f"donki_corr={donki_corr}")
-
-    # Transform to an array for output
-    cov_out = donki_cov.values
-    corr_out = donki_corr.values
-    for m, par_key in enumerate(cme_par_keys_ordered):
-        # Remove any covariance from variables that do not need to be perturbed
-        if par_key not in vars_req:
-            cov_out[m, :] = 0
-            cov_out[:, m] = 0
-
-            corr_out[m, :] = 0
-            corr_out[:, m] = 0
-
-    print(f"cov_out={cov_out}")
-    print(f"corr_out={corr_out}")
-
-    plot_sample_cov(
-        cov_out,
-        corr_out,
-        "MO ConeCME",
-        vars_req=["t_init", "v", "width", "lon", "lat", "thick"],
-    )
-    return cov_out, corr_out'''
 
 
 def main(
@@ -1376,7 +1239,6 @@ def main(
             sd_t_init=sd_t_init, sd_v=sd_v, sd_width=sd_width,
             sd_lon=sd_lon, sd_lat=sd_lat, sd_thick=sd_thick
         )
-        print(f"uncorr_samp = {uncorr_samp}")
 
 
     if blair_samp:
@@ -1400,8 +1262,6 @@ def main(
             use_log_v=use_log_v,
             plot_cme_cov=plot_cme_cov,
         )
-
-        print(f"blair_samples = {blair_samples}")
 
     if donki_samp:
         start_time = datetime.datetime(2017, 1, 1, 0, 0, 0)
@@ -1431,7 +1291,6 @@ def main(
             catalog = catalog,
             feature = feature
         )
-        print(f"donki_samples = {donki_samples}")
 
     if mo_cone_samp:
         mo_start_time = datetime.datetime(2017, 1, 1, 5, 0, 0)

@@ -38,14 +38,12 @@ class ResampleParsLogWeights:
             rng: Generator = None
     ):
         self.log_weights: list[float] = log_weights
-        print(f"self.log_weights1 = {self.log_weights}")
 
         # Remove nan or infinite values from log_weights
         self.log_weights: list[float] = [
             x if (~np.isnan(x) or np.isfinite(x)) else -1e31
             for x in log_weights
         ]
-        print(f"self.log_weights2 = {self.log_weights}")
 
         if n_ensemble is None:
             self.n_ensemble: int = len(log_weights)
@@ -114,11 +112,9 @@ class ResampleParsLogWeights:
             -np.inf if x == 0 else float(np.round(np.log(x), 9))
             for x in positions
         ]
-        # (rng.random() + np.arange(self.n_ensemble)) / self.n_ensemble
 
         # Calculate CDF all weights
         cdf_val: list[float] = self.make_cdf_log_weights()
-        #print(f"pos={positions}")
         resamp_ind: list[int] = [
             bisect.bisect_left(cdf_val, x) for x in positions
         ]

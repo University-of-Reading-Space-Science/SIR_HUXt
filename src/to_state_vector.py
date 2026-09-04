@@ -27,7 +27,6 @@ class ToStateVector:
             self.pars_in_state_vector: list[str] = pars_in_state_vector
 
         self.n_ensemble: int = self.cme_par_dict["n_members"]
-        #print(self.pars_in_state_vector)
         self.n_pars: int = len(self.pars_in_state_vector)
 
         if cme_par_array is None:
@@ -52,8 +51,6 @@ class ToStateVector:
         """
         assert all(p in self.cme_par_dict.keys() for p in ["surf_init_time", "t_init", "n_members"])
 
-        print(f"cme_par_dict[t_init] = {self.cme_par_dict['t_init']}")
-        print(f"cme_par_dict[surf_init_time] = {self.cme_par_dict['surf_init_time']}")
         t_init_arr: npt.NDArray[float] = np.array([
             (self.cme_par_dict["t_init"][i] - self.cme_par_dict["surf_init_time"]).total_seconds()
             for i in range(self.n_ensemble)
@@ -159,9 +156,6 @@ class ToStateVector:
         req_keys.update(additional_keys_req)
 
         assert all(p in self.cme_par_dict.keys() for p in req_keys)
-
-        # Initialise array to hold the CME parameters
-        #cme_par_array: npt.NDArray = np.zeros((self.n_ensemble, 6))
 
         # Standardise the units and then remove the astropy units
         # The following for loop below is equivalent to writing, but allows for greater flexibility

@@ -80,6 +80,7 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
     # Make dataframe of the raw ssw profile
     # Get array of PA's to pass out too
     pa = np.zeros(len(times)) + pa_center
+
     # Convert profile into a dataframe and return.
     profile = pd.DataFrame({'time': times, 'el': el_best, 'el_lo': el_lo, 'el_hi': el_hi, 'pa': pa})
 
@@ -121,6 +122,7 @@ class Observations:
             ssw_event: str=None,
             craft:str=None,
             img:str=None,
+            use_parallel: bool=False,
     ) -> None:
         """
         Class to get observations for DA from
@@ -148,6 +150,7 @@ class Observations:
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
         :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
         :param rng_seed: Seed to use for random number generator
+        :param use_parallel: Boolean to determine whether to use parallel execution if using synthetic observations
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: Change such that observations are downloaded if need be
@@ -255,6 +258,7 @@ class Observations:
             else:
                 self.rng: Generator = np.random.default_rng(obs_rng_seed)
 
+            self.use_parallel: bool = use_parallel
             self.plot_surf_output: bool = plot_surf_output
 
             self.observations: list[float] = self.make_synthetic_obs()
@@ -275,11 +279,6 @@ class Observations:
         :return: synth_obs: List of synthetic observations
         """
 
-        # if self.rng is None:
-        #     rng = np.random.default_rng()
-        # else:
-        #     rng = self.rng
-
         # Initialise an observation operator instance
         obs_op_obj = ObservationOperator(
             use_model=self.use_model,
@@ -299,29 +298,29 @@ class Observations:
             cme_init_rad = self.cme_init_rad,
             cme_fixed_duration = self.cme_fixed_duration,
             fixed_duration = self.fixed_duration,
-            plot_surf_output = self.plot_surf_output
+            plot_surf_output = self.plot_surf_output,
+            use_parallel = self.use_parallel,
         )
 
         unpert_obs = obs_op_obj.make_obs_op()
-        #print(f"unpert_obs: {unpert_obs}")
+
         synth_obs = [
             uo + self.rng.normal(loc=0, scale=self.obs_cov)
             for uo in unpert_obs[0, :]
         ]
-        #print(f"synth_obs: {synth_obs}")
+
         return synth_obs
 
 
     def read_obs_from_file(self) -> tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]]:
 
         times_datetime = []
-        times_astro = []
         el_best = []
         el_lo = []
         el_hi = []
         obs_lon = []
         for obs_file in self.obs_filenames:
-            with tables.open_file(obs_file, mode="r") as f:#h5py.File(self.obs_filenames, 'r') as f:
+            with tables.open_file(obs_file, mode="r") as f:
 
                 # Pull out ssw_event
                 # ssw_event = "ssw_012"
@@ -336,19 +335,14 @@ class Observations:
 
                 for cme_slice in ssw_event:
                     frame_time = Time(cme_slice._v_title, format='isot', scale='utc')
-                    #print(f"frame_time = {frame_time}")
+
                     ert_hpc = spice.get_lonlat(frame_time, 'earth', system='hpc', observatory=self.craft)
-                    #print(f"ert_hpc = {ert_hpc}")
                     ert_hpr = spice.convert_hpc_to_hpr(ert_hpc[1], ert_hpc[2])
                     ert_pa_avg = np.mean(ert_hpr[1])
                     pa_center = ert_pa_avg
-                    #print("Ecliptic PA requested. Using pa_center = {:4.2f}".format(pa_center))
 
                     cme_df = pd.DataFrame.from_records(cme_slice.cme_coords.read())
                     cme_df.replace(to_replace=[99999], value=np.nan, inplace=True)
-                    # print(f"frame_time={frame_time}")
-                    # print(f"cme_df = {cme_df}")
-                    # print(f"cme_df_columns = {cme_df.columns}")
 
                     # Look up the indices of this position angle slice, and average
                     #   the elongation coords in this window.
@@ -369,93 +363,6 @@ class Observations:
                     el_lo.append(np.nanmean(cme_df['el_lo'][id_pa]))
                     el_hi.append(np.nanmean(cme_df['el_hi'][id_pa]))
 
-                # Get observations longitude
-                # h_obs_class = Sobs(craft.upper(), np.array(times_astro))
-                # obs_lon = h_obs_class.lon
-
-                # Make dataframe of the raw ssw profile
-                # Get array of PA's to pass out too
-                # pa = np.zeros(len(el_best)) + pa_center
-                # # Convert profile into a dataframe and return.
-                # profile = pd.DataFrame({'time': times_datetime, 'el': el_best, 'el_lo': el_lo, 'el_hi': el_hi, 'pa': pa})
-                #
-                # profile['el_dlo'] = profile['el'] - profile['el_lo']
-                # profile['el_dhi'] = profile['el_hi'] - profile['el']
-                # Set the time error to zero, as well defined for SSW
-                # profile['time_err'] = profile['time'] - profile['time']
-                # Add in julian dates
-                #profile['time'] = profile["time"]#pd.DatetimeIndex(profile['time']).to_julian_date()
-                # for key in f.keys():
-                #      print(key)  # Names of the root level object names in HDF5 file - can be groups or datasets.
-                #      print(type(f[key]))  # get the object type: usually group or dataset
-                #
-                #
-                # # loop on names and H5 objects:
-                # for name, h5obj in f.items():
-                #     if isinstance(h5obj, h5py.Group):
-                #         print(f"{name} is a group")
-                #         for name_group, h5obj_group in f[name].items():
-                #             print(name_group)
-                #             if isinstance(h5obj_group, h5py.Group):
-                #                 print(f"{name_group} is Group")
-                #                 for name_group2, h5obj_group2 in f[name][name_group].items():
-                #                     print(name_group2)
-                #                     if isinstance(h5obj_group2, h5py.Group):
-                #                         print(f"{name_group2} is Group")
-                #                         for name_group3, h5obj_group3 in f[name][name_group][name_group2].items():
-                #                             print(name_group3)
-                #                             if isinstance(h5obj_group3, h5py.Group):
-                #                                 print(f"{name_group3} is Group")
-                #                                 for name_group4, h5obj_group4 in f[name][name_group][name_group2][name_group3].items():
-                #                                     print(name_group4)
-                #                                     if isinstance(h5obj_group4, h5py.Group):
-                #                                         print(f"{name_group4} is Group")
-                #                                     elif isinstance(h5obj_group4, h5py.Dataset):
-                #                                         print(name_group4, 'is a Dataset')
-                #                                         #print(h5obj_group4.keys())
-                #                                         a = h5obj.get_node(f"/{name}/{name_group}/{name_group2}/{name_group3}/")#, getclass=True)
-                #                                         print(f"a={a}")
-                #                                         # ds = xr.open_dataset(
-                #                                         #     f,
-                #                                         #     group=f"/{name}/{name_group}/{name_group2}/{name_group3}/{name_group4}"
-                #                                         # )
-                #                                         #print(ds)
-                #                                         #print(f"{name_group4} dataset: {np.array(h5obj_group4)}")
-                #                             elif isinstance(h5obj_group3, h5py.Dataset):
-                #                                 print(name_group3, 'is a Dataset')
-                #                     elif isinstance(h5obj_group2, h5py.Dataset):
-                #                         print(name_group2, 'is a Dataset')
-                #
-                #
-                #             elif isinstance(h5obj_group, h5py.Dataset):
-                #                 print(name_group, 'is a Dataset')
-                #
-                #     elif isinstance(h5obj, h5py.Dataset):
-                #         print(name, 'is a Dataset')
-                #         # return a np.array using dataset object:
-                #         arr1 = h5obj[:]
-                #         # return a np.array using dataset name:
-                #         arr2 = file[name][:]
-                #         # compare arr1 to arr2 (should always return True):
-                #         print(np.array_equal(arr1, arr2))
-            # #df = pd.read_hdf(self.obs_filenames)
-            # ssw_event = "sw_007"
-            # craft = "sta"
-            # img = "diff"
-            # pa_center = 0
-            # df = get_ssw_profile(ssw_event, craft, img, pa_center, pa_wid=1.0)
-            # print(df)
-            #print(f"profile = {profile}")
-
-        # Get all required values
-        # obs_times_out = times_datetime.copy() # profile['time'].values
-        # obs_lon_out = obs_lon.copy()
-        # obs_out = el_best.copy() #profile['el'].values
-
-        # Filter out any NaNs in the observations
-        #obs_cond = ~np.isnan(el_best)
-
-        #print(obs_cond)
         obs_times_out = [
             x for i, x in enumerate(times_datetime) if ~np.isnan(el_best[i])
         ]
@@ -471,7 +378,6 @@ class Observations:
 
 
 def main():
-    # "C:\Users\ss905122\PycharmProjects\SIR_HUXt\SSW_cme_classifications.hdf5"
     h5_file_path = os.path.join(
         "C:\\", "Users", "ss905122", "PycharmProjects",
         "SIR_SUXt", "SSW_cme_classifications.hdf5"
