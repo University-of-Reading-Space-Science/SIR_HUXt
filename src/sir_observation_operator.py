@@ -45,7 +45,10 @@ class SynthObsEphem:
     Class to hold observation time, radius, latitude and longitude for use in initialising
       Sim.SyntheticImager class
     """
-    def __init__(self, obs_times, obs_rads, obs_lats, obs_lons):
+    def __init__(self, surf_init_time, obs_times, obs_rads, obs_lats, obs_lons):
+        self.datetime = [
+            surf_init_time + datetime.timedelta(seconds=i) for i in obs_times.value
+        ]
         self.time = obs_times
         self.r = obs_rads
         self.lat = obs_lats
@@ -262,6 +265,7 @@ class ObserverSynthHI:
             self.obs_lon[id_under] = self.obs_lon[id_under] + (360 * u.deg)
 
         synth_obs_class = SynthObsEphem(
+            surf_init_time=surf_model_init_time,
             obs_times=self.hi_times,
             obs_rads=self.obs_r,
             obs_lats=self.obs_lat,
