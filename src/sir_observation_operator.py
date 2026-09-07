@@ -273,13 +273,23 @@ class ObserverSynthHI:
         )
 
         # Calculate the j-maps and delta j-maps and track the CME
-        synth_imager_class = Sim.SyntheticImager(synth_obs_class)
-        jmap, djmap = synth_imager_class.compute_jmap(model)
-        cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+        if use_model == "compress_surf":
+            synth_imager_class = Sim.SyntheticImager2D(synth_obs_class)
+            jmap, djmap = synth_imager_class.compute_jmap(model)
+            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
 
-        # Extract time and elongation profiles of synthetic HI-data
-        synth_imager_time = cme_profile["feature_00"]["t"][:]
-        synth_imager_elon = cme_profile["feature_00"]["e"][:]
+            # Extract time and elongation profiles of synthetic HI-data
+            synth_imager_time = cme_profile["feature_00"]["t"][:]
+            synth_imager_elon = cme_profile["feature_00"]["e"][:]
+
+        elif use_model == "compress_surf3d":
+            synth_imager_class = Sim.SyntheticImager3D(synth_obs_class)
+            jmap, djmap = synth_imager_class.compute_jmap(model)
+            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+
+            # Extract time and elongation profiles of synthetic HI-data
+            synth_imager_time = cme_profile["feature_00"]["t"][:]
+            synth_imager_elon = cme_profile["feature_00"]["e"][:]
 
         # Interpolate the synthetic elongations to observation times
         synth_imager_elon_interp = np.interp(
@@ -359,28 +369,15 @@ class ObservationOperator:
         # Get model to use and whether to use compressible SURF, incompressible SURF or HUXt;
         #  and define the solver accordingly.
         self.use_model = use_model.lower()
-        assert (self.use_model in ["surf", "compress_surf", "huxt"])
+        assert (self.use_model in ["surf", "surf3d", "compress_surf", "compress_surf3d", "huxt"])
 
-        if use_model == "surf":
+        if (use_model == "surf") or (use_model == "surf3d"):
             self.solver = "huxt"
-        elif use_model == "compress_surf":
+        elif (use_model == "compress_surf") or (use_model == "compress_surf3d"):
             self.solver = "hydro"
         else:
             self.solver = "huxt"
 
-        assert (self.solver in ["huxt", "hydro"])
-
-        # Get model to use and whether to use compressible SURF, incompressible SURF or HUXt;
-        #  and define the solver accordingly.
-        self.use_model = use_model.lower()
-        assert (self.use_model in ["surf", "compress_surf", "huxt"])
-
-        if use_model == "surf":
-            self.solver = "huxt"
-        elif use_model == "compress_surf":
-            self.solver = "hydro"
-        else:
-            self.solver = "huxt"
         assert (self.solver in ["huxt", "hydro"])
 
         if obs_radius is None:
@@ -771,6 +768,22 @@ class ObservationOperator:
             model.solve([cme])
             cme_member: S.ConeCME = model.cmes[0]
 
+        elif self.use_model in ["compress_surf3d"]:
+            model: SURF3d = setup_surf3d(
+                start_datetime=self.surf_init_time,
+                vr_in=self.vr_in,
+                lon_start=self.lon_start,
+                lon_stop=self.lon_stop,
+                sim_time=3 * u.day,
+                dt_scale=self.dt_scale,
+                r_min=self.r_min,
+                solver=self.solver,
+            )
+
+            # Run CME through SURF
+            model.solve([cme])
+            cme_member: S.ConeCME = model.cmes[0]
+
         elif self.use_model in ["huxt"]:
             model: HUXt = setup_huxt(
                 start_datetime=self.surf_init_time,
@@ -804,7 +817,7 @@ class ObservationOperator:
             )
             cme_flank: pd.DataFrame = observer_object.model_flank
 
-        elif self.use_model in ["compress_surf"]:
+        elif self.use_model in ["compress_surf", "compress_surf3d"]:
             obs_datetime = np.array(self.obs_time_in_datetime)
             obs_radius = np.array(self.obs_radius) * u.AU
             obs_longitude = np.array(self.obs_lon) * u.deg
