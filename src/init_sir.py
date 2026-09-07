@@ -124,6 +124,70 @@ def setup_surf(
     return model
 
 
+def setup_surf3d(
+        start_datetime: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
+        vr_3d_in: npt.NDArray[Quantity[u.km / u.s]] = np.ones(128) * 400 * u.km / u.s,
+        vr_lons: npt.NDArray[Quantity[u.deg]] = np.arange(0, 361, 10) * u.deg,
+        vr_lats: npt.NDArray[Quantity[u.deg]] = np.arange(-90, 90, 10) * u.deg,
+        lat_min: Quantity[u.deg] = -30 * u.deg,
+        lat_max: Quantity[u.deg] = 30 * u.deg,
+        lon_start: Quantity[u.deg] = 290 * u.deg,
+        lon_stop: Quantity[u.deg] = 380 * u.deg,
+        sim_time: Quantity[u.day] = 2 * u.day,
+        dt_scale: int = 20,
+        r_min: Quantity[u.solRad] = 21.5 * u.solRad,
+        solver: str = "huxt",
+) -> S.SURF3d:
+    """
+    Initialise SURF with some predetermined boundary/initial conditions
+    Here a uniform 400km/s wind is used, and SURF time is set to 2008-01-01T00:00:00.
+    :param start_datetime: Initial datetime of SURF simulation
+    :param vr_3d_in: Initial radial solar wind speed in km/s
+    :param vr_lons: Initial longitude of SURF simulation in degrees
+    :param vr_lats: Initial latitude of SURF simulation in degrees
+    :param lon_start: Initial longitude of SURF simulation in degrees
+    :param lon_stop: Final longitude of SURF simulation in degrees
+    :param sim_time: SURF simulation time in seconds
+    :param dt_scale: Scalar specifying cadence of output timesteps
+    :param r_min: Inner boundary radius in solar radii
+    :param solver: Solver to use, string, must be in ["huxt", "hydro"]
+
+    :return model3d: SURF3d model object with required ambient wind conditions at required
+                    longitudes and latitude
+    """
+
+    assert type(start_datetime) == datetime.datetime
+
+    assert solver in ["huxt", "hydro"], "Solver must be in ['huxt', 'hydro']"
+
+    start_time: Time = Time(start_datetime, scale="utc")
+    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
+    ert: Observer = S.Observer("EARTH", start_time)
+
+    # Set up SURF for a sim_time-day simulation, outputting every dt_scale
+    model3d = S.SURF3d(
+        cr_num=cr_num,
+        cr_lon_init=ert.lon_c.to(u.deg),
+        v_map=vr_3d_in,
+        v_map_lat=vr_lats,
+        v_map_long=vr_lons,
+        latitude_min=lat_min,
+        latitude_max=lat_max,
+        lon_start=lon_start.to(u.rad),
+        lon_stop=lon_stop.to(u.rad),
+        dt_scale=dt_scale,
+        simtime=sim_time,
+        r_min=r_min,
+        solver=solver,
+    )
+
+    # model1d = S.SURF(v_boundary=vr_in, cr_num=cr_num, cr_lon_init=ert.lon_c, latitude=ert.lat.to(u.deg),
+    #                  lon_out=0 * u.deg, simtime=5 * u.day, dt_scale=4)
+    # print(type(model))
+
+    return model3d
+
+
 def initialise_cme_parameter_ensemble_dict(
         n_ensemble: int,
         surf_init_time: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
