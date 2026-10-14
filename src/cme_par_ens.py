@@ -4,7 +4,7 @@ A module that defines the classes required for non-standard type-hints
 """
 import datetime
 
-from mypy.build import TypedDict
+from typing import TypedDict
 
 import astropy.units as u
 from astropy.units import Quantity

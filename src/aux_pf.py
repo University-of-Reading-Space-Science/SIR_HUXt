@@ -1,6 +1,7 @@
 # @package sir
 # This module will take inputs from SURF and perform an SIR to
 #  generate an updated set of weights and particles
+import copy
 import numpy as np
 import numpy.typing as npt
 import datetime
@@ -44,7 +45,7 @@ class AuxPF:
             true_cme_par_dict: CmeParEns = None,
             infl_fact: float = 1,
             craft: str=None,
-            pars_in_state: list[str] = ["v", "lon", "width"],
+            pars_in_state: list[str] | None = None,
             vr_in: npt.NDArray[Quantity[u.km/u.s]]=np.zeros(128) + 400 * u.km / u.s,
             vr_longs: npt.NDArray[Quantity[u.rad]]=np.nan * u.rad,
             vr_lats: npt.NDArray[Quantity[u.rad]]=np.nan * u.rad,
@@ -77,7 +78,8 @@ class AuxPF:
         self.obs_time = obs_time
         self.true_cme_par_dict: CmeParEns = true_cme_par_dict
         self.infl_fact = infl_fact
-        self.pars_in_state = pars_in_state
+        # (avoid a mutable default argument)
+        self.pars_in_state = ["v", "lon", "width"] if pars_in_state is None else list(pars_in_state)
         self.vr_in = vr_in
         self.vr_longs = vr_longs
         self.vr_lats = vr_lats
@@ -150,7 +152,12 @@ class AuxPF:
         :return: cov_state: Covariance of the state vector
         :return: scaled_cov_state: Covariance of the state vector scaled by cov_shrink_fact2
         """
-        cov_state: float | npt.NDArray = np.cov(self.state_vector, rowvar=False)
+        # Weighted covariance, consistent with the weighted mean used in shrink_par (Liu & West, 2001).
+        #  (Previously the unweighted covariance was used.)
+        weights = np.exp(np.asarray(self.log_weights, dtype=float))
+        if (not np.all(np.isfinite(weights))) or (np.sum(weights) <= 0):
+            weights = None
+        cov_state: float | npt.NDArray = np.cov(self.state_vector, rowvar=False, aweights=weights)
         if cov_state.ndim == 0:
             cov_state: npt.NDArray[float] = np.array([[cov_state]])
 
@@ -238,12 +245,15 @@ class AuxPF:
         :return: state_vector_dict: State vector dictionary with shrunken parameters replacing original parameters
         """
         from_state_class = FromStateVector(
-            cme_par_array=self.cme_par_array,
-            cme_par_dict=self.cme_par_dict,
+            cme_par_array=np.copy(self.cme_par_array),
+            cme_par_dict=copy.deepcopy(self.cme_par_dict),
             state_ens=self.state_vector,
             pars_in_state_vector=self.pars_in_state
         )
         state_vector_dict = from_state_class.cme_par_array_to_cme_par_dict()
+
+        # NB: cme_par_array_to_cme_par_dict fills the dictionary it was given in place,
+        #  so the copies above stop the shrunk parameters overwriting self.cme_par_dict
 
         return state_vector_dict
 
@@ -269,7 +279,8 @@ class AuxPF:
         """
         ## Function to convert the CME parameters into a state vector
         # Extract weights of particles
-        weights: list[float] = self.cme_par_dict["weight"]
+        # np.array so boolean indexing works (cme_par_dict stores a python list)
+        weights: npt.NDArray[float] = np.array(self.cme_par_dict["weight"], dtype=float)
 
         # If there are non-finite weights, set weight to zero (i.e. discard particle)
         weight_cond = ~np.isfinite(weights)
@@ -287,7 +298,8 @@ class AuxPF:
         :return: log_weights: Logarithm of particle filter weights
         """
         # Extract weights of particles
-        log_weights: list[float] = self.cme_par_dict["log_weight"]
+        # np.array so boolean indexing works (cme_par_dict stores a python list)
+        log_weights: npt.NDArray[float] = np.array(self.cme_par_dict["log_weight"], dtype=float)
 
         # If there are non-finite log_weights, set log_weight to log(1e-100)
         #  (i.e. discard particle)
@@ -454,7 +466,8 @@ class AuxPF:
         Function to calculate the Effective Sample Size with logarithmic weights
         :return: ess: Effective Sample Size
         """
-        # Normalise weights
+        # Normalise weights (np.asarray: `2 * list` would repeat the list rather than double it)
+        log_weight_in = np.asarray(log_weight_in, dtype=float)
         log_weight_in = log_weight_in - jacobian_log(log_weight_in)
 
         # Calculate the effective sample size
@@ -494,7 +507,7 @@ class AuxPF:
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob_log_weights(log_likelihood_shrunk_ens)
         log_aux_prob = [
-            x if ~np.isnan(x) else -1e31 for x in log_aux_prob
+            x if np.isfinite(x) else -1e31 for x in log_aux_prob
         ]
 
         # Get indices to resample

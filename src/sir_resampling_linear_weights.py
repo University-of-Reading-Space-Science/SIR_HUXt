@@ -29,7 +29,9 @@ class ResampleParsLinearWeights:
         Function to normalise the weights so that they all sum to 1
         :return: Normalised weights
         """
-        return self.weights / np.sum(self.weights)
+        # np.asarray so that a python list of weights works too (list / float raises TypeError)
+        weights = np.asarray(self.weights, dtype=float)
+        return weights / np.sum(weights)
 
 
     def make_cdf(self) -> list[float]:
@@ -80,7 +82,7 @@ class ResampleParsLinearWeights:
         # Calculate CDF all weights
         cdf_val: list[float] = self.make_cdf()
         resamp_ind: list[int] = [
-            bisect.bisect_left(cdf_val, x) for x in positions
+            min(bisect.bisect_left(cdf_val, x), self.n_ensemble - 1) for x in positions
         ]
 
         return resamp_ind

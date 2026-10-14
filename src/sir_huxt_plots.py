@@ -71,7 +71,7 @@ def plot_huxt_multi(ax, time, model):
             cme_r = np.append(cme_r, cme_r[0])
             ax.plot(cme_lons, cme_r, '-', color=cme_colors[cid], linewidth=3)
 
-    bodies = HA.get_body_styles()
+    bodies = Ha.get_body_styles()
     # Don't want STA or STB in these plots, so:
     bodies.pop('STA')
     bodies.pop('STB')

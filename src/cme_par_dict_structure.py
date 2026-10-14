@@ -64,6 +64,6 @@ def cme_par_get_keys(cme_par_array_index: int) -> str:
     )
 
     if keyReq is None:
-        raise IndexError(f"cme_par_index {cme_par_index} not found in cme_par_key_dict.")
+        raise IndexError(f"cme_par_index {cme_par_array_index} not found in cme_par_key_dict.")
 
     return keyReq

@@ -1,4 +1,5 @@
 import os
+import sys
 import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -74,7 +75,8 @@ def uncorrelated_cov_mat(
         sd_width: float=0,
         sd_lon: float=0,
         sd_lat: float=0,
-        sd_thick: float=0
+        sd_thick: float=0,
+        plot_cme_cov: bool=False,
 ) -> npt.NDArray[float]:
     """
     Generate uncorrelated covariance matrix
@@ -98,11 +100,13 @@ def uncorrelated_cov_mat(
         ind_req = cme_par_get_indices(var_name)
         uncorr_cov_mat[ind_req, ind_req] = sd_vals[ind_req] * sd_vals[ind_req]
 
-    plot_sample_cov(
-        uncorr_cov_mat,
-        np.identity(6),
-        "Uncorrelated covariance matrix",
-    )
+    # (previously always plotted, which blocks on plt.show() during DA runs)
+    if plot_cme_cov:
+        plot_sample_cov(
+            uncorr_cov_mat,
+            np.identity(6),
+            "Uncorrelated covariance matrix",
+        )
     return uncorr_cov_mat
 
 
@@ -140,6 +144,8 @@ def make_uncorrelated_samples(
     )
     print(f"uncorr_cov = {uncorr_cov}")
 
+    # Copy so the caller's list isn't modified in place
+    mean_cme_pars = list(mean_cme_pars)
     if use_log_v:
         mean_cme_pars[1] = np.log(mean_cme_pars[1])
 
@@ -418,7 +424,7 @@ def make_donki_cov(
     ########################################################################
     # Use routine in surf.surf_inputs to retrieve DONKI ConeCME parameters
     ########################################################################
-    if use_model in ["surf", "compress_surf"]:
+    if use_model in ["surf", "surf3d", "compress_surf", "compress_surf3d"]:
         donki_cone_cme_dict = surf_inputs.get_DONKI_coneCMEs(
             startdate=start_time,
             enddate=end_time,
@@ -572,6 +578,7 @@ def make_donki_samples(
         rng,
         start_time: datetime.datetime,
         end_time:datetime.datetime,
+        use_model: str="surf",
         scale_corr: bool=False,
         vars_req: npt.NDArray[str]=np.array(["t_init", "v", "width", "lon", "lat", "thick"]),
         sd_t_init: float=0,
@@ -614,9 +621,11 @@ def make_donki_samples(
     """
     donki_samples: npt.NDArray[float] = np.zeros((6, n_ens))
 
+    # (use_model is a required argument of make_donki_cov and was previously not passed)
     donki_tuple: tuple[npt.NDArray[float], npt.NDArray[float]] = make_donki_cov(
         start_time=start_time,
         end_time=end_time,
+        use_model=use_model,
         scale_corr=scale_corr,
         vars_req=vars_req,
         sd_t_init=sd_t_init,
@@ -638,6 +647,7 @@ def make_donki_samples(
     # Take exponential of speed values
     v_index = cme_par_get_indices("v")
 
+    mean_cme_pars = list(mean_cme_pars)
     if use_log_v:
         mean_cme_pars[v_index]: list[float] = np.log(mean_cme_pars[v_index])
 
@@ -1192,7 +1202,11 @@ def make_mo_cone_samples(
     mo_cone_cov: npt.NDArray[float] = mo_cone_tuple[0]
     mo_cone_corr: npt.NDArray[float] = mo_cone_tuple[1]
 
-    mean_cme_pars[cme_par_get_indices("v")]: list[float] = np.log(mean_cme_pars[cme_par_get_indices("v")])
+    # Only work in log-speed if use_log_v (previously the mean speed was always logged,
+    #  but only exponentiated back when use_log_v=True -> CME speeds of ~log(v) ~ 7 km/s otherwise)
+    mean_cme_pars = list(mean_cme_pars)
+    if use_log_v:
+        mean_cme_pars[cme_par_get_indices("v")]: list[float] = np.log(mean_cme_pars[cme_par_get_indices("v")])
     for m in range(n_ens):
         mo_cone_samples[:, m] = rng.multivariate_normal(
             mean=mean_cme_pars, cov=mo_cone_cov

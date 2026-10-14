@@ -177,7 +177,7 @@ class Setup:
         fixed_duration: Quantity[u.s] = 12 * 3600 * u.s
 
         if mas_or_wsa.upper() == "MAS":
-            cr_num: int = np.trunc(sn.carrington_rotation_number(surf_init_time))
+            cr_num: int = int(np.trunc(sn.carrington_rotation_number(surf_init_time)))
 
             if use_model in ["surf", "compress_surf"]:
                 vr_in = Sin.get_MAS_long_profile(cr_num, lat=0.0 * u.deg)
@@ -915,7 +915,11 @@ class Setup:
                     sys.exit("Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'")
 
         # Time taken to get from cme_init_rad to r_min
-        surf_dict = self.initialise_surf_parameters()
+        #  (reuse self.surf_par_dict if already built: initialise_surf_parameters re-reads the WSA map)
+        if hasattr(self, "surf_par_dict"):
+            surf_dict = self.surf_par_dict
+        else:
+            surf_dict = self.initialise_surf_parameters()
         surf_cme_ir: Quantity[u.solRad] = surf_dict["cme_init_rad"]
         surf_r_min: Quantity[u.solRad] = surf_dict["r_min"]
 

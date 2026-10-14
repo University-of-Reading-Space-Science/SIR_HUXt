@@ -17,7 +17,6 @@ import huxt.huxt_analysis as HA
 
 import datetime
 import astropy.units as u
-#from SURF.surf.notebooks.SURF_examples import vr_longs
 from astropy.units import Quantity
 from astropy.time import Time
 import matplotlib.pyplot as plt
@@ -467,25 +466,9 @@ class ObservationOperator:
 
         assert (self.solver in ["huxt", "hydro"])
 
-        if obs_radius is None:
-            self.obs_radius = 1 * u.AU
-        else:
-            self.obs_radius = obs_radius
-
-        if obs_lon is None:
-            self.obs_lon = 0 * u.deg
-        else:
-            self.obs_lon = obs_lon
-
-        if obs_lat is None:
-            self.obs_lat = 0 * u.deg
-        else:
-            self.obs_lat = obs_lat
-
         assert obs_time_in_datetime is not None
         self.obs_time_in_datetime: datetime.datetime | list[datetime.datetime] = obs_time_in_datetime
         self.obs_time_in_jd = Time(self.obs_time_in_datetime, format='datetime').jd
-
 
         if isinstance(self.obs_time_in_datetime, datetime.datetime):
             self.obs_time_in_sec = (self.obs_time_in_datetime - surf_init_time).total_seconds() * u.s
@@ -510,6 +493,7 @@ class ObservationOperator:
 
         # Read in CME parameter dictionary and obtain number of ensemble members
         self.cme_par_dict = cme_par_dict
+        self.obs_cov = obs_cov
         self.n_members = self.cme_par_dict["n_members"]
 
         # Initialise ambient solar wind conditions for SURF
@@ -1259,6 +1243,7 @@ class ObservationOperator:
                     )
         else:
             sys.exit(f"make_obs_op: unsupported use_model '{self.use_model}'")
+
         return obs_op
 
 

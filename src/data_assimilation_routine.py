@@ -31,6 +31,7 @@ from cme_par_ens import CmeParEns
 from da_surf_setup import Setup
 import time
 from multiprocessing import Pool
+from typing import Generator
 
 env_path = Path('.', '.env')
 load_dotenv(dotenv_path=env_path, override=True)
@@ -74,7 +75,7 @@ class RunDataAssimilationRoutine:
         self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
 
         if isinstance(self.vr_longs.value, float):
-            self.lon_in:int = 1
+            self.n_lon_in: int = 1
         else:
             if not np.all(np.isnan(self.vr_longs)):
                 self.n_lon_in: int = len(self.vr_longs)
@@ -82,7 +83,7 @@ class RunDataAssimilationRoutine:
                 self.n_lon_in: int = len(self.vr_in)
 
         if isinstance(self.vr_lats.value, float):
-            self.lat_in:int = 1
+            self.n_lat_in: int = 1
         else:
             if not np.all(np.isnan(self.vr_lats)):
                 self.n_lat_in: int = len(self.vr_lats)
@@ -113,12 +114,6 @@ class RunDataAssimilationRoutine:
         # Ensure all bias terms exist, if not, set bias_term_bool to False
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
             self.bias_term_bool = False
-        self.bias_term_5rs: float = obs_par_dict["bias_term_5rs"]
-        self.bias_term_21rs: float = obs_par_dict["bias_term_21rs"]
-
-        # Ensure all bias terms exist, if not, set bias_term_bool to False
-        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
-            self.bias_term_bool = False
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
         self.true_cme_par_dict: CmeParEns = self.setup_class.true_cme_par_dict
@@ -127,7 +122,6 @@ class RunDataAssimilationRoutine:
             # Generate observations
             self.observations: list[float] = self.get_observations()
             if not isinstance(self.obs_radius, list):
-                print("Hi")
                 self.obs_radius = [self.obs_radius for _ in range(self.n_obs)]
 
             if not isinstance(self.obs_lon, list):
@@ -146,7 +140,6 @@ class RunDataAssimilationRoutine:
             self.n_obs: int = obs_tuple[3]
 
             if not isinstance(self.obs_radius, list):
-                print("Hi")
                 self.obs_radius = [self.obs_radius for _ in range(self.n_obs)]
 
             if not isinstance(self.obs_lat, list):
@@ -230,13 +223,12 @@ class RunDataAssimilationRoutine:
         )
         model_dir = f"model_{self.use_model.upper()}"
 
-        model_dir = f"model_{self.use_model.upper()}"
-
         if self.use_synthetic_obs:
+            # (single quotes inside the f-string so this also parses on Python < 3.12)
             obs_dir = (
-                f"truth_{self.true_cme_par_dict["v"].value}_{self.true_cme_par_dict["width"].value}"
-                f"_{self.true_cme_par_dict["lon"].value}_{self.true_cme_par_dict["lat"].value}"
-                f"_{self.true_cme_par_dict["thick"].value}"
+                f"truth_{self.true_cme_par_dict['v'].value}_{self.true_cme_par_dict['width'].value}"
+                f"_{self.true_cme_par_dict['lon'].value}_{self.true_cme_par_dict['lat'].value}"
+                f"_{self.true_cme_par_dict['thick'].value}"
             )
         else:
             obs_dir = (
@@ -321,7 +313,9 @@ class RunDataAssimilationRoutine:
         # Initialise observations
         obs_class = Observations(
             use_model=self.use_model,
+            obs_radius=self.obs_radius,
             obs_lon=self.obs_lon,
+            obs_lat=self.obs_lat,
             obs_times_in_datetime=self.obs_times,
             obs_filenames=self.obs_filenames,
             use_synthetic_obs=self.use_synthetic_obs,
@@ -329,6 +323,9 @@ class RunDataAssimilationRoutine:
             obs_cov=self.obs_cov,
             surf_init_time=self.surf_init_time,
             vr_in=self.vr_in,
+            vr_longs=self.vr_longs,
+            vr_lats=self.vr_lats,
+            n_lat_surf=self.n_lat_surf,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
             sim_time=self.sim_time,
@@ -465,6 +462,7 @@ class RunDataAssimilationRoutine:
 
             samples = mp_cov.make_donki_samples(
                 n_ens=self.n_members,
+                use_model=self.use_model,
                 mean_cme_pars=mean_cme_par_array,
                 rng=rng,
                 start_time=start_time_donki,
@@ -517,7 +515,7 @@ class RunDataAssimilationRoutine:
             )
         else:
             print(f"cme_cov_type provided was: {self.cme_cov_type}")
-            print(f"cme_cov_type must be in {allowed_cme_cov_types}.")
+            print(f"cme_cov_type must be in {self.setup_class.allowed_cov_types()}.")
             sys.exit()
 
         cme_par_dict["t_init"] = [
@@ -641,9 +639,12 @@ class RunDataAssimilationRoutine:
 
                     cme_par_dict = aux_pf_class.aux_pf()
                 elif fg_cme_init_cond:
-                    print("Obs time before CME is expected to be in SURF model domain")
-                elif obs_in_elon_range_cond:
+                    # (these two messages were previously swapped)
                     print("Observation is outside the permitted elongation range for the model")
+                elif obs_in_elon_range_cond:
+                    print("Obs time before CME is expected to be in SURF model domain")
+                else:
+                    print("Obs time before CME launch and obs outside permitted elongation range")
 
                 # Standardise the units and remove the astropy units
                 cme_saved_pars[yi + 1, :, 0] = [
@@ -741,6 +742,9 @@ class RunDataAssimilationRoutine:
                     ),
                 )
 
+            else:
+                sys.exit(f"Saving output for use_model = {self.use_model} is not supported")
+
             print(cme_par_ds)
             outParFile = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode='w')
@@ -750,10 +754,12 @@ class RunDataAssimilationRoutine:
 
 def main():
     print_environment_variables()
-    setup_class = Setup()
-    da_par_dict = setup_class.da_par_dict
 
+    # Reuse the Setup instance built by RunDataAssimilationRoutine
+    #  (each Setup() re-reads/re-maps the WSA boundary conditions)
     run_da_class = RunDataAssimilationRoutine()
+    setup_class = run_da_class.setup_class
+    da_par_dict = setup_class.da_par_dict
 
     run_start = da_par_dict["run_start"]
 

@@ -189,12 +189,12 @@ def plot_par_values_over_single_run(
     else:
         if craft is None:
             filePath = os.path.join(
-                base_file_path, f"run_{runNo:03d}", f"{parNameLegend.replace(" ", "_")}_vs_obs_no.png"
+                base_file_path, f"run_{runNo:03d}", f"{parNameLegend.replace(' ', '_')}_vs_obs_no.png"
             )
         else:
             filePath = os.path.join(
                 base_file_path, f"run_{runNo:03d}",
-                f"{parNameLegend.replace(" ", "_")}_vs_obs_no_{craft}_assim.png"
+                f"{parNameLegend.replace(' ', '_')}_vs_obs_no_{craft}_assim.png"
             )
         plt.savefig(filePath)
 
@@ -224,11 +224,12 @@ def plot_par_values_over_mult_runs(
 
     return None
 
-def get_prior_post_cme_pars_from_ds(ds):
+def get_prior_post_cme_pars_from_ds(ds, runNo=0):
     """
     Function to retrieve prior and posterior cme parameters: [t_init, v, width, lon, lat, thick]
       from dataset (and the posterior logarithm of the weights)
     :param ds: Dataset containing all CME parameters from data assimilation run
+    :param runNo: Run index to extract if ds contains multiple runs (previously undefined here)
     :return: prior_dict, Dictionary containing the prior CME parameters extracted
     :return: posterior_dict, Dictionary containing the posterior CME parameters extracted plus the log_weights
     """
@@ -261,12 +262,13 @@ def get_prior_post_cme_pars_from_ds(ds):
         prior_lat_in = ds["lat"][runNo, 0, :].values
         prior_thick_in = ds["thick"][runNo, 0, :].values
 
-        post_t_init_in = ds["t_init"][runNo, 0, :].values
-        post_v_in = ds["v"][runNo, 0, :].values
-        post_width_in = ds["width"][runNo, 0, :].values
-        post_lon_in = ds["lon"][runNo, 0, :].values
-        post_lat_in = ds["lat"][runNo, 0, :].values
-        post_thick_in = ds["thick"][runNo, 0, :].values
+        # Posterior is the final observation index (previously index 0, i.e. the prior)
+        post_t_init_in = ds["t_init"][runNo, -1, :].values
+        post_v_in = ds["v"][runNo, -1, :].values
+        post_width_in = ds["width"][runNo, -1, :].values
+        post_lon_in = ds["lon"][runNo, -1, :].values
+        post_lat_in = ds["lat"][runNo, -1, :].values
+        post_thick_in = ds["thick"][runNo, -1, :].values
 
         log_weights_in = ds["log_weight"][runNo, -1, :].values
     else:
@@ -293,7 +295,7 @@ def get_prior_post_cme_pars_from_ds(ds):
     width_prior = [prior_width_in[i] * u.deg for i in range(n_members)]
     lon_prior = [prior_lon_in[i] * u.deg for i in range(n_members)]
     lat_prior = [prior_lat_in[i] * u.deg for i in range(n_members)]
-    thick_prior = [prior_thick_in * u.solRad for i in range(n_members)]
+    thick_prior = [prior_thick_in[i] * u.solRad for i in range(n_members)]
 
     sec_to_cme_post = [
         float(post_t_init_in[i]) * u.s for i in range(n_members)
@@ -302,7 +304,7 @@ def get_prior_post_cme_pars_from_ds(ds):
     width_post = [post_width_in[i] * u.deg for i in range(n_members)]
     lon_post = [post_lon_in[i] * u.deg for i in range(n_members)]
     lat_post = [post_lat_in[i] * u.deg for i in range(n_members)]
-    thick_post = [post_thick_in * u.solRad for i in range(n_members)]
+    thick_post = [post_thick_in[i] * u.solRad for i in range(n_members)]
     log_weights_post = [log_weights_in[i] for i in range(n_members)]
     weights_post = np.array([
         np.exp(log_weights_post[i]) for i in range(n_members)
@@ -658,8 +660,8 @@ def get_cme_arrival_time(
             v_bound_in = ds["ambient_vr"].values * u.km / u.s
             r_min_in = ds["r_min"].values * u.solRad
         else:
-            v_bound_in = ds["ambient_vr"][runNo, :, :].to(u.km / u.s) * u.km / u.s
-            r_min_in = ds["r_min"][runNo, :, :].to(u.solRad) * u.solRad
+            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
+            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
     elif use_model in ["compress_surf3d"]:
         try:
             v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
@@ -672,10 +674,10 @@ def get_cme_arrival_time(
             vr_lats_in = ds["vr_lats"].values * u.deg
             r_min_in = ds["r_min"].values * u.solRad
         else:
-            v_bound_in = ds["ambient_vr"][runNo, :, :].to(u.km / u.s) * u.km / u.s
+            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
             vr_longs_in = ds["vr_longs"].values[runNo, :, :] * u.deg
             vr_lats_in = ds["vr_lats"].values[runNo, :, :] * u.deg
-            r_min_in = ds["r_min"][runNo, :, :].to(u.solRad) * u.solRad
+            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
 
     if use_model in ["surf"]:
         model: SURF = S.SURF(
@@ -742,7 +744,7 @@ def get_cme_arrival_time(
     # print(f"cme_launch_time = {cme_launch_time}")
 
     # Extract the CME parameters from the xr.Dataset
-    prior_dict, post_dict = get_prior_post_cme_pars_from_ds(ds)
+    prior_dict, post_dict = get_prior_post_cme_pars_from_ds(ds, runNo=runNo)
     sec_to_cme_prior = np.array(prior_dict["t_init"]) * u.s
     v_prior = np.array(prior_dict["v"])
     width_prior = np.array(prior_dict["width"])
@@ -1929,7 +1931,7 @@ def main():
                 fig_title=fig_title,
                 yTruth=widthTruth,
                 runNo=runNo,
-                parUnits="$^\circ$",
+                parUnits=r"$^\circ$",
                 n_obs=n_obs,
                 base_file_path=baseFilePath,
                 craft=craft,
@@ -1945,7 +1947,7 @@ def main():
                 tick_cadence=3,
                 yTruth=lonTruth,
                 runNo=runNo,
-                parUnits="$^\circ$",
+                parUnits=r"$^\circ$",
                 n_obs=n_obs,
                 base_file_path=baseFilePath,
                 craft=craft,
@@ -1961,7 +1963,7 @@ def main():
                 tick_cadence=3,
                 yTruth=lonTruth,
                 runNo=runNo,
-                parUnits="$^\circ$",
+                parUnits=r"$^\circ$",
                 n_obs=n_obs,
                 base_file_path=baseFilePath,
                 craft=craft,
@@ -1984,7 +1986,7 @@ def main():
     #     widthTruth,
     #     "Observation number",
     #     "CME Width",
-    #     parUnits="$^\circ$"
+    #     parUnits=r"$^\circ$"
     # )
     # plot_par_values_over_mult_runs(
     #     ds,
@@ -1993,7 +1995,7 @@ def main():
     #     lonTruth,
     #     "Observation number",
     #     "CME Longitude",
-    #     parUnits="$^\circ$"
+    #     parUnits=r"$^\circ$"
     # )
     #
     # fig, axes = plt.subplots(figsize=(25, 17), nrows=2, ncols=3, layout="constrained")

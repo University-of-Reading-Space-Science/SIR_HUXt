@@ -100,7 +100,7 @@ class ToStateVector:
         lon_arr: npt.NDArray[Quantity[None]] = np.array([
             lon.to(u.deg).value for lon in self.cme_par_dict["lon"][:]
         ])
-        lonCond: list[bool] = list(lon_arr > 180)
+        lonCond: npt.NDArray[bool] = lon_arr > 180
         lon_arr[lonCond]: Quantity[None] = lon_arr[lonCond] - 360
 
         return lon_arr
@@ -228,14 +228,17 @@ class ToStateVector:
         """
         assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
 
-        # Extract weights of particles
-        self.cme_par_dict = remove_infinite_weights(self.cme_par_dict)
-
         # Extract all required parameters, put them in an ensemble matrix, then calculate the zscores for output
-        state_mat: npt.NDArray[float] = self.cme_par_dict_keys_to_array()
+        #  (previously called the undefined remove_infinite_weights, cme_par_dict_keys_to_array and sir.zscore)
+        state_mat: npt.NDArray[float] = self.cme_par_dict_to_state_vector()
 
         for i in range(self.n_pars):
             # Convert to z_scores
-            self.z_ens[:, i], self.x_mean[i], self.x_std[i] = sir.zscore(state_mat[:, i])
+            self.x_mean[i] = np.mean(state_mat[:, i])
+            self.x_std[i] = np.std(state_mat[:, i], ddof=1)  # matches sir.zscore
+            if self.x_std[i] > 0:
+                self.z_ens[:, i] = (state_mat[:, i] - self.x_mean[i]) / self.x_std[i]
+            else:
+                self.z_ens[:, i] = 0.0
 
         return self.z_ens, self.x_mean, self.x_std

@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 import re
+from urllib.parse import urljoin
 
 import surf.surf_inputs as Sin
 import astropy.units as u
@@ -39,18 +40,27 @@ class ReadWSAFiles():
         print(f"year_req={year_req:04d}, month_req={month_req:02d}")
         wsa_url = f"{self.base_url}/{year_req:04d}/{month_req:02d}"
 
-        wsa_url_prev_month = f"{self.base_url}/{year_req:04d}/{month_req - 1:02d}"
+        # Previous month, wrapping January back to December of the previous year
+        #  (previously gave e.g. ".../2012/00" for January)
+        if month_req == 1:
+            prev_year, prev_month = year_req - 1, 12
+        else:
+            prev_year, prev_month = year_req, month_req - 1
+        wsa_url_prev_month = f"{self.base_url}/{prev_year:04d}/{prev_month:02d}"
         print(f"wsa_url={wsa_url}")
 
         return wsa_url, wsa_url_prev_month
 
 
-    def list_files(self):
+    def list_files(self, url=None):
         """
         Get all files in the directory and extract timestamps.
+        :param url: Directory URL to list (defaults to the month of self.date_required)
         """
+        if url is None:
+            url = self.wsa_url
 
-        response = requests.get(self.wsa_url, timeout=10)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -85,7 +95,8 @@ class ReadWSAFiles():
                 {
                     "datetime": file_time,
                     "filename": filename,
-                    "url": f"{self.wsa_url}/{href}",
+                    # urljoin copes with both relative and absolute hrefs
+                    "url": urljoin(url.rstrip("/") + "/", href),
                 }
             )
 
@@ -105,6 +116,14 @@ class ReadWSAFiles():
             f for f in files
             if f["datetime"] <= self.date_required
         ]
+
+        # Early in the month there may be no file yet, so look at the previous month
+        if not candidates:
+            files_prev = self.list_files(url=self.wsa_url_prev_month)
+            candidates = [
+                f for f in files_prev
+                if f["datetime"] <= self.date_required
+            ]
 
         if not candidates:
             raise ValueError(

@@ -28,7 +28,7 @@ from astropy.time import Time
 
 import matplotlib.pyplot as plt
 from cme_par_ens import CmeParEns
-from init_sir import initialise_cme_parameter_ensemble_dict, setup_surf
+from init_sir import initialise_cme_parameter_ensemble_dict, setup_surf, setup_huxt
 import seaborn as sns
 import colorcet as cc
 import pytest

@@ -1,6 +1,8 @@
 import numpy as np
 import numpy.typing as npt
 import datetime
+import sys
+from typing import Generator
 
 import huxt.huxt as H
 import surf.surf as S
@@ -44,7 +46,7 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
     # Open up the SSW data
     if use_model in ['huxt']:
         project_dirs = H._setup_dirs_()
-    elif use_model in ['surf', 'compress_surf']:
+    elif use_model in ['surf', 'compress_surf', 'compress_surf3d']:
         project_dirs = S._setup_dirs_()
     else:
         project_dirs = {}
@@ -69,7 +71,7 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
         times.append(frame_time.datetime)
         # Get the CME front data
         cme = pd.DataFrame.from_records(cme_slice.cme_coords.read())
-        cme.replace(to_replace=[99999], value=np.NaN, inplace=True)
+        cme.replace(to_replace=[99999], value=np.nan, inplace=True)
         # Look up the indices of this position angle slice, and average the elongation coords in this
         # window.
         id_pa = (cme['pa'] >= (pa_center - pa_wid)) & (cme['pa'] <= (pa_center + pa_wid))
@@ -109,6 +111,9 @@ class Observations:
             obs_cov: npt.NDArray[float] | float=None,
             surf_init_time: datetime.datetime=None,
             vr_in: npt.NDArray[Quantity[u.km / u.s]]=None,
+            vr_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            vr_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            n_lat_surf: int=45,
             lon_start: Quantity[u.deg]=None,
             lon_stop: Quantity[u.deg]=None,
             sim_time: Quantity[u.day]=None,
@@ -163,6 +168,15 @@ class Observations:
         # Check whether we're reading observations from a file or using synthetic observations
         self.use_synth_obs: bool = use_synthetic_obs
 
+        # These are needed for both synthetic and real observations
+        #  (craft is passed through to the observation operator for synthetic obs)
+        self.ssw_event: str = ssw_event
+        self.craft: str = craft
+        self.img: str = img
+        self.vr_longs = vr_longs
+        self.vr_lats = vr_lats
+        self.n_lat_surf: int = n_lat_surf
+
         # If no observation filenames are specified, make synthetic observations
         if obs_filenames is None:
             self.use_synth_obs: bool = True
@@ -170,9 +184,6 @@ class Observations:
             self.obs_filenames: str | list[str] = obs_filenames
             if isinstance(self.obs_filenames, str):
                 self.obs_filenames = [self.obs_filenames]
-            self.ssw_event: str = ssw_event
-            self.craft: str = craft
-            self.img: str = img
 
         if obs_radius is None:
             self.obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] = 1.0 * u.AU
@@ -194,9 +205,8 @@ class Observations:
             assert obs_times_in_datetime is not None
             self.obs_times_in_datetime: datetime.datetime | list[datetime.datetime] = obs_times_in_datetime
 
-            assert(
-                all([true_cme_par_dict, obs_cov]) is not None
-            )
+            assert true_cme_par_dict is not None, "true_cme_par_dict required for synthetic obs"
+            assert obs_cov is not None, "obs_cov required for synthetic obs"
             assert all(p in true_cme_par_dict.keys() for p in required_dict_keys())
 
             self.true_cme_par_dict: CmeParEns = true_cme_par_dict
@@ -299,8 +309,12 @@ class Observations:
             obs_lat = self.obs_lat,
             obs_time_in_datetime=self.obs_times_in_datetime,
             obs_cov = self.obs_cov,
+            craft = self.craft,
             surf_init_time = self.surf_init_time,
             vr_in = self.vr_in,
+            vr_longs = self.vr_longs,
+            vr_lats = self.vr_lats,
+            n_lat_surf = self.n_lat_surf,
             lon_start = self.lon_start,
             lon_stop = self.lon_stop,
             sim_time = self.sim_time,
@@ -315,8 +329,11 @@ class Observations:
 
         unpert_obs = obs_op_obj.make_obs_op()
 
+        # obs_cov is an error (co)variance, so the noise standard deviation is sqrt(obs_cov).
+        #  (Previously scale=obs_cov was used, i.e. obs_cov was treated as a standard deviation.)
+        obs_sd = np.sqrt(np.ravel(np.asarray(self.obs_cov, dtype=float))[0])
         synth_obs = [
-            uo + self.rng.normal(loc=0, scale=self.obs_cov)
+            uo + self.rng.normal(loc=0, scale=obs_sd)
             for uo in unpert_obs[0, :]
         ]
 
@@ -360,9 +377,9 @@ class Observations:
                     id_pa = (cme_df['pa'] >= (pa_center - pa_wid)) & (cme_df['pa'] <= (pa_center + pa_wid))
 
                     # Get observations longitude
-                    if self.use_model in ["surf", "compress_surf"]:
+                    if self.use_model in ["surf", "compress_surf", "compress_surf3d"]:
                         h_obs_class = Sobs(self.craft.upper(), frame_time)
-                    elif use_model in ["huxt"]:
+                    elif self.use_model in ["huxt"]:
                         h_obs_class = Hobs(self.craft.upper(), frame_time)
                     else:
                         sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")

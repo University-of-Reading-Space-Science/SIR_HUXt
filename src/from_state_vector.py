@@ -90,8 +90,8 @@ class FromStateVector:
         # Check if all z_score values have been loaded into the class, if not raise an exception
         if not self.zscore_bool:
             raise Exception(
-                f"Missing zscore values input into FromStateVector."
-                f" z_ens={self.state_ens}, x_mean={self.x_mean}, x_std={self.x_std}"
+                f"Missing zscore values (x_mean and x_std) input into FromStateVector."
+                f" z_ens={self.state_ens}"
             )
         assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
 
@@ -99,9 +99,10 @@ class FromStateVector:
         for i, ip in enumerate(self.pars_in_state_vector):
             if ip in required_dict_keys():
                 cme_par_ind_req = cme_par_get_indices(ip)
-                self.cme_par_array[:, cme_par_ind_req] = sir.inv_zscore(
-                    self.state_ens[:, i], self.x_mean[i], self.x_std[i]
-                )
+                # inverse z-score (previously called sir.inv_zscore, but `sir` was never imported)
+                self.cme_par_array[:, cme_par_ind_req] = (
+                    self.state_ens[:, i] * self.x_std[i]
+                ) + self.x_mean[i]
 
         return self.cme_par_array
 
@@ -192,9 +193,10 @@ class FromStateVector:
         # Get the required cme_par_array index for t_init
         ind_req = cme_par_get_indices("lon")
 
-        lon_arr: npt.NDArray[Quantity[None]] = self.cme_par_array[:, ind_req]
+        # Copy, so that the 0-360 conversion doesn't modify self.cme_par_array (kept in +/-180) in place
+        lon_arr: npt.NDArray[Quantity[None]] = np.copy(self.cme_par_array[:, ind_req])
 
-        lon_cond: list[bool] = list(lon_arr < 0)
+        lon_cond: npt.NDArray[bool] = lon_arr < 0
         lon_arr[lon_cond]: npt.NDArray[Quantity[None]] = lon_arr[lon_cond] + 360
 
         lon_dict: list[Quantity[u.deg]] = list(lon_arr) * u.deg

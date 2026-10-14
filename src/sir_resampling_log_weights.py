@@ -7,25 +7,24 @@ def jacobian_log(exponents: list[float]) -> float:
     """
     Function to calculate the Jacobian logarithm of the exponents, given by the sum:
         Jacob_log = log( sum_{j=1}^{N}[exp{exponents_j}] )
-    Used for normalising the log_weights
+    Used for normalising the log_weights.
+    Computed with the numerically stable log-sum-exp trick (equivalent to the recursion in
+    Gentner (2008) Algorithm 1). NaN entries are ignored (previously a NaN in the first entry,
+    or two consecutive -inf entries, turned the whole result into NaN).
     :return: Jacobian logarithm of exponents
     """
+    x = np.asarray(exponents, dtype=float).ravel()
+    x = x[~np.isnan(x)]
 
-    # Initialise the Jacobian logarithm as the first exponent
-    jacob_log: float = exponents[0]
+    if x.size == 0:
+        return np.nan
 
-    lenExp: int = len(exponents)
+    x_max = np.max(x)
+    if not np.isfinite(x_max):
+        # All -inf (=> log(0) = -inf) or at least one +inf (=> +inf)
+        return float(x_max)
 
-    # Update the Jacobian logarithm based upon the algorithm in Gentner (2008) Algorithm 1
-    for i in range(1, lenExp):
-        # Calculate the components
-        if ~np.isnan(exponents[i]):
-            term1: float = np.max([jacob_log, exponents[i]])
-
-            t2exp: float = -np.abs(exponents[i] - jacob_log)
-            term2: float = np.log(1 + np.exp(t2exp))
-
-            jacob_log: float = term1 + term2
+    jacob_log: float = float(x_max + np.log(np.sum(np.exp(x - x_max))))
 
     return jacob_log
 
@@ -40,8 +39,9 @@ class ResampleParsLogWeights:
         self.log_weights: list[float] = log_weights
 
         # Remove nan or infinite values from log_weights
+        # (previous condition `~np.isnan(x) or np.isfinite(x)` let +/-inf through)
         self.log_weights: list[float] = [
-            x if (~np.isnan(x) or np.isfinite(x)) else -1e31
+            float(x) if np.isfinite(x) else -1e31
             for x in log_weights
         ]
 
@@ -63,7 +63,8 @@ class ResampleParsLogWeights:
         Function to normalise the logarithmic weights so that
         :return: Normalised weights
         """
-        return [self.log_weights[i] - jacobian_log(self.log_weights) for i in range(self.n_ensemble)]
+        log_norm_const: float = jacobian_log(self.log_weights)
+        return [self.log_weights[i] - log_norm_const for i in range(self.n_ensemble)]
 
 
     def make_cdf_log_weights(self) -> list[float]:
@@ -115,8 +116,9 @@ class ResampleParsLogWeights:
 
         # Calculate CDF all weights
         cdf_val: list[float] = self.make_cdf_log_weights()
+        # Clip to the last particle in case rounding leaves cdf_val[-1] marginally below a position
         resamp_ind: list[int] = [
-            bisect.bisect_left(cdf_val, x) for x in positions
+            min(bisect.bisect_left(cdf_val, x), self.n_ensemble - 1) for x in positions
         ]
 
         return resamp_ind
