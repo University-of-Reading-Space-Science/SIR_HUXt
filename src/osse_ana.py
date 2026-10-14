@@ -186,6 +186,7 @@ def plot_par_values_over_single_run(
 
     if base_file_path is None:
         plt.show()
+        plt.close(fig)
     else:
         if craft is None:
             filePath = os.path.join(
@@ -197,6 +198,7 @@ def plot_par_values_over_single_run(
                 f"{parNameLegend.replace(' ', '_')}_vs_obs_no_{craft}_assim.png"
             )
         plt.savefig(filePath)
+        plt.close(fig)
 
     return None
 
@@ -221,6 +223,7 @@ def plot_par_values_over_mult_runs(
     ax.set_xlabel(f"{xLabel}")
     ax.set_ylabel(f"{parNameLegend} ({parUnits})")
     plt.show()
+    plt.close(fig)
 
     return None
 
@@ -848,23 +851,29 @@ def get_cme_arrival_time(
         if n_proc < 1:
             n_proc = 1
         pool = Pool(processes=n_proc)
+        try:
 
-        for i in range(n_members):
-            obj_result[i] = pool.apply_async(
-                get_cme_stats_prior_post,
-                kwds={
-                    'ens_no': i,
-                    'n_members': n_members,
-                    'model': model,
-                    'prior_cme': prior_cme_objects[i],
-                    'post_cme': post_cme_objects[i],
-                    'cme_hit_object': cme_hit_object,
-                },
-                callback=log_result,
-            )
+            for i in range(n_members):
+                obj_result[i] = pool.apply_async(
+                    get_cme_stats_prior_post,
+                    kwds={
+                        'ens_no': i,
+                        'n_members': n_members,
+                        'model': model,
+                        'prior_cme': prior_cme_objects[i],
+                        'post_cme': post_cme_objects[i],
+                        'cme_hit_object': cme_hit_object,
+                    },
+                    callback=log_result,
+                )
 
-        pool.close()
-        pool.join()
+            pool.close()
+            pool.join()
+        except BaseException:
+            # Release the worker processes if anything fails (or on Ctrl+C)
+            pool.terminate()
+            pool.join()
+            raise
 
         for i in range(n_members):
             obs_tuple = obj_result[i].get()
@@ -1175,12 +1184,14 @@ def get_cme_arrival_time(
 
         if base_file_path is None:
             plt.show()
+            plt.close(fig)
         else:
             out_dir_path = os.path.join(base_file_path, f"run_{runNo:03d}")
             filePath = os.path.join(
                 out_dir_path, "histogram_arrival_time_error.png"
             )
             plt.savefig(filePath)
+            plt.close(fig)
 
             # if np.isnan(weighted_median_post_arr_sec):
             #     weight_med_prior = np.nan
@@ -1358,6 +1369,7 @@ def plot_sample_cov(
     )
     ax.set_title(f"Correlation matrix for obs_no = {obs_no}, run_no = {run_no}")
     plt.show()
+    plt.close(fig)
 
     # sns.heatmap(df.cov(), annot=True, cmap=plt.cm.RdBu_r, vmin=-1600, vmax=1600)
     # plt.show()
@@ -1844,22 +1856,28 @@ def main():
             if nProc < 1:
                 nProc = 1
             pool = Pool(processes=nProc)
-            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-                print("HI")
-                pool.apply_async(
-                    get_cme_arrival_time,
-                    kwds={
-                        'ds': ds,
-                        'runNo': runNo,
-                        'use_model': use_model,
-                        'real_arrival_time':real_arrival_time,
-                        'cme_hit_object': "EARTH",
-                        'base_file_path': baseFilePath,
-                        'parallel_ens': False,
-                    },
-                )
-            pool.close()
-            pool.join()
+            try:
+                for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
+                    print("HI")
+                    pool.apply_async(
+                        get_cme_arrival_time,
+                        kwds={
+                            'ds': ds,
+                            'runNo': runNo,
+                            'use_model': use_model,
+                            'real_arrival_time':real_arrival_time,
+                            'cme_hit_object': "EARTH",
+                            'base_file_path': baseFilePath,
+                            'parallel_ens': False,
+                        },
+                    )
+                pool.close()
+                pool.join()
+            except BaseException:
+                # Release the worker processes if anything fails (or on Ctrl+C)
+                pool.terminate()
+                pool.join()
+                raise
         else:
             for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
                 print("HI2")

@@ -582,7 +582,7 @@ class ObservationOperator:
 
                 # Setup a SyntheticImager3D class instance to get the min and max latitudes
                 # TODO: Remove hard-coded values for min and max elongations and buff_lat
-                print(f"psi_ert_avg = {self.psi_ert_avg}")
+                #print(f"psi_ert_avg = {self.psi_ert_avg}")
 
                 imgr = Sim.SyntheticImager3DOrig(
                     craft_observer,#_class,
@@ -594,7 +594,7 @@ class ObservationOperator:
                 imgr._compute_fov_geometry(0)
                 self.lat_min = imgr.lat_grid.min().to(u.deg) - buff_lat
                 self.lat_max = imgr.lat_grid.max().to(u.deg) + buff_lat
-                print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
+                #print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
 
         # SURF3d needs a finite latitude range; fall back to setup_surf3d's defaults
         if self.use_model in ["compress_surf3d"]:
@@ -844,10 +844,12 @@ class ObservationOperator:
                 fig, ax = SA.plot(model, t_interest)
                 ax.set_title(f"Synth obs CME at {obs_t}")
                 plt.show()
+                plt.close(fig)
             elif self.use_model in ["huxt"]:
                 fig, ax = HA.plot(model, t_interest)
                 ax.set_title(f"Synth obs CME at {obs_t}")
                 plt.show()
+                plt.close(fig)
             else:
                 sys.exit(
                     f"Unknown use_model name, {self.use_model}, "
@@ -1037,52 +1039,58 @@ class ObservationOperator:
             cme_flanks: list[DataFrame] | list[None] = [None] * self.n_members
 
             pool = Pool(processes=n_proc)
-            if isinstance(self.obs_lon, np.ndarray):
-                if np.ndim(self.obs_lon) == 0:
-                    # Get CME flanks for each ensemble member in parallel
-                    #  when self.obs_lon is a single value in an array
-                    obs_lon_val: Quantity[u.deg] = float(self.obs_lon.value) * u.deg
+            try:
+                if isinstance(self.obs_lon, np.ndarray):
+                    if np.ndim(self.obs_lon) == 0:
+                        # Get CME flanks for each ensemble member in parallel
+                        #  when self.obs_lon is a single value in an array
+                        obs_lon_val: Quantity[u.deg] = float(self.obs_lon.value) * u.deg
 
-                    for i, i_cme in enumerate(cme_objects):
-                        obj_res[i] = pool.apply_async(
-                            self.get_cme_flank_single_ens_member,
-                            kwds={
-                                'cme': i_cme,
-                                'obs_longitude': obs_lon_val,
-                                'ens_no': i,
-                            },
-                            callback=log_result
-                        )
+                        for i, i_cme in enumerate(cme_objects):
+                            obj_res[i] = pool.apply_async(
+                                self.get_cme_flank_single_ens_member,
+                                kwds={
+                                    'cme': i_cme,
+                                    'obs_longitude': obs_lon_val,
+                                    'ens_no': i,
+                                },
+                                callback=log_result
+                            )
+                    else:
+                        # Get CME flanks for each ensemble member in parallel
+                        #  when self.obs_lon is an array with multiple values and
+                        #  extract relevant value
+                        for i, i_cme in enumerate(cme_objects):
+                            obj_res[i] = pool.apply_async(
+                                self.get_cme_flank_single_ens_member,
+                                kwds={
+                                    'cme': i_cme,
+                                    'obs_longitude': self.obs_lon[i],
+                                    'ens_no': i,
+                                },
+                                callback=log_result
+                            )
                 else:
                     # Get CME flanks for each ensemble member in parallel
-                    #  when self.obs_lon is an array with multiple values and
-                    #  extract relevant value
+                    #  when self.obs_lon is not in an array (i.e. a float)
                     for i, i_cme in enumerate(cme_objects):
                         obj_res[i] = pool.apply_async(
                             self.get_cme_flank_single_ens_member,
                             kwds={
                                 'cme': i_cme,
-                                'obs_longitude': self.obs_lon[i],
+                                'obs_longitude': self.obs_lon,
                                 'ens_no': i,
                             },
                             callback=log_result
                         )
-            else:
-                # Get CME flanks for each ensemble member in parallel
-                #  when self.obs_lon is not in an array (i.e. a float)
-                for i, i_cme in enumerate(cme_objects):
-                    obj_res[i] = pool.apply_async(
-                        self.get_cme_flank_single_ens_member,
-                        kwds={
-                            'cme': i_cme,
-                            'obs_longitude': self.obs_lon,
-                            'ens_no': i,
-                        },
-                        callback=log_result
-                    )
 
-            pool.close()
-            pool.join()
+                pool.close()
+                pool.join()
+            except BaseException:
+                # Release the worker processes if anything fails (or on Ctrl+C)
+                pool.terminate()
+                pool.join()
+                raise
 
             for i, _ in enumerate(cme_objects):
                 cme_flanks[i] = obj_res[i].get()
@@ -1271,7 +1279,7 @@ def main():
 
     cme_launch_datetime = datetime.datetime(2012, 1, 1, 1, 0, 0, 0)
     cme_launch_time = (cme_launch_datetime - surf_init_time).total_seconds() * u.s
-    print(cme_launch_time)
+    #print(cme_launch_time)
     cme_speed = 600 * u.km / u.s
     cme_width = 40 * u.deg
     cme_lon = 0 * u.deg

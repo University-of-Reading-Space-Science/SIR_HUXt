@@ -35,6 +35,7 @@ def plot_sample_cov(
     )
     ax.set_title(f"Covariance matrix for {cov_name}")
     plt.show()
+    plt.close(fig)
 
     fig, ax = plt.subplots(1, 1)
     sns.heatmap(
@@ -44,6 +45,7 @@ def plot_sample_cov(
     )
     ax.set_title(f"Correlation matrix for {cov_name}")
     plt.show()
+    plt.close(fig)
 
     # Basic correlogram
     # sns.pairplot(df)
@@ -66,6 +68,7 @@ def plot_pair_plot(
     im = sns.pairplot(df_cme_par)
     im.map_lower(sns.kdeplot, levels=10, color="k")
     plt.show()
+    plt.close(im.figure)
 
     return None
 
@@ -1033,8 +1036,9 @@ def make_mo_cone_cme_cov(
 
     elif make_cov_corr_mat_from_nc_pars:
         # Open premade nc files containing all cme parameters
-        mo_cone_cme_ds = xr.open_dataset(mo_cone_par_file_name)
-        mo_cone_cme_df = mo_cone_cme_ds.to_pandas()
+        #  (context manager so the file handle is released once the data are in memory)
+        with xr.open_dataset(mo_cone_par_file_name) as mo_cone_cme_ds:
+            mo_cone_cme_df = mo_cone_cme_ds.to_pandas()
 
         ###############################################################
         # Calculate covariance matrix from mo_cone_cme_df
@@ -1062,15 +1066,16 @@ def make_mo_cone_cme_cov(
 
     else:
         # Open premade nc files containing all cme parameters
-        mo_cone_cme_ds = xr.open_dataset(mo_cone_par_file_name)
-        mo_cone_cme_df = mo_cone_cme_ds.to_pandas()
+        #  (context managers so the file handles are released once the data are in memory;
+        #   previously three handles were left open on every call, i.e. every DA run)
+        with xr.open_dataset(mo_cone_par_file_name) as mo_cone_cme_ds:
+            mo_cone_cme_df = mo_cone_cme_ds.to_pandas()
 
         # Open premade nc files containing cme parameter covariance and correlation matrices
-        mo_cone_cme_cov_ds = xr.open_dataset(cov_out_file_name)
-        mo_cone_cme_corr_ds = xr.open_dataset(corr_out_file_name)
-
-        mo_cone_cme_cov = mo_cone_cme_cov_ds.to_pandas()
-        mo_cone_cme_corr = mo_cone_cme_corr_ds.to_pandas()
+        with xr.open_dataset(cov_out_file_name) as mo_cone_cme_cov_ds:
+            mo_cone_cme_cov = mo_cone_cme_cov_ds.to_pandas()
+        with xr.open_dataset(corr_out_file_name) as mo_cone_cme_corr_ds:
+            mo_cone_cme_corr = mo_cone_cme_corr_ds.to_pandas()
 
     # Update covariance matrix if we require it to be a scaled correlation matrix
     if scale_corr:

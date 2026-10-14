@@ -523,7 +523,11 @@ class AuxPF:
             [self.resample_pars(ind_req) for ind_req in resample_ind]
         )
 
-        # Place new resampled pars into the cme_par_dict
+        # Place new resampled pars into the cme_par_dict.
+        #  Reorder the rows by ancestor first, so that parameters NOT in the state vector (e.g. t_init, lat,
+        #  thick for the OSSE) are inherited from the resampled particle rather than staying with member i.
+        #  (No effect while those parameters have zero prior spread, as in the current setup.)
+        self.cme_par_array = np.copy(self.cme_par_array[np.asarray(resample_ind, dtype=int), :])
         from_state_class: FromStateVector = FromStateVector(
             cme_par_array=self.cme_par_array,
             cme_par_dict=self.cme_par_dict,

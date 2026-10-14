@@ -602,7 +602,10 @@ class RunDataAssimilationRoutine:
                 obs_in_elon_range_cond = (
                     (obs >= self.elong_min) and (obs <= self.elong_max)
                 )
-
+                print(
+                    f"elong_min = {self.elong_min}, elong_max = {self.elong_max}, \n"
+                    f" obs={obs}, obs_in_elon_range_cond = {obs_in_elon_range_cond}"
+                )
                 if fg_cme_init_cond and obs_in_elon_range_cond:
                     aux_pf_class = AuxPF(
                         use_model=self.use_model,

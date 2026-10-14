@@ -174,6 +174,7 @@ def main():
     ax[-1].set_xlim([-20, 20])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
     sys.exit()
 
     max_y_axis = 20
@@ -198,6 +199,7 @@ def main():
     ax[-1].set_xlim([-10, 10])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
 
     max_y_axis = 20
     fig, ax = plt.subplots(figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained")
@@ -221,6 +223,7 @@ def main():
     ax[-1].set_xlim([-10, 10])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
 
     # prior_arrival_speed_flat = np.array(dict1["prior_cme_arrival_s_from_20000101"]).flatten()
     # post_arrival_speed_flat = np.array(dict1["post_cme_arrival_s_from_20000101"]).flatten()
@@ -261,6 +264,7 @@ def main():
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
 
     max_y_axis = 20
     fig, ax = plt.subplots(figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained")
@@ -284,6 +288,7 @@ def main():
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
 
     max_y_axis = 20
     fig, ax = plt.subplots(figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained")
@@ -307,6 +312,7 @@ def main():
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
+    plt.close(fig)
 
 
     return None

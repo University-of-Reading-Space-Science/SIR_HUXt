@@ -45,6 +45,13 @@ class ResampleParsLogWeights:
             for x in log_weights
         ]
 
+        # If every particle failed (non-finite, or already set to the -1e31 sentinel upstream, e.g. no
+        #  ensemble member's CME was tracked at the observation time) there is no information in the
+        #  weights, so fall back to uniform weights. Previously -1e31 + log(N) == -1e31 in floating point,
+        #  so the normalised weights were all exp(0) = 1 and every particle was resampled onto member 0.
+        if all(x <= -1e30 for x in self.log_weights):
+            self.log_weights = [0.0 for _ in self.log_weights]
+
         if n_ensemble is None:
             self.n_ensemble: int = len(log_weights)
         else:

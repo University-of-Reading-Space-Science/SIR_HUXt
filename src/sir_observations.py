@@ -55,6 +55,14 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
             f"accepted use_model variables = ['huxt', 'surf', 'compress_surf']"
         )
     ssw_out = tables.open_file(project_dirs['SSW_data'], mode="r")
+    try:
+        return _read_ssw_profile(ssw_out, ssw_event, craft, img, pa_center, pa_wid)
+    finally:
+        # Release the HDF5 handle even if reading fails
+        ssw_out.close()
+
+
+def _read_ssw_profile(ssw_out, ssw_event, craft, img, pa_center, pa_wid):
 
     # Pull out ssw_event
     ssw_path = "/".join(['', ssw_event, craft, img])
@@ -93,7 +101,6 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
     # Add in julian dates
     profile['time'] = pd.DatetimeIndex(profile['time']).to_julian_date()
 
-    ssw_out.close()
     return profile
 
 

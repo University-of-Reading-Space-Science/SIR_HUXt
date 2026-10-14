@@ -128,8 +128,6 @@ def setup_surf_compress(
         start_datetime: datetime.datetime = datetime.datetime(2008, 1, 1, 0, 0, 0),
         vr_in: npt.NDArray[Quantity[u.km / u.s]] = np.ones(128) * 400 * u.km / u.s,
         br_in=np.nan * u.nT,
-        n_in=np.nan * (u.cm ** -3),
-        T_in=np.nan * u.K,
         lon_start: Quantity[u.deg] = 290 * u.deg,
         lon_stop: Quantity[u.deg] = 380 * u.deg,
         sim_time: Quantity[u.day] = 2 * u.day,
@@ -166,8 +164,6 @@ def setup_surf_compress(
     model: SURF = S.SURF(
         v_boundary=vr_in,
         b_boundary=br_in,
-        rho_boundary=n_in,
-        temp_boundary=T_in,
         cr_num=cr_num,
         cr_lon_init=ert.lon_c.to(u.deg),
         latitude=0 * u.deg,#ert.lat.to(u.deg),

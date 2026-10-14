@@ -169,7 +169,7 @@ class Setup:
         latitude_min = -30 * u.deg
         latitude_max = 30 * u.deg
         n_lat_surf = 45
-        sim_time: Quantity[u.day] = 3 * u.day
+        sim_time: Quantity[u.day] = 2 * u.day
         dt_scale: int = 1
         cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
         r_min: Quantity[u.solRad] = 21.5 * u.solRad
@@ -1103,8 +1103,8 @@ class Setup:
         use_parallel: bool = self.get_use_parallel()
 
         # Set limits on minimum and maximum elongation observations to use
-        elong_min = 4.0
-        elong_max = 30.0
+        elong_min = 6.0
+        elong_max = 10.0
 
         obs_par_dict = {
             "n_obs": n_obs,
@@ -1131,7 +1131,7 @@ class Setup:
 
 
     def initialise_da_parameters(self):
-        n_members: int = 50
+        n_members: int = 25
 
         run_start = -1
         n_runs: int = 1
