@@ -101,9 +101,9 @@ class Observations:
             use_model: str,
             obs_radius: Quantity[u.AU] | list[Quantity[u.AU]]=None,
             obs_lon: Quantity[u.deg] | list[Quantity[u.deg]]=None,
-            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = None,
+            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]]=None,
             obs_times_in_datetime: datetime.datetime | list[datetime.datetime]=None,
-            obs_filenames: list[str] | str =None,
+            obs_filenames: list[str] | str=None,
             use_synthetic_obs: bool=False,
             true_cme_par_dict: CmeParEns=None,
             obs_cov: npt.NDArray[float] | float=None,
@@ -158,7 +158,7 @@ class Observations:
 
         # Read in string to determine which model to use
         self.use_model: str = use_model.lower()
-        assert self.use_model in ["surf", "compress_surf", "huxt"]
+        assert self.use_model in ["surf", "compress_surf", "compress_surf3d", "huxt"]
 
         # Check whether we're reading observations from a file or using synthetic observations
         self.use_synth_obs: bool = use_synthetic_obs
@@ -264,11 +264,22 @@ class Observations:
             self.observations: list[float] = self.make_synthetic_obs()
 
         else:
-            obs_tuple: tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]] = self.read_obs_from_file()
+            if self.ssw_event in ["ssw_007", "ssw_008", "ssw_009", "ssw_012"]:
+                obs_tuple: tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]] = self.read_obs_from_file()
 
-            self.obs_times_in_datetime: list[datetime.datetime] = obs_tuple[0]
-            self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
-            self.observations: list[float] = obs_tuple[2]
+                self.obs_times_in_datetime: list[datetime.datetime] = obs_tuple[0]
+                self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
+                self.observations: list[float] = obs_tuple[2]
+            else:
+                obs_tuple: tuple[
+                    list[datetime.datetime], list[Quantity[u.deg]],
+                    list[Quantity[u.deg]], list[float]
+                ] = self.l5_read_obs_from_file()
+
+                self.obs_times_in_datetime: list[datetime.datetime] = obs_tuple[0]
+                self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
+                self.obs_lat: list[Quantity[u.deg]] = obs_tuple[2]
+                self.observations: list[float] = obs_tuple[3]
 
 
     def make_synthetic_obs(self) -> list[float]:
@@ -375,12 +386,46 @@ class Observations:
 
         return obs_times_out, obs_lon_out, obs_out
 
+    def l5_read_obs_from_file(
+            self,
+            obs_lat: float=0.0
+    ) -> tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]]:
+        times_datetime = []
+        elong = []
+        obs_lon = []
+
+        for obs_file in self.obs_filenames:
+            with open(obs_file, 'r') as f:
+                for line in f:
+                    line_split = line.split()
+
+                    datetime_str = line_split[1].split(".")[0].strip()
+                    datetime_obs = datetime.datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%S')
+                    times_datetime.append(datetime_obs)
+
+                    elong.append(float(line_split[2].strip()))
+                    obs_lon.append(float(line_split[3].strip()))
+
+        obs_times_out = [
+            x for i, x in enumerate(times_datetime) if ~np.isnan(elong[i])
+        ]
+        obs_lon_out = [
+            x for i, x in enumerate(obs_lon) if ~np.isnan(elong[i])
+        ]
+        obs_lat_out = [
+            obs_lat for i, _ in enumerate(elong) if ~np.isnan(elong[i])
+        ]
+        obs_out = [
+            x for i, x in enumerate(elong) if ~np.isnan(elong[i])
+        ]
+
+        return obs_times_out, obs_lon_out, obs_lat_out, obs_out
 
 
 def main():
     h5_file_path = os.path.join(
         "C:\\", "Users", "ss905122", "PycharmProjects",
-        "SIR_SUXt", "SSW_cme_classifications.hdf5"
+        "SIR_HUXt", "SSW_cme_classifications.hdf5"
     )
     use_model = "surf"
     use_model = "surf"

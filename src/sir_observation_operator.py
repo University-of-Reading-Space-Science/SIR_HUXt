@@ -8,17 +8,21 @@ import sys
 import os
 
 import surf.surf as S
+import surf.surf_inputs as Sin
 import surf.surf_analysis as SA
+import surf.surf_imaging as Sim
 
 import huxt.huxt as H
 import huxt.huxt_analysis as HA
 
 import datetime
 import astropy.units as u
+#from SURF.surf.notebooks.SURF_examples import vr_longs
 from astropy.units import Quantity
 from astropy.time import Time
+import matplotlib.pyplot as plt
 
-from init_sir import setup_huxt, setup_surf, initialise_cme_parameter_ensemble_dict
+from init_sir import setup_huxt, setup_surf, setup_surf3d, initialise_cme_parameter_ensemble_dict
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
@@ -26,8 +30,6 @@ import asyncio
 from functools import partial
 import time
 from multiprocessing import Pool
-
-import surf.surf_imaging as Sim
 
 
 def background(f):
@@ -46,13 +48,20 @@ class SynthObsEphem:
       Sim.SyntheticImager class
     """
     def __init__(self, surf_init_time, obs_times, obs_rads, obs_lats, obs_lons):
-        self.datetime = [
-            surf_init_time + datetime.timedelta(seconds=i) for i in obs_times.value
-        ]
-        self.time = obs_times
-        self.r = obs_rads
-        self.lat = obs_lats
-        self.lon = obs_lons
+        if isinstance(obs_times.value, float):
+            self.datetime = np.array([surf_init_time + datetime.timedelta(seconds=obs_times.value)])
+            self.time = np.array([obs_times.value]) * u.s
+            self.r = np.array([obs_rads.to(u.m).value]) * u.m
+            self.lat = np.array([obs_lats.to(u.rad).value]) * u.rad
+            self.lon = np.array([obs_lons.to(u.rad).value]) * u.rad
+        else:
+            self.datetime = [
+                surf_init_time + datetime.timedelta(seconds=i) for i in obs_times.value
+            ]
+            self.time = obs_times
+            self.r = obs_rads
+            self.lat = obs_lats
+            self.lon = obs_lons
 
 
 class ObserverTracer:
@@ -193,9 +202,11 @@ class ObserverSynthHI:
             use_model: str,
             model: S.SURF,
             obs_time: npt.NDArray[datetime.datetime],
+            craft: str=None,
+            psi_ert_avg: float=90.0,
             obs_radius: npt.NDArray[Quantity[u.AU]]=1.0 * u.AU,
             obs_longitude: npt.NDArray[Quantity[u.deg]]=300.0 * u.deg,
-            obs_latitude: npt.NDArray[Quantity[u.deg]]=-60.0 * u.deg,
+            obs_latitude: npt.NDArray[Quantity[u.deg]]=0.0 * u.deg,
             el_min: float=4.0,
             el_max: float=30.0,
             hi_resolution: Quantity[u.s] | Quantity[u.hour] | Quantity[u.day]=1.0 * u.hour,
@@ -215,14 +226,19 @@ class ObserverSynthHI:
         """
 
         self.use_model: str = use_model
-        if self.use_model in ["compress_surf"]:
+        if self.use_model in ["compress_surf", "compress_surf3d"]:
             ert_ephem: S.Observer = model.get_observer('EARTH')
         else:
-            sys.exit("Synthetic HI can only be generated with use_model = 'compress_surf'")
+            sys.exit("Synthetic HI can only be generated with use_model = 'compress_surf' and 'compress_surf3d'")
 
         self.obs_time: npt.NDArray[datetime.datetime] = obs_time
-        surf_model_init_time: datetime.datetime = model.time_init.datetime
-        surf_model_sim_time: float = float(model.simtime.to(u.s).value)
+
+        if self.use_model == "compress_surf":
+            surf_model_init_time: datetime.datetime = model.time_init.datetime
+            surf_model_sim_time: float = float(model.simtime.to(u.s).value)
+        else:
+            surf_model_init_time: datetime.datetime = model.SURFlat[0].time_init.datetime
+            surf_model_sim_time: float = float(model.SURFlat[0].simtime.to(u.s).value)
 
         try:
             obs_time_from_start_sec = [
@@ -248,25 +264,52 @@ class ObserverSynthHI:
         hi_resolution_sec = hi_resolution.to(u.s).value
         hi_resolution_day = hi_resolution.to(u.day).value
 
-        self.hi_times = np.arange(0, surf_model_sim_time, hi_resolution_sec) * u.s
-        self.n_hi_times = len(self.hi_times)
+        if use_model == "compress_surf":
+            self.model_times = model.time
 
-        self.obs_r: npt.NDArray[Quantity[u.AU]] = obs_radius * np.ones(self.n_hi_times)
-        self.obs_lon: npt.NDArray[Quantity[u.deg]] = obs_longitude * np.ones(self.n_hi_times)
-        self.obs_lat: npt.NDArray[Quantity[u.deg]] = obs_latitude * np.ones(self.n_hi_times)
+        elif use_model == "compress_surf3d":
+            self.model_times = model.SURFlat[0].time
 
-        # Force longitude into 0-360 domain
-        id_over: list[bool] | bool = self.obs_lon > 360 * u.deg
-        id_under: list[bool] | bool = self.obs_lon < 0 * u.deg
-        if np.any(id_over):
-            self.obs_lon[id_over] = self.obs_lon[id_over] - (360 * u.deg)
+        self.synth_obs_times = np.arange(
+            0,
+            surf_model_sim_time + (hi_resolution_sec / 2.0),
+            hi_resolution_sec
+        ) * u.s
 
-        if np.any(id_under):
-            self.obs_lon[id_under] = self.obs_lon[id_under] + (360 * u.deg)
+        self.n_synth_obs_times = len(self.synth_obs_times)
+        self.ast_times = Time([
+            surf_model_init_time + datetime.timedelta(seconds=s)
+            for s in self.model_times.value
+        ])
+
+        if craft is not None:
+            self.craft_observer = model.get_observer(craft)
+        else:
+            self.obs_times: npt.NDArray[Time] = Time([
+            surf_model_init_time + datetime.timedelta(seconds=s)
+            for s in self.synth_obs_times.value
+            ])
+
+            self.obs_r: npt.NDArray[Quantity[u.AU]] = obs_radius * np.ones(self.n_synth_obs_times)
+            self.obs_lon: npt.NDArray[Quantity[u.deg]] = obs_longitude * np.ones(self.n_synth_obs_times)
+            self.obs_lat: npt.NDArray[Quantity[u.deg]] = obs_latitude * np.ones(self.n_synth_obs_times)
+
+            # Make dictionary for input into the Observer class for a synthetic observer
+            synth_heeq_pos = {
+                "time": self.obs_times,
+                "r": self.obs_r,
+                "lon": self.obs_lon,
+                "lat": self.obs_lat,
+            }
+            self.craft_observer = S.Observer(
+                body="SYNTHETIC",
+                times=self.ast_times,
+                synth_heeq_pos=synth_heeq_pos,
+            )
 
         synth_obs_class = SynthObsEphem(
             surf_init_time=surf_model_init_time,
-            obs_times=self.hi_times,
+            obs_times=self.synth_obs_times,
             obs_rads=self.obs_r,
             obs_lats=self.obs_lat,
             obs_lons=self.obs_lon,
@@ -277,24 +320,56 @@ class ObserverSynthHI:
             synth_imager_class = Sim.SyntheticImager2D(synth_obs_class)
             jmap, djmap = synth_imager_class.compute_jmap(model)
             cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+            #fig, ax = synth_imager_class.plot_jmap(model, jmap, djmap)
+            #plt.show()
 
+            #print(cme_profile)
             # Extract time and elongation profiles of synthetic HI-data
-            synth_imager_time = cme_profile["feature_00"]["t"][:]
-            synth_imager_elon = cme_profile["feature_00"]["e"][:]
+            try:
+                synth_imager_time = cme_profile["feature_00"]["t"][:]
+                synth_imager_elon = cme_profile["feature_00"]["e"][:]
+            except:
+                synth_imager_time = np.nan
+                synth_imager_elon = np.nan
+            else:
+                synth_imager_time = cme_profile["feature_00"]["t"][:]
+                synth_imager_elon = cme_profile["feature_00"]["e"][:]
 
         elif use_model == "compress_surf3d":
-            synth_imager_class = Sim.SyntheticImager3D(synth_obs_class)
+            print(f"self.craft_observer: {self.craft_observer}")
+            synth_imager_class = Sim.SyntheticImager3DOrig(
+                observer=self.craft_observer,
+                pa=psi_ert_avg,
+                elon_min=el_min,
+                elon_max=el_max
+            )
             jmap, djmap = synth_imager_class.compute_jmap(model)
             cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+            fig, ax = synth_imager_class.plot_jmap(model, jmap, djmap)
+            plt.show()
 
             # Extract time and elongation profiles of synthetic HI-data
-            synth_imager_time = cme_profile["feature_00"]["t"][:]
-            synth_imager_elon = cme_profile["feature_00"]["e"][:]
+            try:
+                synth_imager_time = cme_profile["feature_00"]["t"][:]
+                synth_imager_elon = cme_profile["feature_00"]["e"][:]
+            except:
+                synth_imager_time = np.nan
+                synth_imager_elon = np.nan
+            else:
+                synth_imager_time = cme_profile["feature_00"]["t"][:]
+                synth_imager_elon = cme_profile["feature_00"]["e"][:]
 
         # Interpolate the synthetic elongations to observation times
-        synth_imager_elon_interp = np.interp(
-            self.obs_time_day.value, synth_imager_time, synth_imager_elon
-        )
+        cond1 = np.isnan(synth_imager_time)
+        cond2 = np.isnan(synth_imager_elon)
+        all_nan_cond = cond1.all() or cond2.all()
+        if not all_nan_cond:
+            synth_imager_elon_interp = np.interp(
+                self.obs_time_day.value, synth_imager_time, synth_imager_elon
+            )
+        else:
+            synth_imager_elon_interp = np.nan * np.ones(self.n_obs)
+
         flank_data = {
             "time": obs_time,
             "el": synth_imager_elon_interp,
@@ -310,20 +385,30 @@ class ObservationOperator:
             self,
             use_model: str,
             cme_par_dict: CmeParEns,
-            obs_radius: list[Quantity[u.AU]] | Quantity[u.AU],
-            obs_lon: list[Quantity[u.deg]] | Quantity[u.deg],
-            obs_lat: list[Quantity[u.deg]] | Quantity[u.deg],
             obs_time_in_datetime: list[datetime.datetime] | datetime.datetime,
-            obs_cov: npt.NDArray[float] | float = None,
-            surf_init_time: datetime.datetime = None,
-            vr_in: npt.NDArray[Quantity[u.km / u.s]] = None,
-            lon_start: Quantity[u.deg] = None,
-            lon_stop: Quantity[u.deg] = None,
-            sim_time: Quantity[u.day] = None,
-            dt_scale: int | float = None,
-            r_min: Quantity[u.solRad] = None,
-            cme_init_rad: Quantity[u.solRad] = None,
-            cme_fixed_duration:bool = True,
+            obs_cov: npt.NDArray[float] | float,
+            craft: str | None = None,
+            obs_radius: list[Quantity[u.AU]] | Quantity[u.AU]=1 * u.AU,
+            obs_lon: list[Quantity[u.deg]] | Quantity[u.deg]=0 * u.deg,
+            obs_lat: list[Quantity[u.deg]] | Quantity[u.deg]=0 * u.deg,
+            surf_init_time: datetime.datetime=datetime.datetime(2008, 1, 1, 0, 0, 0),
+            vr_in: npt.NDArray[Quantity[u.km / u.s]]=np.nan * u.km / u.s,
+            vr_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            vr_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            br_in: npt.NDArray[Quantity[u.nT]] | Quantity[u.nT]=np.nan * u.nT,
+            br_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            br_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
+            lon_start: Quantity[u.deg]=290 * u.deg,
+            lon_stop: Quantity[u.deg]=430 * u.deg,
+            n_lon_surf: int=128,
+            lat_min: Quantity[u.deg]=np.nan * u.deg,
+            lat_max: Quantity[u.deg]=np.nan * u.deg,
+            n_lat_surf: int=45,
+            sim_time: Quantity[u.day]=5.0 * u.day,
+            dt_scale: int | float=1.0,
+            r_min: Quantity[u.solRad]=21.5 * u.solRad,
+            cme_init_rad: Quantity[u.solRad]=12 * u.solRad,
+            cme_fixed_duration:bool=True,
             fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
             plot_surf_output: bool = False,
             bias_term_bool: bool = False,
@@ -335,14 +420,17 @@ class ObservationOperator:
         Class to get observations operator for DA from
          (what model thinks observations are)
         :param use_model: String to determine whether to use SURF, Compressible SURF or HUXt
+        :param obs_time_in_datetime: Times observations are taken
+        :param obs_cov: To be used with synthetic observations, an observation covariance matrix to be used to
+            add random noise to  truth CME elongations
+        :param craft: Spacecraft that HI observations are being taken from.
+            Possible inputs are Valid bodies are Earth, Venus, Mercury, STA, STB and twin.
+            (Twin for specifying synthetic observations)
         :param obs_radius: Observation radius in AU
         :param obs_lon: Longitude of observation source in degrees
         :param obs_lat: Latitude of observation source in degrees
-        :param obs_time_in_datetime: Times observations are taken
         :param cme_par_dict: To be used to create synthetic observations, a dictionary containing true parameters
             to create a truth CME simulation
-        :param obs_cov: To be used with synthetic observations, an observation covariance matrix to be used to
-            add random noise to  truth CME elongations
         :param surf_init_time: Initial datetime for SURF model
         :param vr_in: Velocities at the inner boundary of the SURF model domain
         :param lon_start: Longitude where we start the SURF simulation
@@ -380,28 +468,18 @@ class ObservationOperator:
 
         assert (self.solver in ["huxt", "hydro"])
 
-        if obs_radius is None:
-            self.obs_radius = 1 * u.AU
-        else:
-            self.obs_radius = obs_radius
-
-        if obs_lon is None:
-            self.obs_lon = 0 * u.deg
-        else:
-            self.obs_lon = obs_lon
-
-        if obs_lat is None:
-            self.obs_lat = 0 * u.deg
-        else:
-            self.obs_lat = obs_lat
-
         assert obs_time_in_datetime is not None
         self.obs_time_in_datetime: datetime.datetime | list[datetime.datetime] = obs_time_in_datetime
         self.obs_time_in_jd = Time(self.obs_time_in_datetime, format='datetime').jd
 
+
         if isinstance(self.obs_time_in_datetime, datetime.datetime):
+            self.obs_time_in_sec = (self.obs_time_in_datetime - surf_init_time).total_seconds() * u.s
             self.n_obs_in_time = 1
         elif isinstance(self.obs_time_in_datetime, list):
+            self.obs_time_in_sec = [
+                (t - surf_init_time).total_seconds() * u.s for t in self.obs_time_in_datetime
+            ]
             self.n_obs_in_time = len(self.obs_time_in_datetime)
         else:
             sys.exit(
@@ -409,73 +487,112 @@ class ObservationOperator:
                 " or a list. Exiting..."
             )
 
-
         # Define all variables required to initialise SURF are provided
         assert (all([cme_par_dict, obs_cov]) is not None)
         assert all(p in cme_par_dict.keys() for p in required_dict_keys())
 
+        # Read in CME parameter dictionary and obtain number of ensemble members
         self.cme_par_dict = cme_par_dict
-        self.obs_cov = obs_cov
         self.n_members = self.cme_par_dict["n_members"]
 
-        # Initialise default surf setup
-        if surf_init_time is None:
-            self.surf_init_time = datetime.datetime(2008, 1, 1, 0, 0, 0)
-        else:
-            self.surf_init_time = surf_init_time
+        # Initialise ambient solar wind conditions for SURF
+        self.vr_in = vr_in
+        self.vr_longs = vr_longs
+        self.vr_lats = vr_lats
+        self.br_in = br_in
+        self.br_longs = br_longs
+        self.br_lats = br_lats
 
-        if vr_in is None:
-            self.vr_in = np.ones(128) * 400 * u.km / u.s
-        else:
-            self.vr_in = vr_in
+        # Initialise SURF input parameters
+        self.surf_init_time = surf_init_time
+        self.lon_start = lon_start
+        self.lon_stop = lon_stop
+        self.n_lon_surf = n_lon_surf
+        self.lat_min = lat_min
+        self.lat_max = lat_max
+        self.n_lat_surf = n_lat_surf
+        self.sim_time = sim_time
+        self.dt_scale = dt_scale
+        self.r_min = r_min
+        self.cme_init_rad = cme_init_rad
+        self.cme_fixed_duration = cme_fixed_duration
+        self.fixed_duration = fixed_duration
 
-        if lon_start is None:
-            self.lon_start = 290 * u.deg
-        else:
-            self.lon_start = lon_start
+        self.carr_rot, self.carr_rot_lon_init = Sin.datetime2surfinputs(surf_init_time)
 
-        if lon_stop is None:
-            self.lon_stop = 380 * u.deg
-        else:
-            self.lon_stop = lon_stop
+        if self.lon_start > self.lon_stop:
+            self.lon_stop = self.lon_stop + 360 * u.deg
 
-        if sim_time is None:
-            self.sim_time = 5 * u.day
-        else:
-            self.sim_time = sim_time
+        if ~(np.isnan(self.lat_min) or np.isnan(self.lat_max)):
+            assert (self.lat_min < self.lat_max)
 
-        if dt_scale is None:
-            self.dt_scale = 20
+        # Initialise observation related quantities
+        if craft == "twin":
+            self.obs_radius = obs_radius
+            self.obs_lon = obs_lon
+            self.obs_lat = obs_lat
         else:
-            self.dt_scale = dt_scale
+            # Generate dummy model instance to get the craft's and Earth's position
+            dum_model = S.SURF(
+                v_boundary=np.ones(128) * 400 * u.km / u.s,
+                cr_num=self.carr_rot,
+                cr_lon_init=self.carr_rot_lon_init,
+            )
+            craft_observer = dum_model.get_observer(craft)
+            craft_observer_datetime: datetime.datetime = [
+                surf_init_time + datetime.timedelta(seconds=t_out.to('s').value)
+                for t_out in dum_model.time_out
+            ]
+            time_diffs = [
+                (cod - obs_time_in_datetime).total_seconds()
+                for cod in craft_observer_datetime
+            ]
 
-        if r_min is None:
-            self.r_min = 30 * u.solRad
-        else:
-            self.r_min = r_min
+            ind_req: int = int(np.argmin(
+                np.abs(time_diffs)
+            ))
+            self.obs_radius = craft_observer.r[ind_req].to(u.AU)
+            self.obs_lon = craft_observer.lon[ind_req].to(u.deg)
+            self.obs_lat = craft_observer.lat[ind_req].to(u.deg)
 
-        if cme_init_rad is None:
-            self.cme_init_rad = 12 * u.solRad
-        else:
-            self.cme_init_rad = cme_init_rad
+            craft_obs_class = SynthObsEphem(
+                surf_init_time=surf_init_time,
+                obs_times=self.obs_time_in_sec,
+                obs_rads=self.obs_radius,
+                obs_lats=self.obs_lat,
+                obs_lons=self.obs_lon,
+            )
 
-        if cme_fixed_duration is None:
-            self.cme_fixed_duration = False
-        else:
-            self.cme_fixed_duration = cme_fixed_duration
+            if use_model in ["compress_surf3d"]:
+                # Compute position angle of Earth from observing craft
+                self.ert_observer = dum_model.get_observer("EARTH")
+                self.psi_ert, self.elon_ert = Sim.compute_target_hpr_coords(craft_observer, self.ert_observer)
+                self.psi_ert_avg = np.mean(self.psi_ert.to(u.deg).value)
 
-        if fixed_duration is None:
-            self.fixed_duration = 12 * 60 * 60 * u.s
-        else:
-            self.fixed_duration = fixed_duration
+                # Setup a SyntheticImager3D class instance to get the min and max latitudes
+                # TODO: Remove hard-coded values for min and max elongations and buff_lat
+                print(f"psi_ert_avg = {self.psi_ert_avg}")
 
+                imgr = Sim.SyntheticImager3DOrig(
+                    craft_observer,#_class,
+                    pa=self.psi_ert_avg,
+                    elon_min=5.0,
+                    elon_max=30.0
+                )
+                buff_lat = 2.0 * u.deg
+                imgr._compute_fov_geometry(0)
+                self.lat_min = imgr.lat_grid.min().to(u.deg) - buff_lat
+                self.lat_max = imgr.lat_grid.max().to(u.deg) + buff_lat
+                print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
+
+        self.obs_cov = obs_cov
+
+        # Read in bias terms
         self.plot_surf_output = plot_surf_output
         self.bias_term_bool = bias_term_bool
         self.bias_term_5rs = bias_term_5rs
         self.bias_term_21rs = bias_term_21rs
 
-        self.use_parallel = use_parallel
-
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
             self.bias_term_bool = False
         self.bias_term_5rs = bias_term_5rs
@@ -483,6 +600,9 @@ class ObservationOperator:
 
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
             self.bias_term_bool = False
+
+        # Determine whether to use parallel computation for each ensemble member
+        self.use_parallel = use_parallel
 
 
     def extract_cme_launch_time_and_speed(self) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
@@ -663,7 +783,7 @@ class ObservationOperator:
         cme_thickness: list[Quantity[u.solRad]] = cme_pars[5]
 
         # Generate CME object
-        if self.use_model in ["surf", "compress_surf"]:
+        if self.use_model in ["surf", "compress_surf", "compress_surf3d"]:
             cme_objects: list[S.ConeCME] = [
                 S.ConeCME(
                     t_launch=cme_launch_time[i],
@@ -769,11 +889,18 @@ class ObservationOperator:
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["compress_surf3d"]:
+            print(f"lat_min={self.lat_min}, lat_max={self.lat_max}")
             model: SURF3d = setup_surf3d(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
+                vr_lons=self.vr_longs,
+                vr_lats=self.vr_lats,
+                lat_min=self.lat_min,
+                lat_max=self.lat_max,
+                n_lat_surf=self.n_lat_surf,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
+                n_lon_surf=self.n_lon_surf,
                 sim_time=3 * u.day,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
@@ -782,7 +909,12 @@ class ObservationOperator:
 
             # Run CME through SURF
             model.solve([cme])
-            cme_member: S.ConeCME = model.cmes[0]
+            cme_member: H.ConeCME = model.SURFlat[0].cmes[0]
+            """for i in range(len(model.SURFlat)):
+                print(f"i = {i}/{len(model.SURFlat)}, latitude = {model.SURFlat[i].latitude}")
+                for k, v in model.SURFlat[i].__dict__.items():
+                    print(f"{str(k)} = {str(v)}")
+            cme_member: S.ConeCME = model.cmes[0]"""
 
         elif self.use_model in ["huxt"]:
             model: HUXt = setup_huxt(
@@ -803,6 +935,8 @@ class ObservationOperator:
             cme_member = model.cmes[0]
             sys.exit("Unknown use_model name, expected either 'surf' or 'huxt'")
 
+        #print(f"self.use_model = {self.use_model}")
+        #print(f"model = {model}")
         if ens_no is not None:
             if np.mod(ens_no, 10) == 0:
                 print(f"Model solved cme_flank_ens_no: {ens_no}")
@@ -817,15 +951,17 @@ class ObservationOperator:
             )
             cme_flank: pd.DataFrame = observer_object.model_flank
 
-        elif self.use_model in ["compress_surf", "compress_surf3d"]:
+        elif self.use_model in ["compress_surf"]:
             obs_datetime = np.array(self.obs_time_in_datetime)
-            obs_radius = np.array(self.obs_radius) * u.AU
-            obs_longitude = np.array(self.obs_lon) * u.deg
-            obs_latitude = np.array(self.obs_lat) * u.deg
+            obs_radius = np.array(self.obs_radius.to(u.AU).value) * u.AU
+            obs_longitude = np.array(self.obs_lon.to(u.deg).value) * u.deg
+            obs_latitude = np.array(self.obs_lat.to(u.deg).value) * u.deg
 
+            # TODO: Remove hard-coded numbers input into el_min and el_max
             obs_synth_HI_class = ObserverSynthHI(
                 use_model=self.use_model,
                 model=model,
+                psi_ert_avg=self.psi_ert_avg,
                 obs_time=obs_datetime,
                 obs_radius=obs_radius,
                 obs_longitude=obs_longitude,
@@ -835,6 +971,57 @@ class ObservationOperator:
             )
             cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
 
+            if np.isnan(cme_flank['el'].values):
+                print("=====================================================")
+                print(f"Observation operator failed: ens_no = {ens_no}")
+                print(f"cme_t_init = {cme_member.t_launch}")
+                print(f"cme_speed = {cme_member.v}")
+                print(f"cme_width = {cme_member.width}")
+                print(f"cme_lon = {cme_member.longitude.to(u.deg)}")
+                print(f"cme_lat = {cme_member.latitude.to(u.deg)}")
+                print("=====================================================\n")
+        elif self.use_model in ["compress_surf3d"]:
+            obs_datetime = np.array(self.obs_time_in_datetime)
+            obs_radius = np.array(self.obs_radius.to(u.AU).value) * u.AU
+            obs_longitude = np.array(self.obs_lon.to(u.deg).value) * u.deg
+            obs_latitude = np.array(self.obs_lat.to(u.deg).value) * u.deg
+
+            # TODO: Remove hard-coded numbers input into el_min and el_max
+            obs_synth_HI_class = ObserverSynthHI(
+                use_model=self.use_model,
+                model=model,
+                psi_ert_avg=self.psi_ert_avg,
+                obs_time=obs_datetime,
+                obs_radius=obs_radius,
+                obs_longitude=obs_longitude,
+                obs_latitude=obs_latitude,
+                el_min=4.0,
+                el_max=30.0
+            )
+            cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
+
+            # Find lat nearest Earth's
+            id_lat = np.argmin(np.abs(
+                model.lat.to(u.deg).value - self.ert_observer.lat[0].to(u.deg).value
+            ))
+            model_ert_lat = model.SURFlat[id_lat]
+            obs_time_sec_from_start = (self.obs_time_in_datetime - self.surf_init_time).total_seconds()
+            _, _ = SA.plot_compressible(
+                model_ert_lat,
+                (obs_time_sec_from_start / (24 * 3600)) * u.day,
+                save=False
+            )
+            plt.show()
+
+            if np.isnan(cme_flank['el'].values):
+                print("=====================================================")
+                print(f"Observation operator failed: ens_no = {ens_no}")
+                print(f"cme_t_init = {cme_member.t_launch}")
+                print(f"cme_speed = {cme_member.v}")
+                print(f"cme_width = {cme_member.width}")
+                print(f"cme_lon = {cme_member.longitude.to(u.deg)}")
+                print(f"cme_lat = {cme_member.latitude.to(u.deg)}")
+                print("=====================================================\n")
         else:
             model = setup_huxt()
             cme_flank = pd.DataFrame()
@@ -848,7 +1035,6 @@ class ObservationOperator:
 
         if self.plot_surf_output:
             self.plot_surf(model)
-
 
         return cme_flank
 

@@ -43,8 +43,12 @@ class AuxPF:
             obs_time: datetime.datetime,
             true_cme_par_dict: CmeParEns = None,
             infl_fact: float = 1,
+            craft: str=None,
             pars_in_state: list[str] = ["v", "lon", "width"],
             vr_in: npt.NDArray[Quantity[u.km/u.s]]=np.zeros(128) + 400 * u.km / u.s,
+            vr_longs: npt.NDArray[Quantity[u.rad]]=np.nan * u.rad,
+            vr_lats: npt.NDArray[Quantity[u.rad]]=np.nan * u.rad,
+            n_lat_surf: int = 1,
             lon_start: Quantity[u.deg]=290 * u.deg,
             lon_stop: Quantity[u.deg]=380 * u.deg,
             time_tolerance: Quantity[u.day]=0.5 * u.day,
@@ -62,6 +66,7 @@ class AuxPF:
             rng=None
     ):
         self.use_model = use_model
+        self.craft = craft
         self.cme_par_dict:CmeParEns = cme_par_dict
 
         self.obs = obs
@@ -74,6 +79,9 @@ class AuxPF:
         self.infl_fact = infl_fact
         self.pars_in_state = pars_in_state
         self.vr_in = vr_in
+        self.vr_longs = vr_longs
+        self.vr_lats = vr_lats
+        self.n_lat_surf = n_lat_surf
         self.lon_start = lon_start
         self.lon_stop = lon_stop
         self.time_tolerance = time_tolerance
@@ -303,8 +311,12 @@ class AuxPF:
             obs_lat=self.obs_lat,
             obs_time_in_datetime=self.obs_time,
             obs_cov=self.obs_cov,
+            craft=self.craft,
             surf_init_time=self.surf_init_time,
             vr_in=self.vr_in,
+            vr_longs=self.vr_longs,
+            vr_lats=self.vr_lats,
+            n_lat_surf=self.n_lat_surf,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
             sim_time=self.sim_time,

@@ -29,7 +29,7 @@ from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 
 from da_surf_setup import Setup
-
+import time
 from multiprocessing import Pool
 
 env_path = Path('.', '.env')
@@ -55,16 +55,39 @@ class RunDataAssimilationRoutine:
         surf_par_dict = self.setup_class.surf_par_dict
         self.use_model: str = surf_par_dict["use_model"]
         self.surf_init_time: datetime.datetime = surf_par_dict["surf_init_time"]
-        self.vr_in: npt.NDArray[Quantity[u.km / u.s]] = surf_par_dict["vr_in"]
-        self.n_lon: int = len(self.vr_in)
+        self.vr_in: npt.NDArray[Quantity[u.km / u.s]] | Quantity[u.km / u.s] = surf_par_dict["vr_in"]
+        self.vr_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg] = surf_par_dict["vr_longs"]
+        self.vr_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg] = surf_par_dict["vr_lats"]
+        self.br_in: npt.NDArray[Quantity[u.nT]] | Quantity[u.nT] = surf_par_dict["br_in"]
+        self.br_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg] = surf_par_dict["br_longs"]
+        self.br_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg] = surf_par_dict["br_lats"]
         self.lon_start: Quantity[u.deg] = surf_par_dict["lon_start"]
         self.lon_stop: Quantity[u.deg] = surf_par_dict["lon_stop"]
+        self.latitude_min: Quantity[u.deg] = surf_par_dict["latitude_min"]
+        self.latitude_max: Quantity[u.deg] = surf_par_dict["latitude_max"]
+        self.n_lat_surf: int = surf_par_dict["n_lat_surf"]
         self.sim_time: Quantity[u.days] = surf_par_dict["sim_time"]
         self.dt_scale: int | float = surf_par_dict["dt_scale"]
         self.r_min: Quantity[u.solRad] = surf_par_dict["r_min"]
         self.cme_init_rad: Quantity[u.solRad] = surf_par_dict["cme_init_rad"]
         self.cme_fixed_duration: bool = surf_par_dict["cme_fixed_duration"]
         self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
+
+        if isinstance(self.vr_longs.value, float):
+            self.lon_in:int = 1
+        else:
+            if not np.all(np.isnan(self.vr_longs)):
+                self.n_lon_in: int = len(self.vr_longs)
+            else:
+                self.n_lon_in: int = len(self.vr_in)
+
+        if isinstance(self.vr_lats.value, float):
+            self.lat_in:int = 1
+        else:
+            if not np.all(np.isnan(self.vr_lats)):
+                self.n_lat_in: int = len(self.vr_lats)
+            else:
+                self.n_lat_in: int = 1
 
         # Initialise observation variables
         obs_par_dict = self.setup_class.obs_par_dict
@@ -74,6 +97,8 @@ class RunDataAssimilationRoutine:
         self.obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] = obs_par_dict["obs_lat"]
         self.obs_cov: float | npt.NDArray[float] = obs_par_dict["obs_cov"]
         self.obs_times: list[datetime.datetime] = obs_par_dict["obs_times"]
+        self.elong_min: float = obs_par_dict["elong_min"]
+        self.elong_max: float = obs_par_dict["elong_max"]
         self.use_synthetic_obs: bool = obs_par_dict["use_synthetic_obs"]
         self.obs_filenames: list[str] = obs_par_dict["obs_filenames"]
         self.obs_rng_seed: int = obs_par_dict["obs_rng_seed"]
@@ -119,6 +144,13 @@ class RunDataAssimilationRoutine:
             self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
             self.observations: list[float] = obs_tuple[2]
             self.n_obs: int = obs_tuple[3]
+
+            if not isinstance(self.obs_radius, list):
+                print("Hi")
+                self.obs_radius = [self.obs_radius for _ in range(self.n_obs)]
+
+            if not isinstance(self.obs_lat, list):
+                self.obs_lat = [self.obs_lat for _ in range(self.n_obs)]
 
 
         # Generate first-guess cme_parameters (which OSSE draws priors around)
@@ -236,6 +268,47 @@ class RunDataAssimilationRoutine:
 
         return output_dir
 
+    def obs_in_elong_range(
+            self,
+            obs_val: float,
+            inclusive_lower: bool=True,
+            inclusive_upper: bool=True
+    ) -> bool:
+        """
+        Helper function for get_observations to simplify list comprehension and determine whether
+         an observation is in the desired elongation range
+        :param obs_val: Elongation observation in degrees
+        :param inclusive_lower: Boolean to determine whether lower bound is inclusive
+        :param inclusive_upper: Boolean to determine whether upper bound is inclusive
+        :return: elong_in_range_bool: bool: Boolean that shows if obs is in the range specified (True) or not (False)
+        """
+        # Initialise output variables
+        greater_than_lower_elong: bool = False
+        lower_than_upper_elong: bool = False
+        elong_in_range: bool = False
+
+        # Determine whether elongation obs. is greater than the lower bound
+        if inclusive_lower:
+            if obs_val >= self.elong_min:
+                greater_than_lower_elong = True
+        else:
+            if obs_val > self.elong_min:
+                greater_than_lower_elong = True
+
+        # Determine whether elongation obs is lower than the upper bound
+        if inclusive_upper:
+            if obs_val <= self.elong_max:
+                lower_than_upper_elong = True
+        else:
+            if obs_val < self.elong_max:
+                lower_than_upper_elong = True
+
+        # Determine whether elongation is within the required range
+        if (greater_than_lower_elong & lower_than_upper_elong):
+            elong_in_range = True
+
+        return elong_in_range
+
 
     def get_observations(self) -> (
             list[float] | tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float], int]
@@ -244,6 +317,7 @@ class RunDataAssimilationRoutine:
         Function to get observations from files or generate synthetic observations
         :return: observations: Observations to be assimilated
         """
+
         # Initialise observations
         obs_class = Observations(
             use_model=self.use_model,
@@ -276,9 +350,22 @@ class RunDataAssimilationRoutine:
             obs_out = obs_class.observations
             return obs_out
         else:
-            obs_out = obs_class.observations
-            obs_times_out = obs_class.obs_times_in_datetime
-            obs_lon_out = obs_class.obs_lon
+            obs = obs_class.observations
+            obs_times = obs_class.obs_times_in_datetime
+            obs_lon = obs_class.obs_lon
+
+            # Limit the observations to be assimilated to the range of elong_min - elong_max
+            obs_times_out = [
+                x for i, x in enumerate(obs_times) if self.obs_in_elong_range(obs_val=obs[i])
+            ]
+            obs_lon_out = [
+                x for i, x in enumerate(obs_lon) if self.obs_in_elong_range(obs_val=obs[i])
+            ]
+            obs_out = [
+                x for x in obs if ((x >= self.elong_min) & (x <= self.elong_max))
+            ]
+
+
             n_obs = len(obs_out)
 
             assert len(obs_times_out) == n_obs
@@ -510,37 +597,53 @@ class RunDataAssimilationRoutine:
 
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
-
-                aux_pf_class = AuxPF(
-                    use_model=self.use_model,
-                    cme_par_dict=cme_par_dict,
-                    obs=obs,
-                    obs_cov=self.obs_cov,
-                    obs_radius=self.obs_radius[yi],
-                    obs_lon=self.obs_lon[yi],
-                    obs_lat=self.obs_lat[yi],
-                    obs_time=self.obs_times[yi],
-                    true_cme_par_dict=self.true_cme_par_dict,
-                    infl_fact=1,
-                    pars_in_state=self.pars_in_state,
-                    vr_in=self.vr_in,
-                    lon_start=self.lon_start,
-                    lon_stop=self.lon_stop,
-                    time_tolerance=self.time_tolerance,
-                    dt_scale=self.dt_scale,
-                    delta_aux_pf=self.delta_aux_pf,
-                    r_min=self.r_min,
-                    cme_init_rad=self.cme_init_rad,
-                    cme_fixed_duration = self.cme_fixed_duration,
-                    fixed_duration=self.fixed_duration,
-                    bias_term_bool=self.bias_term_bool,
-                    bias_term_5rs=self.bias_term_5rs,
-                    bias_term_21rs=self.bias_term_21rs,
-                    use_parallel=self.use_parallel,
-                    rng=rng
+                # Initial conditions for running the DA, that the observation time is after
+                #  the first-guess of the CME launch and that the observation is in the
+                #  set [elong_min, elong_max]
+                fg_cme_init_cond = self.obs_times[yi] > self.fg_mean_cme_t_init
+                obs_in_elon_range_cond = (
+                    (obs >= self.elong_min) and (obs <= self.elong_max)
                 )
 
-                cme_par_dict = aux_pf_class.aux_pf()
+                if fg_cme_init_cond and obs_in_elon_range_cond:
+                    aux_pf_class = AuxPF(
+                        use_model=self.use_model,
+                        cme_par_dict=cme_par_dict,
+                        obs=obs,
+                        obs_cov=self.obs_cov,
+                        obs_radius=self.obs_radius[yi],
+                        obs_lon=self.obs_lon[yi],
+                        obs_lat=self.obs_lat[yi],
+                        obs_time=self.obs_times[yi],
+                        craft=self.craft,
+                        true_cme_par_dict=self.true_cme_par_dict,
+                        infl_fact=1,
+                        pars_in_state=self.pars_in_state,
+                        vr_in=self.vr_in,
+                        vr_longs=self.vr_longs,
+                        vr_lats=self.vr_lats,
+                        n_lat_surf=self.n_lat_surf,
+                        lon_start=self.lon_start,
+                        lon_stop=self.lon_stop,
+                        time_tolerance=self.time_tolerance,
+                        dt_scale=self.dt_scale,
+                        delta_aux_pf=self.delta_aux_pf,
+                        r_min=self.r_min,
+                        cme_init_rad=self.cme_init_rad,
+                        cme_fixed_duration = self.cme_fixed_duration,
+                        fixed_duration=self.fixed_duration,
+                        bias_term_bool=self.bias_term_bool,
+                        bias_term_5rs=self.bias_term_5rs,
+                        bias_term_21rs=self.bias_term_21rs,
+                        use_parallel=self.use_parallel,
+                        rng=rng
+                    )
+
+                    cme_par_dict = aux_pf_class.aux_pf()
+                elif fg_cme_init_cond:
+                    print("Obs time before CME is expected to be in SURF model domain")
+                elif obs_in_elon_range_cond:
+                    print("Observation is outside the permitted elongation range for the model")
 
                 # Standardise the units and remove the astropy units
                 cme_saved_pars[yi + 1, :, 0] = [
@@ -569,26 +672,75 @@ class RunDataAssimilationRoutine:
 
             # Save cme_parameters into a .nc file
             # Make an xarray object
-            cme_par_ds = xr.Dataset(
-                data_vars=dict(
-                    model_init_time=self.surf_init_time,
-                    cme_init_rad=self.cme_init_rad,
-                    r_min=self.r_min,
-                    ambient_vr=(["n_lon"], self.vr_in),
-                    t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
-                    v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
-                    width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
-                    lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
-                    lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
-                    thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
-                    log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
-                ),
-                coords=dict(
-                    obs_no=("n_obs", range(self.n_obs + 1)),
-                    ens_no=("n_ens", range(self.n_members)),
-                    surf_lon=("n_lon", (2 * np.pi / self.n_lon) * np.arange(self.n_lon)),
-                ),
-            )
+            if self.use_model in ["surf", "huxt"]:
+                cme_par_ds = xr.Dataset(
+                    data_vars=dict(
+                        model_init_time=self.surf_init_time,
+                        cme_init_rad=self.cme_init_rad,
+                        r_min=self.r_min,
+                        ambient_vr=(["n_lon"], self.vr_in),
+                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
+                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
+                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
+                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
+                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
+                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
+                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
+                    ),
+                    coords=dict(
+                        obs_no=("n_obs", range(self.n_obs + 1)),
+                        ens_no=("n_ens", range(self.n_members)),
+                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
+                    ),
+                )
+            elif self.use_model in ["compress_surf"]:
+                cme_par_ds = xr.Dataset(
+                    data_vars=dict(
+                        model_init_time=self.surf_init_time,
+                        cme_init_rad=self.cme_init_rad,
+                        r_min=self.r_min,
+                        ambient_vr=(["n_lon"], self.vr_in),
+                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
+                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
+                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
+                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
+                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
+                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
+                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
+                    ),
+                    coords=dict(
+                        obs_no=("n_obs", range(self.n_obs + 1)),
+                        ens_no=("n_ens", range(self.n_members)),
+                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
+                    ),
+                )
+            elif self.use_model in ["compress_surf3d"]:
+                print(np.shape(self.vr_in))
+                print(f"{self.n_lon_in}, {self.n_lat_in}")
+                cme_par_ds = xr.Dataset(
+                    data_vars=dict(
+                        model_init_time=self.surf_init_time,
+                        cme_init_rad=self.cme_init_rad,
+                        r_min=self.r_min,
+                        ambient_vr=(["n_lat", "n_lon"], self.vr_in),
+                        vr_longs=(["n_lon"], self.vr_longs),
+                        vr_lats=(["n_lat"], self.vr_lats),
+                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
+                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
+                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
+                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
+                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
+                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
+                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
+                    ),
+                    coords=dict(
+                        obs_no=("n_obs", range(self.n_obs + 1)),
+                        ens_no=("n_ens", range(self.n_members)),
+                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
+                        surf_lat=("n_lat", range(self.n_lat_in)),
+                    ),
+                )
+
             print(cme_par_ds)
             outParFile = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode='w')
@@ -599,9 +751,11 @@ class RunDataAssimilationRoutine:
 def main():
     print_environment_variables()
     setup_class = Setup()
+    da_par_dict = setup_class.da_par_dict
+
     run_da_class = RunDataAssimilationRoutine()
 
-    run_start = 75
+    run_start = da_par_dict["run_start"]
 
     if setup_class.get_use_synthetic_obs():
         run_da_class.run_data_assimilation(run_start=run_start)
