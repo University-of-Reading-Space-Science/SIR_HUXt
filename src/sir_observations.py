@@ -1,8 +1,28 @@
+"""
+sir_observations.py
+
+Observations to assimilate: CME elongations (deg) and the times / observer positions they were taken at.
+
+``Observations`` either
+  * makes synthetic observations (OSSE / twin experiments): runs the observation operator for the
+    "truth" CME and adds Gaussian noise with variance ``obs_cov``; or
+  * reads real observations from file:
+      - Solar Stormwatch (SSW) HDF5 classifications for events ssw_007/008/009/012
+        (``read_obs_from_file``), or
+      - whitespace-separated text files "<index> <ISO time> <elongation> <observer lon>"
+        (``l5_read_obs_from_file``, used for all other events).
+
+``get_ssw_profile`` is an older stand-alone SSW reader kept for reference.
+"""
+import datetime
+import os
+import sys
+
 import numpy as np
 import numpy.typing as npt
-import datetime
-import sys
-from typing import Generator
+from numpy.random import Generator
+import pandas as pd
+import tables
 
 import huxt.huxt as H
 import surf.surf as S
@@ -10,21 +30,25 @@ import surf.surf as S
 from huxt.huxt import Observer as Hobs
 from surf.surf import Observer as Sobs
 
-import pandas as pd
-import os
 from stereo_spice.coordinates import StereoSpice
 
 from astropy.time import Time
 import astropy.units as u
 from astropy.units import Quantity
-import tables
 
 from cme_par_ens import CmeParEns
 from sir_observation_operator import ObservationOperator
 from cme_par_dict_structure import required_dict_keys
 
 
-def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
+def get_ssw_profile(
+        use_model: str,
+        ssw_event: str,
+        craft: str,
+        img: str,
+        pa_center: float,
+        pa_wid: float = 1.0
+) -> pd.DataFrame:
     """
     Compute the Solar Stormwatch profile of the CME along a fixed position angle window, for either STA or STB.
     Parameters
@@ -62,7 +86,15 @@ def get_ssw_profile(use_model, ssw_event, craft, img, pa_center, pa_wid=1.0):
         ssw_out.close()
 
 
-def _read_ssw_profile(ssw_out, ssw_event, craft, img, pa_center, pa_wid):
+def _read_ssw_profile(
+        ssw_out: tables.File,
+        ssw_event: str,
+        craft: str,
+        img: str,
+        pa_center: float,
+        pa_wid: float
+) -> pd.DataFrame:
+    """Read the SSW profile from an open HDF5 file (see get_ssw_profile)."""
 
     # Pull out ssw_event
     ssw_path = "/".join(['', ssw_event, craft, img])
@@ -105,47 +137,55 @@ def _read_ssw_profile(ssw_out, ssw_event, craft, img, pa_center, pa_wid):
 
 
 class Observations:
+    """
+    Observations to be assimilated (synthetic or read from file); see the module docstring.
+
+    After construction:
+        self.observations          : list of elongations (deg)
+        self.obs_times_in_datetime : observation times
+        self.obs_lon (/ obs_lat)   : observer position(s) (updated from file for real observations)
+    """
     def __init__(
             self,
             use_model: str,
-            obs_radius: Quantity[u.AU] | list[Quantity[u.AU]]=None,
-            obs_lon: Quantity[u.deg] | list[Quantity[u.deg]]=None,
-            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]]=None,
-            obs_times_in_datetime: datetime.datetime | list[datetime.datetime]=None,
-            obs_filenames: list[str] | str=None,
+            obs_radius: Quantity[u.AU] | list[Quantity[u.AU]] | None = None,
+            obs_lon: Quantity[u.deg] | list[Quantity[u.deg]] | None = None,
+            obs_lat: Quantity[u.deg] | list[Quantity[u.deg]] | None = None,
+            obs_times_in_datetime: datetime.datetime | list[datetime.datetime] | None = None,
+            obs_filenames: list[str] | str | None = None,
             use_synthetic_obs: bool=False,
-            true_cme_par_dict: CmeParEns=None,
-            obs_cov: npt.NDArray[float] | float=None,
-            surf_init_time: datetime.datetime=None,
-            vr_in: npt.NDArray[Quantity[u.km / u.s]]=None,
+            true_cme_par_dict: CmeParEns | None = None,
+            obs_cov: npt.NDArray[float] | float | None = None,
+            surf_init_time: datetime.datetime | None = None,
+            vr_in: npt.NDArray[Quantity[u.km / u.s]] | None = None,
             vr_longs: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
             vr_lats: npt.NDArray[Quantity[u.deg]] | Quantity[u.deg]=np.nan * u.deg,
             n_lat_surf: int=45,
-            lon_start: Quantity[u.deg]=None,
-            lon_stop: Quantity[u.deg]=None,
-            sim_time: Quantity[u.day]=None,
-            dt_scale: int|float=None,
-            r_min: Quantity[u.solRad]=None,
-            cme_init_rad: Quantity[u.solRad]=None,
-            cme_fixed_duration:bool = None,
-            fixed_duration: Quantity[u.s] = None,
+            lon_start: Quantity[u.deg] | None = None,
+            lon_stop: Quantity[u.deg] | None = None,
+            sim_time: Quantity[u.day] | None = None,
+            dt_scale: int | float | None = None,
+            r_min: Quantity[u.solRad] | None = None,
+            cme_init_rad: Quantity[u.solRad] | None = None,
+            cme_fixed_duration: bool | None = None,
+            fixed_duration: Quantity[u.s] | None = None,
             plot_surf_output: bool=False,
-            obs_rng_seed: int=None,
-            ssw_event: str=None,
-            craft:str=None,
-            img:str=None,
+            obs_rng_seed: int | None = None,
+            ssw_event: str | None = None,
+            craft: str | None = None,
+            img: str | None = None,
             use_parallel: bool=False,
     ) -> None:
         """
-        Class to get observations for DA from
-        :param use_model: String to determine which model to use, possible models are ['surf', 'compress_surf', 'huxt']
-        :param use_model: String to determine which model to use, possible models are ['surf', 'compress_surf', 'huxt']
+        Make synthetic observations or read real ones from file.
+        Missing synthetic-run settings fall back to the defaults below (e.g. 400 km/s wind from 2008-01-01).
+        :param use_model: Model to use: 'surf', 'compress_surf', 'compress_surf3d' or 'huxt'
+        :param obs_radius, obs_lat: Observer distance and latitude
         :param obs_lon: Longitude of observation source
         :param obs_times_in_datetime: Times observations are taken
         :param obs_filenames: A list of observation filenames that observations are to be read from
-        :param use_synthetic_obs: A boolean indicating whether to use synthetic observations, this overrides
-                                  obs_filenames and if set to False, will use synthetic observations
-                                  even if obs_filenames are specified
+        :param use_synthetic_obs: Use synthetic observations. NB: synthetic observations are also used
+                                  whenever obs_filenames is None
         :param true_cme_par_dict: To be used to create synthetic observations, a dictionary containing true parameters
             to create a truth CME simulation
         :param obs_cov: To be used with synthetic observations, an observation covariance matrix to be used to
@@ -163,6 +203,8 @@ class Observations:
         :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
         :param rng_seed: Seed to use for random number generator
         :param use_parallel: Boolean to determine whether to use parallel execution if using synthetic observations
+        :param vr_longs, vr_lats, n_lat_surf: Inner-boundary coordinates / grid size (compress_surf3d)
+        :param ssw_event, craft, img: Event id, spacecraft ("sta"/"stb") and image type ("diff"/"norm")
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
             INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE IN CASE OF REAL OBS
         :TODO: Change such that observations are downloaded if need be
@@ -301,13 +343,12 @@ class Observations:
 
     def make_synthetic_obs(self) -> list[float]:
         """
-        Function to create synthetic observations
-        :param rng: Current seed of the random number generator
-        :param plot_surf: Boolean to determine whether to plot the SURF output at observation times
-        :return: synth_obs: List of synthetic observations
+        Create synthetic observations: the truth CME's modelled elongation at each observation time
+        plus Gaussian noise with standard deviation sqrt(obs_cov) (drawn from self.rng).
+        :return: synth_obs: List of synthetic observations (deg)
         """
 
-        # Initialise an observation operator instance
+        # Run the observation operator for the truth CME (a single "member")
         obs_op_obj = ObservationOperator(
             use_model=self.use_model,
             cme_par_dict = self.true_cme_par_dict,
@@ -348,6 +389,12 @@ class Observations:
 
 
     def read_obs_from_file(self) -> tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]]:
+        """
+        Read Solar Stormwatch observations from the HDF5 file(s): for each frame, average the
+        elongation within +/-1 deg of the position angle of Earth as seen from the craft.
+        Frames with no valid elongation are dropped.
+        :return: obs_times, obs_lon (craft longitude per frame), elongations (deg)
+        """
 
         times_datetime = []
         el_best = []
@@ -413,7 +460,13 @@ class Observations:
     def l5_read_obs_from_file(
             self,
             obs_lat: float=0.0
-    ) -> tuple[list[datetime.datetime], list[Quantity[u.deg]], list[float]]:
+    ) -> tuple[list[datetime.datetime], list[float], list[float], list[float]]:
+        """
+        Read observations from text file(s) with lines "<index> <ISO time> <elongation> <observer lon>".
+        Lines with NaN elongation are dropped.
+        :param obs_lat: Observer latitude assigned to every observation
+        :return: obs_times, obs_lon, obs_lat, elongations (NB: longitudes/latitudes are plain floats, no units)
+        """
         times_datetime = []
         elong = []
         obs_lon = []
@@ -434,10 +487,10 @@ class Observations:
             x for i, x in enumerate(times_datetime) if ~np.isnan(elong[i])
         ]
         obs_lon_out = [
-            x for i, x in enumerate(obs_lon) if ~np.isnan(elong[i])
+            x * u.deg for i, x in enumerate(obs_lon) if ~np.isnan(elong[i])
         ]
         obs_lat_out = [
-            obs_lat for i, _ in enumerate(elong) if ~np.isnan(elong[i])
+            obs_lat * u.deg for i, _ in enumerate(elong) if ~np.isnan(elong[i])
         ]
         obs_out = [
             x for i, x in enumerate(elong) if ~np.isnan(elong[i])
@@ -446,7 +499,8 @@ class Observations:
         return obs_times_out, obs_lon_out, obs_lat_out, obs_out
 
 
-def main():
+def main() -> None:
+    """Example: read the SSW observations of ssw_012 from STEREO-B."""
     h5_file_path = os.path.join(
         "C:\\", "Users", "ss905122", "PycharmProjects",
         "SIR_HUXt", "SSW_cme_classifications.hdf5"

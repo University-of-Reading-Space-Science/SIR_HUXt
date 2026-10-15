@@ -1,7 +1,16 @@
+"""
+wsa_reader.py
+
+Download WSA (Wang-Sheeley-Arge) GONG solar-wind speed maps from the CCMC ISWA data tree.
+
+``ReadWSAFiles(date).download_file()`` finds the most recent WSA FITS file at or before ``date``
+(looking in the previous month's directory too, early in a month) and saves it to ``output_dir``.
+The files are named ``vel_YYYYMMDDHHMMRxxx_gong.fits``.
+"""
 import os
+import re
 from datetime import datetime
 from pathlib import Path
-import re
 from urllib.parse import urljoin
 
 import surf.surf_inputs as Sin
@@ -12,7 +21,12 @@ from bs4 import BeautifulSoup
 
 
 class ReadWSAFiles():
-    def __init__(self, date_required, output_dir=None):
+    """Locate and download the WSA GONG velocity map closest to (at or before) a required date."""
+    def __init__(self, date_required: datetime, output_dir: str | Path | None = None) -> None:
+        """
+        :param date_required: Datetime the WSA map is required for
+        :param output_dir: Directory to save the downloaded FITS file in (default: current directory)
+        """
         self.base_url = (
             "https://iswa.ccmc.gsfc.nasa.gov/"
             "iswa_data_tree/model/solar/WSA4.5/"
@@ -33,7 +47,11 @@ class ReadWSAFiles():
             os.makedirs(self.output_dir)
 
 
-    def get_wsa_url(self):
+    def get_wsa_url(self) -> tuple[str, str]:
+        """
+        Build the ISWA directory URLs for the month of self.date_required and the previous month.
+        :return: wsa_url, wsa_url_prev_month
+        """
         year_req = self.date_required.year
         month_req = self.date_required.month
 
@@ -52,10 +70,11 @@ class ReadWSAFiles():
         return wsa_url, wsa_url_prev_month
 
 
-    def list_files(self, url=None):
+    def list_files(self, url: str | None = None) -> list[dict]:
         """
-        Get all files in the directory and extract timestamps.
+        List the WSA FITS files in an ISWA directory and extract their timestamps.
         :param url: Directory URL to list (defaults to the month of self.date_required)
+        :return: List of {"datetime", "filename", "url"} dictionaries, sorted by datetime
         """
         if url is None:
             url = self.wsa_url
@@ -105,9 +124,10 @@ class ReadWSAFiles():
         return files
 
 
-    def find_file(self):
+    def find_file(self) -> dict:
         """
-        Find file at or immediately before self.date_required.
+        Find the file at or immediately before self.date_required.
+        :return: {"datetime", "filename", "url"} dictionary of the selected file
         """
 
         files = self.list_files()
@@ -133,9 +153,10 @@ class ReadWSAFiles():
         return candidates[-1]
 
 
-    def download_file(self):
+    def download_file(self) -> Path:
         """
-        Download the closest file at or before self.date_required.
+        Download the closest file at or before self.date_required (streamed in 1 MB chunks).
+        :return: Path of the downloaded file
         """
 
         file_info = self.find_file()

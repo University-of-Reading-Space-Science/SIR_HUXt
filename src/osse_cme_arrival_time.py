@@ -1,36 +1,30 @@
-import glob
-import os
-import sys
-import json
-from collections import defaultdict, ChainMap
+"""
+osse_cme_arrival_time.py
 
-from IPython.core.pylabtools import figsize
-from astropy.time import Time
-import astropy.units as u
-import h5py
-import matplotlib.pyplot as plt
+Summarise CME arrival-time and arrival-speed errors over several DA runs: reads each run's
+``cme_arrival_stats.json`` (written by osse_arrival.get_cme_arrival_time), combines them and plots
+histograms of the prior / posterior arrival-time errors (all members, run means, run medians) and
+arrival speeds.
+
+Edit the settings at the top of ``main()`` (model, event, ensemble size, runs, paths).
+"""
 import datetime
-import matplotlib as mpl
+import json
+import os
+from collections import ChainMap
+
+import matplotlib.pyplot as plt
 import numpy as np
 
-import huxt.huxt as H
-import surf.surf as S
-import xarray as xr
-import scipy.stats as st
-
-import sunpy.coordinates.sun as sn
-import seaborn as sns
-import pandas as pd
-import holoviews as hv
-import colorcet as cc
-import weightedstats as wst
-
-from colorcet.plotting import sine_combs
-from sunpy.coordinates.sun import orientation
-from multiprocessing import Pool
 
 
-def flatten_nested(nested):
+
+def flatten_nested(nested: list) -> list:
+    """
+    Flatten arbitrarily nested lists, e.g. [[1, [2, 3]], 4] -> [1, 2, 3, 4] (iteratively, no recursion).
+    :param nested: (Nested) list
+    :return: flat: Flat list of the non-list items, in order
+    """
     flat = []
     stack = [iter(nested)]
     while stack:
@@ -44,7 +38,11 @@ def flatten_nested(nested):
     return flat
 
 
-def main():
+def main() -> None:
+    """Combine the arrival statistics of the configured runs and plot the histograms."""
+    # ---------------------------------------------------------------------------------
+    # Settings
+    # ---------------------------------------------------------------------------------
     use_model = "compress_surf"
     event = "04B"
     n_ens = 50
@@ -60,6 +58,7 @@ def main():
         true_cme_thick = 0.0
         truth_dir = "truth_495.0_37.4_0.0_0.0_0.0"
         prior_dir = "prior_495.0_37.4_0.0_-2.9_0.0"
+        obs_dir_name = truth_dir  # twin output lives under truth_<...>, not obs_<...>
         real_arrival_time = datetime.datetime(2012, 1, 4, 3, 12, 10)
     else:
         obs_dir_name = "obs_stb_04B_diff"
@@ -78,6 +77,9 @@ def main():
         obs_dir_name,  # "New folder",
         prior_dir, "0.98",
     )
+    # ---------------------------------------------------------------------------------
+    # Read each run's statistics and merge them into one dictionary of lists
+    # ---------------------------------------------------------------------------------
     cme_dict_list = []
     for runNo in range(start_run, start_run + n_runs):
         out_dir_path = os.path.join(base_file_path, f"run_{runNo:03d}")
@@ -97,13 +99,8 @@ def main():
             },
             {key: dict2[key] for key in dict2 if key not in dict1}
         ))
-    # res = defaultdict(list)
-    # for d in cme_dict_list:
-    #     for k, v in d.items():
-    #         res[k].extend(v)
 
     print(f"dict_val = {dict(dict1)}")
-    #print(np.shape(dict1["prior_cme_arrival_s_from_20000101"]))
 
     if n_runs > 1:
         for key in dict1:
@@ -111,6 +108,10 @@ def main():
 
     print(dict1)
 
+    # ---------------------------------------------------------------------------------
+    # Arrival-time errors (hours) relative to the observed / true arrival time
+    #  (arrival times are stored as seconds after 2000-01-01)
+    # ---------------------------------------------------------------------------------
     base_time = datetime.datetime(2000,1, 1, 0,0,0)
 
     seconds_real_arr_from_base = (real_arrival_time - base_time).total_seconds()
@@ -124,7 +125,6 @@ def main():
     median_prior_arrival_times_flat = np.array(dict1["median_prior_arrival"]).flatten()
     median_post_arrival_times_flat = np.array(dict1["median_post_arrival"]).flatten()
 
-    #print(prior_arrival_times_flat)
     hours_prior_arrival_time_err = [
         (prior_arrival_times_flat[i] - seconds_real_arr_from_base) / 3600.0
         for i in range(n_runs * n_ens)
@@ -166,16 +166,11 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("Count", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("Arrival time error (hours)", fontsize=28)
     ax[-1].set_xlim([-20, 20])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
     plt.close(fig)
-    sys.exit()
 
     max_y_axis = 20
     fig, ax = plt.subplots(figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained")
@@ -191,10 +186,6 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("Count", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("Arrival time error (hours)", fontsize=28)
     ax[-1].set_xlim([-10, 10])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
@@ -215,20 +206,15 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("Count", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("Arrival time error (hours)", fontsize=28)
     ax[-1].set_xlim([-10, 10])
     ax[1].plot([0, 0], [0, max_y_axis], color='red', linestyle='dashed')
     plt.show()
     plt.close(fig)
 
-    # prior_arrival_speed_flat = np.array(dict1["prior_cme_arrival_s_from_20000101"]).flatten()
-    # post_arrival_speed_flat = np.array(dict1["post_cme_arrival_s_from_20000101"]).flatten()
-
-    ################################################################################################
+    # ---------------------------------------------------------------------------------
+    # Arrival speeds
+    # ---------------------------------------------------------------------------------
     real_speed = 519.3605577633269
     prior_arrival_speed_flat = np.array(dict1["prior_arrival_speed"]).flatten()
     post_arrival_speed_flat = np.array(dict1["post_arrival_speed"]).flatten()
@@ -256,10 +242,6 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("Count", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("CME Arrival Speed (km/s)", fontsize=28)
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
@@ -280,10 +262,6 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("No. of particles", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("Arrival CME speed (km/s)", fontsize=28)
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
@@ -304,10 +282,6 @@ def main():
     ax[1].set_ylim([0, max_y_axis])
     ax[1].set_ylabel("Count", fontsize=28)
     ax[1].tick_params(axis='both', which='major', labelsize=24)
-    # if len(weights_post_plot) > 0:
-    #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-    # ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-    # ax[2].set_ylim([0, 1])
     ax[-1].set_xlabel("Arrival CME speed (km/s)", fontsize=28)
     ax[-1].set_xlim([475, 575])
     ax[1].plot([real_speed, real_speed], [0, max_y_axis], color='red', linestyle='dashed')
@@ -319,4 +293,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

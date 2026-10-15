@@ -1,3 +1,11 @@
+"""
+calibration_osse.py
+
+LEGACY: calibration OSSEs for the original single-observer HUXt SIR scheme (sir_huxt_mono_obs.py).
+Runs the SIR repeatedly for one truth CME scenario seen from a range of observer longitudes, in parallel.
+Not used by the current Aux-PF pipeline (data_assimilation_routine.py). Also needs the moviepy /
+sklearn dependencies of sir_huxt_mono_obs, and ``np.NaN`` below requires NumPy < 2.
+"""
 import os
 import glob
 import itertools
@@ -16,11 +24,12 @@ import huxt.huxt as H
 import huxt.huxt_analysis as HA
 import sir_huxt_mono_obs as sir
 
-def calibration_osse(params):
+def calibration_osse(params: tuple[str, float]) -> None:
     """
     Run the SIR scheme repeatedly for guesses at one truth CME and different realisations of noise added to the     
     observations.
     Use a uniform solar wind background.
+    :param params: (CME scenario name, observer longitude in deg relative to Earth)
     """ 
     
     # Set the seed, so all experiments start the same.

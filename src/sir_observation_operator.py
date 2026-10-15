@@ -1,11 +1,29 @@
-# @package sir_observation_operator
-# This module will take a HUXt/SURF and ConeCME object and calculate its elongation profile
-#  for use as an observation operator in the data assimilation algorithm
+"""
+sir_observation_operator.py
+
+The observation operator H(x) for the data assimilation: maps an ensemble of CME parameters to the
+elongations a heliospheric imager would observe.
+
+For every ensemble member, ``ObservationOperator.make_obs_op()``:
+    1. builds a cone CME from the member's parameters (``make_cme_objects``),
+    2. runs the forward model (SURF, compressible SURF, SURF3d or HUXt) with that CME,
+    3. extracts the CME's time-elongation profile with an observer class (see sir_observers.py), and
+    4. samples it at the observation time(s),
+returning an (n_members, n_obs_times) array.
+
+The observer classes used to live in this module and are re-exported from here, so
+``from sir_observation_operator import ObserverSynthHI`` (etc.) keeps working.
+"""
+import datetime
+import os
+import sys
+import time
+from multiprocessing import Pool
+
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import sys
-import os
+from pandas import DataFrame
 
 import surf.surf as S
 import surf.surf_inputs as Sin
@@ -15,7 +33,6 @@ import surf.surf_imaging as Sim
 import huxt.huxt as H
 import huxt.huxt_analysis as HA
 
-import datetime
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
@@ -25,360 +42,19 @@ from init_sir import setup_huxt, setup_surf, setup_surf3d, initialise_cme_parame
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
-import asyncio
-from functools import partial
-import time
-from multiprocessing import Pool
-
-
-def background(f):
-    def wrapped(*args, **kwargs):
-        return asyncio.get_event_loop().run_in_executor(
-            None,
-            partial(f, *args, **kwargs)
-        )
-
-    return wrapped
-
-
-class SynthObsEphem:
-    """
-    Class to hold observation time, radius, latitude and longitude for use in initialising
-      Sim.SyntheticImager class
-    """
-    def __init__(self, surf_init_time, obs_times, obs_rads, obs_lats, obs_lons):
-        if isinstance(obs_times.value, float):
-            self.datetime = np.array([surf_init_time + datetime.timedelta(seconds=obs_times.value)])
-            self.time = np.array([obs_times.value]) * u.s
-            self.r = np.array([obs_rads.to(u.m).value]) * u.m
-            self.lat = np.array([obs_lats.to(u.rad).value]) * u.rad
-            self.lon = np.array([obs_lons.to(u.rad).value]) * u.rad
-        else:
-            self.datetime = [
-                surf_init_time + datetime.timedelta(seconds=i) for i in obs_times.value
-            ]
-            self.time = obs_times
-            self.r = obs_rads
-            self.lat = obs_lats
-            self.lon = obs_lons
-
-
-class ObserverTracer:
-    """
-    The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a SURF simulation
-    for an observer at a specified longitude relative to Earth. The observers distance defaults to 1 AU, and has the same latitude as Earth
-    during the SURF run.
-    Author: Luke Barnard
-    """
-    @u.quantity_input(longitude=u.deg)
-    def __init__(
-            self,
-            use_model: str,
-            model: S.SURF | H.HUXt,
-            cme: S.ConeCME | H.ConeCME,
-            longitude: Quantity[u.deg],
-            el_min: float=4.0,
-            el_max: float=30.0
-    ):
-        self.use_model: str = use_model
-        if self.use_model in ["surf", "compress_surf"]:
-            ert_ephem: S.Observer = model.get_observer('EARTH')
-        elif self.use_model in ["huxt"]:
-            ert_ephem: H.Observer = model.get_observer('EARTH')
-        else:
-            sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
-
-
-        self.time: npt.NDArray[Time] = ert_ephem.time
-        self.r: npt.NDArray[Quantity[u.AU]] = ert_ephem.r * 0 + 1 * u.AU
-        self.lon: npt.NDArray[Quantity[u.deg]] = ert_ephem.lon + longitude
-        self.lat: npt.NDArray[Quantity[u.deg]] = ert_ephem.lat
-        self.el_min: float = el_min
-        self.el_max: float = el_max
-
-        # Force longitude into 0-360 domain
-        id_over: list[bool] | bool = self.lon > 360 * u.deg
-        id_under: list[bool] | bool = self.lon < 0 * u.deg
-        if np.any(id_over):
-            self.lon[id_over] = self.lon[id_over] - 360 * u.deg
-
-        if np.any(id_under):
-            self.lon[id_under] = self.lon[id_under] + 360 * u.deg
-
-        self.model_flank: pd.DataFrame = self.compute_flank_profile(cme)
-
-
-    def compute_flank_profile(
-            self,
-            cme: H.ConeCME | S.ConeCME
-    ) -> pd.DataFrame:
-        """
-        Compute the time elongation profile of the flank of a ConeCME in SURF. The observer longtiude is specified
-        relative to Earth but otherwise matches Earth's coords.
-
-        Parameters
-        ----------
-        cme: A ConeCME object from a completed SURF run (i.e the ConeCME.coords dictionary has been populated).
-        Returns
-        -------
-        obs_profile: Pandas dataframe giving the coordinates of the ConeCME flank from STA's perspective, including the
-                    time, elongation, position angle, and HEEQ radius and longitude.
-        """
-        times: Time = Time([coord['time'] for i, coord in cme.coords.items()])
-
-        # Compute observers location using earth ephem, adding on observers longitude offset from Earth
-        # and correct for runover 2*pi
-        flank: pd.DataFrame = pd.DataFrame(index=np.arange(times.size), columns=['time', 'el', 'r', 'lon'])
-        flank['time'] = times.jd
-
-        for i, coord in cme.coords.items():
-
-            if len(coord['r']) == 0:
-                flank.loc[i, ['lon', 'r', 'el']] = np.nan
-                continue
-
-            r_obs: npt.NDArray[Quantity[u.AU]] = self.r[i]
-            x_obs: npt.NDArray[Quantity[u.AU]] = self.r[i] * np.cos(self.lat[i]) * np.cos(self.lon[i])
-            y_obs: npt.NDArray[Quantity[u.AU]] = self.r[i] * np.cos(self.lat[i]) * np.sin(self.lon[i])
-            z_obs: npt.NDArray[Quantity[u.AU]] = self.r[i] * np.sin(self.lat[i])
-
-            lon_cme: npt.NDArray[Quantity[u.deg]] = coord['lon']
-            lat_cme: npt.NDArray[Quantity[u.deg]] = coord['lat']
-            r_cme: npt.NDArray[Quantity[u.AU]] = coord['r']
-
-            x_cme: npt.NDArray[Quantity[u.AU]] = r_cme * np.cos(lat_cme) * np.cos(lon_cme)
-            y_cme: npt.NDArray[Quantity[u.AU]] = r_cme * np.cos(lat_cme) * np.sin(lon_cme)
-            z_cme: npt.NDArray[Quantity[u.AU]] = r_cme * np.sin(lat_cme)
-
-            #########################################################
-            # Compute the observer CME distance, S, and elongation
-            x_cme_s: npt.NDArray[Quantity[u.AU]] = x_cme - x_obs
-            y_cme_s: npt.NDArray[Quantity[u.AU]] = y_cme - y_obs
-            z_cme_s: npt.NDArray[Quantity[u.AU]] = z_cme - z_obs
-            s: npt.NDArray[Quantity[u.AU]] = np.sqrt(x_cme_s ** 2 + y_cme_s ** 2 + z_cme_s ** 2)
-
-            numer: npt.NDArray[float] = (r_obs ** 2 + s ** 2 - r_cme ** 2).value
-            denom: npt.NDArray[float] = (2.0 * r_obs * s).value
-            e_obs: npt.NDArray[float] = np.arccos(numer / denom)
-
-            # Restrict those CME points to those in FOV
-            # For those ahead of Earth, this is negative y_cme_s
-            # For those behind Earth, this is positive y_cme_s
-            if self.lon[i] < np.pi * u.rad:
-                id_sub: list[bool] = y_cme_s.value < 0
-                e_obs = e_obs[id_sub]
-                lon_cme = lon_cme[id_sub]
-                r_cme = r_cme[id_sub]
-            elif self.lon[i] > np.pi * u.rad:
-                id_sub = y_cme_s.value > 0
-                e_obs = e_obs[id_sub]
-                lon_cme = lon_cme[id_sub]
-                r_cme = r_cme[id_sub]
-
-            # Find the flank coordinate and update output
-            id_obs_flank: int = int(np.argmax(e_obs))
-            flank.loc[i, 'lon'] = lon_cme[id_obs_flank].value
-            flank.loc[i, 'r'] = r_cme[id_obs_flank].value
-            flank.loc[i, 'el'] = np.rad2deg(e_obs[id_obs_flank])
-
-        # Force values to be floats.
-        keys: list[str] = ['lon', 'r', 'el']
-        flank[keys] = flank[keys].astype(np.float64)
-
-        return flank
-
-
-class ObserverSynthHI:
-    """
-    The function of this observer class is to provide pseudo-observations of a ConeCME's flank elongation from a SURF simulation
-    for an observer at a specified longitude relative to Earth. The observers distance defaults to 1 AU, and has the same latitude as Earth
-    during the SURF run.
-    Author: Matthew Lang, based off code written by Luke Barnard
-    """
-    @u.quantity_input(longitude=u.deg)
-    def __init__(
-            self,
-            use_model: str,
-            model: S.SURF,
-            obs_time: npt.NDArray[datetime.datetime],
-            craft: str=None,
-            psi_ert_avg: float=90.0,
-            obs_radius: npt.NDArray[Quantity[u.AU]]=1.0 * u.AU,
-            obs_longitude: npt.NDArray[Quantity[u.deg]]=300.0 * u.deg,
-            obs_latitude: npt.NDArray[Quantity[u.deg]]=0.0 * u.deg,
-            el_min: float=4.0,
-            el_max: float=30.0,
-            hi_resolution: Quantity[u.s] | Quantity[u.hour] | Quantity[u.day]=1.0 * u.hour,
-    ):
-        """
-        Class to generate synthetic HI profiles and extract the elongation profiles
-        :param use_model: The model type being used in this simulation (must be 'compress_surf')
-        :param model: The model after it has been solved with the CMEs required
-        :param cme: CME object
-        :param obs_time: Observation time
-        :param obs_radius: Observation radius
-        :param obs_longitude: Observation longitude
-        :param obs_latitude: Observation latitude
-        :param el_min: Minimum elongation
-        :param el_max: Maximum elongation
-        :param hi_resolution: Temporal resolution to model the HI data in
-        """
-
-        self.use_model: str = use_model
-        if self.use_model in ["compress_surf", "compress_surf3d"]:
-            ert_ephem: S.Observer = model.get_observer('EARTH')
-        else:
-            sys.exit("Synthetic HI can only be generated with use_model = 'compress_surf' and 'compress_surf3d'")
-
-        self.obs_time: npt.NDArray[datetime.datetime] = obs_time
-
-        if self.use_model == "compress_surf":
-            surf_model_init_time: datetime.datetime = model.time_init.datetime
-            surf_model_sim_time: float = float(model.simtime.to(u.s).value)
-        else:
-            surf_model_init_time: datetime.datetime = model.SURFlat[0].time_init.datetime
-            surf_model_sim_time: float = float(model.SURFlat[0].simtime.to(u.s).value)
-
-        try:
-            obs_time_from_start_sec = [
-                (ot - surf_model_init_time).total_seconds() for ot in self.obs_time
-            ]
-        except:
-            obs_time_from_start_sec = [
-                (self.obs_time - surf_model_init_time).total_seconds()
-            ]
-            self.obs_time = np.array([self.obs_time])
-        else:
-            obs_time_from_start_sec = [
-                (ot - surf_model_init_time).total_seconds() for ot in self.obs_time
-            ]
-        self.obs_time_sec: npt.NDArray[Quantity[u.s]] = np.array(obs_time_from_start_sec) * u.s #ert_ephem.time
-        self.obs_time_day: npt.NDArray[Quantity[u.day]] = self.obs_time_sec.to(u.day)
-        self.n_obs = len(self.obs_time)
-        self.el_min: float = el_min
-        self.el_max: float = el_max
-
-        # Get Heliospheric Imager resolution required
-        hi_resolution_hr = hi_resolution.to(u.hour).value
-        hi_resolution_sec = hi_resolution.to(u.s).value
-        hi_resolution_day = hi_resolution.to(u.day).value
-
-        if use_model == "compress_surf":
-            self.model_times = model.time
-
-        elif use_model == "compress_surf3d":
-            self.model_times = model.SURFlat[0].time
-
-        self.synth_obs_times = np.arange(
-            0,
-            surf_model_sim_time + (hi_resolution_sec / 2.0),
-            hi_resolution_sec
-        ) * u.s
-
-        self.n_synth_obs_times = len(self.synth_obs_times)
-        self.ast_times = Time([
-            surf_model_init_time + datetime.timedelta(seconds=s)
-            for s in self.model_times.value
-        ])
-
-        if craft is not None:
-            self.craft_observer = model.get_observer(craft)
-        else:
-            self.obs_times: npt.NDArray[Time] = Time([
-            surf_model_init_time + datetime.timedelta(seconds=s)
-            for s in self.synth_obs_times.value
-            ])
-
-            self.obs_r: npt.NDArray[Quantity[u.AU]] = obs_radius * np.ones(self.n_synth_obs_times)
-            self.obs_lon: npt.NDArray[Quantity[u.deg]] = obs_longitude * np.ones(self.n_synth_obs_times)
-            self.obs_lat: npt.NDArray[Quantity[u.deg]] = obs_latitude * np.ones(self.n_synth_obs_times)
-
-            # Make dictionary for input into the Observer class for a synthetic observer
-            synth_heeq_pos = {
-                "time": self.obs_times,
-                "r": self.obs_r,
-                "lon": self.obs_lon,
-                "lat": self.obs_lat,
-            }
-            self.craft_observer = S.Observer(
-                body="SYNTHETIC",
-                times=self.ast_times,
-                synth_heeq_pos=synth_heeq_pos,
-            )
-
-        synth_obs_class = SynthObsEphem(
-            surf_init_time=surf_model_init_time,
-            obs_times=self.synth_obs_times,
-            obs_rads=self.obs_r,
-            obs_lats=self.obs_lat,
-            obs_lons=self.obs_lon,
-        )
-
-        # Calculate the j-maps and delta j-maps and track the CME
-        if use_model == "compress_surf":
-            synth_imager_class = Sim.SyntheticImager2D(synth_obs_class)
-            jmap, djmap = synth_imager_class.compute_jmap(model)
-            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
-            #fig, ax = synth_imager_class.plot_jmap(model, jmap, djmap)
-            #plt.show()
-
-            #print(cme_profile)
-            # Extract time and elongation profiles of synthetic HI-data
-            try:
-                synth_imager_time = cme_profile["feature_00"]["t"][:]
-                synth_imager_elon = cme_profile["feature_00"]["e"][:]
-            except:
-                synth_imager_time = np.nan
-                synth_imager_elon = np.nan
-            else:
-                synth_imager_time = cme_profile["feature_00"]["t"][:]
-                synth_imager_elon = cme_profile["feature_00"]["e"][:]
-
-        elif use_model == "compress_surf3d":
-            synth_imager_class = Sim.SyntheticImager3DOrig(
-                observer=self.craft_observer,
-                pa=psi_ert_avg,
-                elon_min=el_min,
-                elon_max=el_max
-            )
-            jmap, djmap = synth_imager_class.compute_jmap(model)
-            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
-            #fig, ax = synth_imager_class.plot_jmap(model, jmap, djmap)
-            #plt.show()
-
-            # Extract time and elongation profiles of synthetic HI-data
-            try:
-                synth_imager_time = cme_profile["feature_00"]["t"][:]
-                synth_imager_elon = cme_profile["feature_00"]["e"][:]
-            except:
-                synth_imager_time = np.nan
-                synth_imager_elon = np.nan
-            else:
-                synth_imager_time = cme_profile["feature_00"]["t"][:]
-                synth_imager_elon = cme_profile["feature_00"]["e"][:]
-
-        # Interpolate the synthetic elongations to observation times
-        cond1 = np.isnan(synth_imager_time)
-        cond2 = np.isnan(synth_imager_elon)
-        all_nan_cond = cond1.all() or cond2.all()
-        if not all_nan_cond:
-            synth_imager_elon_interp = np.interp(
-                self.obs_time_day.value, synth_imager_time, synth_imager_elon
-            )
-        else:
-            synth_imager_elon_interp = np.nan * np.ones(self.n_obs)
-
-        flank_data = {
-            "time": obs_time,
-            "el": synth_imager_elon_interp,
-            "r": np.nan * np.ones(self.n_obs),
-            "lon": np.nan * np.ones(self.n_obs)
-        }
-
-        self.model_flank: pd.DataFrame = pd.DataFrame(flank_data)
+# Re-exported for backwards compatibility (these classes were previously defined here)
+from sir_observers import background, SynthObsEphem, ObserverTracer, ObserverSynthHI  # noqa: F401
 
 
 class ObservationOperator:
+    """
+    Observation operator: run the forward model for every ensemble member and return the modelled
+    elongation(s) at the observation time(s). See the module docstring.
+
+    Example::
+
+        hx = ObservationOperator(use_model, cme_par_dict, obs_time, obs_cov, craft="sta", ...).make_obs_op()
+    """
     def __init__(
             self,
             use_model: str,
@@ -446,6 +122,11 @@ class ObservationOperator:
         :param bias_term_5rs: Float to determine bias term at 5Rs
         :param bias_term_21rs: Float to determine bias term at 21Rs
         :param use_parallel: Boolean to determine whether to use multiprocessing
+        :param vr_longs, vr_lats: Coordinates of vr_in (needed for compress_surf3d)
+        :param br_in, br_longs, br_lats: Inner-boundary magnetic field and coordinates (not currently used)
+        :param n_lon_surf, n_lat_surf: Grid sizes for SURF3d
+        :param lat_min, lat_max: Latitude range for SURF3d (derived from the imager field of view when a
+            real craft is given; otherwise -30/+30 deg if not set)
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
                INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE
                IN CASE OF REAL OBS
@@ -519,6 +200,7 @@ class ObservationOperator:
         self.cme_fixed_duration = cme_fixed_duration
         self.fixed_duration = fixed_duration
 
+        # Carrington rotation number and initial longitude for surf_init_time
         self.carr_rot, self.carr_rot_lon_init = Sin.datetime2surfinputs(surf_init_time)
 
         if self.lon_start > self.lon_stop:
@@ -538,6 +220,7 @@ class ObservationOperator:
             self.obs_lon = obs_lon
             self.obs_lat = obs_lat
         else:
+            # Real spacecraft: the observer is fixed at the craft's position at the (first) observation time
             # Generate dummy model instance to get the craft's and Earth's position
             dum_model = S.SURF(
                 v_boundary=np.ones(128) * 400 * u.km / u.s,
@@ -618,15 +301,20 @@ class ObservationOperator:
         self.use_parallel = use_parallel
 
 
+    # ------------------------------------------------------------------------------------------
+    # CME parameters -> ConeCME objects
+    #  Each extract_* method accepts a cme_par_dict holding either one value per member (list)
+    #  or a single value (scalar), and returns one value per member.
+    # ------------------------------------------------------------------------------------------
     def extract_cme_launch_time_and_speed(self) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
         """
         Function to extract the CME launch time and speed at r_min
         :return: cme_launch_time: CME launch time in seconds from start of SURF model run
         :return cme_speed: CME launch speed at r_min
         """
-        # Calculate time taken to go from cme's initial radius to surf inner boundary
-        # Ensure all variables are lists, if not make them into lists
-        # Get CME launch time
+        # t_init is defined at cme_init_rad; the model needs the time the CME crosses r_min, so add the
+        #  travel time (r_min - cme_init_rad) / v, assuming constant speed.
+        # Get CME launch time (the try/except accepts a list or a single datetime)
         try:
             [
                 (t - self.cme_par_dict["surf_init_time"]).total_seconds()
@@ -829,7 +517,14 @@ class ObservationOperator:
         return cme_objects
 
 
-    def plot_surf(self, model) -> None:
+    # ------------------------------------------------------------------------------------------
+    # Running the model for each member and extracting the elongation profile
+    # ------------------------------------------------------------------------------------------
+    def plot_surf(self, model: S.SURF | H.HUXt) -> None:
+        """
+        Plot the model solution at each observation time (only used when plot_surf_output=True).
+        :param model: Solved SURF/HUXt model
+        """
         if isinstance(self.obs_time_in_datetime, datetime.datetime):
             obs_times_to_plot = [self.obs_time_in_datetime]
         else:
@@ -861,8 +556,8 @@ class ObservationOperator:
 
     def get_cme_flank_single_ens_member(
             self,
-            cme: H.ConeCME | S.ConeCME=None,
-            obs_longitude: Quantity[u.deg] | list[Quantity[u.deg]]=None,
+            cme: H.ConeCME | S.ConeCME | None = None,
+            obs_longitude: Quantity[u.deg] | list[Quantity[u.deg]] | None = None,
             ens_no: int | None=None,
     ) -> pd.DataFrame:
         """
@@ -875,9 +570,9 @@ class ObservationOperator:
         if obs_longitude is None:
             obs_longitude = self.obs_lon
 
-        # Initialise SURF model object for each ensemble member
+        # Build and solve a fresh model for this member (compressible runs use a fixed 3-day run length)
         if self.use_model in ["surf"]:
-            model: SURF = setup_surf(
+            model: S.SURF = setup_surf(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
@@ -893,7 +588,7 @@ class ObservationOperator:
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["compress_surf"]:
-            model: SURF = setup_surf(
+            model: S.SURF = setup_surf(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
@@ -909,7 +604,7 @@ class ObservationOperator:
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["compress_surf3d"]:
-            model: SURF3d = setup_surf3d(
+            model: S.SURF3d = setup_surf3d(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
                 vr_lons=self.vr_longs,
@@ -931,7 +626,7 @@ class ObservationOperator:
             cme_member: S.ConeCME = model.SURFlat[0].cmes[0]
 
         elif self.use_model in ["huxt"]:
-            model: HUXt = setup_huxt(
+            model: H.HUXt = setup_huxt(
                 start_datetime=self.surf_init_time,
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
@@ -950,13 +645,12 @@ class ObservationOperator:
                 f"'surf', 'compress_surf', 'compress_surf3d' or 'huxt'"
             )
 
-        #print(f"self.use_model = {self.use_model}")
-        #print(f"model = {model}")
         if ens_no is not None:
             if np.mod(ens_no, 10) == 0:
                 print(f"Model solved cme_flank_ens_no: {ens_no}")
 
-        # Calculate CME flank
+        # Extract the CME's time-elongation profile:
+        #  incompressible models -> tracer-particle flank; compressible models -> synthetic HI j-maps
         if self.use_model in ["huxt", "surf"]:
             observer_object: ObserverTracer = ObserverTracer(
                 use_model=self.use_model,
@@ -1012,9 +706,10 @@ class ObservationOperator:
 
     def get_cme_flanks(self) -> list[pd.DataFrame]:
         """
-        Function to retrieve the CME flank dataframes for all ensemble members
-         and store them in a list
-        :return: cme_flanks: List of CME flank dataframes
+        Retrieve the CME flank dataframes for all ensemble members, in serial or in parallel
+        (one multiprocessing task per member). The three branches in each case only differ in how
+        the observer longitude is passed (0-d array, one value per member, or a single Quantity).
+        :return: cme_flanks: List of CME flank dataframes, in ensemble-member order
         """
         start_time = time.time()
         cme_objects: list[S.ConeCME] | list[H.ConeCME] = self.make_cme_objects()
@@ -1151,13 +846,17 @@ class ObservationOperator:
         return cme_flanks
 
 
+    # ------------------------------------------------------------------------------------------
+    # Observation operator
+    # ------------------------------------------------------------------------------------------
     def obs_op_bias_correction(
             self,
             elon: float
-    ):
+    ) -> float:
         """
         Function to calculate the bias correction due to using tracer particles to measure CME flank
-        Initial experiments will use a simple linear relation
+        Initial experiments will use a simple linear relation in elongation, defined by the bias at
+        5 and 21 solar radii (bias_term_5rs, bias_term_21rs)
         :param elon: Elongation to calculate the bias correction for
         :return: bias_corr: bias correction
         """
@@ -1199,6 +898,7 @@ class ObservationOperator:
             )
 
         if self.use_model in ["surf", "huxt"]:
+            # Tracer flank profiles are on the model time grid: take the nearest model time
             for i, cme_flank in enumerate(cme_flanks):
                 if isinstance(self.obs_time_in_datetime, datetime.datetime):
                     # Get the CME elongation at the nearest timestep to the observation time
@@ -1233,7 +933,7 @@ class ObservationOperator:
                     ]
 
         elif self.use_model in ["compress_surf", "compress_surf3d"]:
-            # NB: compress_surf3d previously fell through here, so obs_op was left as zeros
+            # Synthetic-HI profiles are already interpolated to the observation times
             for i, cme_flank in enumerate(cme_flanks):
                 if isinstance(self.obs_time_in_datetime, datetime.datetime):
                     # Get the CME elongation at the nearest timestep to the observation time
@@ -1255,7 +955,8 @@ class ObservationOperator:
         return obs_op
 
 
-def main():
+def main() -> None:
+    """Example: observation operator for a single 600 km/s CME in compressible SURF."""
     surf_init_time = datetime.datetime(2012, 1, 1, 0, 0, 0, 0)
     vr_in = np.ones(128) * 400 * u.km / u.s
     lon_start = 290 * u.deg
@@ -1266,7 +967,7 @@ def main():
     use_model = "compress_surf"
     solver = "hydro"
 
-    model: SURF = setup_surf(
+    model: S.SURF = setup_surf(
         start_datetime=surf_init_time,
         vr_in=vr_in,
         lon_start=lon_start,
@@ -1279,7 +980,6 @@ def main():
 
     cme_launch_datetime = datetime.datetime(2012, 1, 1, 1, 0, 0, 0)
     cme_launch_time = (cme_launch_datetime - surf_init_time).total_seconds() * u.s
-    #print(cme_launch_time)
     cme_speed = 600 * u.km / u.s
     cme_width = 40 * u.deg
     cme_lon = 0 * u.deg
@@ -1340,17 +1040,6 @@ def main():
     print(cme_object.t_launch)
     model.solve([cme_object])
 
-    # obs_synth_hi_class = ObserverSynthHI(
-    #     use_model='compress_surf',
-    #     model=model,
-    #     cme=cme_object,
-    #     obs_time=obs_datetime,
-    #     obs_radius=obs_rads,
-    #     obs_longitude=obs_lons,
-    #     obs_latitude=obs_lats,
-    #     el_min=4.0,
-    #     el_max=30.0
-    # )
     obs_op_class = ObservationOperator(
         use_model=use_model,
         cme_par_dict=cme_par_dict,
@@ -1377,4 +1066,4 @@ def main():
     return None
 
 if __name__ == "__main__":
-    main()
+    main()

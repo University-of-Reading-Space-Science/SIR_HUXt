@@ -1,43 +1,46 @@
-import numpy as np
-import numpy.typing as npt
+"""
+data_assimilation_routine.py
+
+Entry point for the CME data assimilation (run this file).
+
+``RunDataAssimilationRoutine`` reads the experiment configuration from ``da_surf_setup.Setup``, gets
+the observations (synthetic or from file), and for each run:
+    1. perturbs the first-guess CME parameters and draws the prior ensemble (``make_cme_par_dict``),
+    2. assimilates the observations one at a time with the auxiliary particle filter (aux_pf.AuxPF),
+       skipping observations before the first-guess CME launch or outside [elong_min, elong_max],
+    3. saves the ensemble after every step to ``<OUT_BASE_DIR>/.../run_NNN/cme_pars.nc``.
+
+Output file: variables t_init (s after model start), v (km/s), width, lon (-180..180), lat (deg),
+thick (rS) and log_weight, each (n_obs + 1, n_ens); index 0 along n_obs is the prior.
+"""
 import datetime
 import os
 import sys
+from pathlib import Path
 
+import numpy as np
+import numpy.typing as npt
+from numpy.random import Generator
 import xarray as xr
-
-import surf.surf as S
-import surf.surf_inputs as Sin
-
-import huxt.huxt_inputs as Hin
-
-import sunpy.coordinates.sun as sn
 
 import astropy.units as u
 from astropy.units import Quantity
-from astropy.time import Time
 
 from dotenv import load_dotenv
-from pathlib import Path
 
 import make_prior_covariance_mat as mp_cov
-from wsa_reader import ReadWSAFiles
-
-from init_sir import initialise_cme_parameter_ensemble_dict
-from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
-
 from da_surf_setup import Setup
-import time
-from multiprocessing import Pool
-from typing import Generator
+from init_sir import initialise_cme_parameter_ensemble_dict
+from sir_observations import Observations
 
 env_path = Path('.', '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
 
-def print_environment_variables():
+def print_environment_variables() -> None:
+    """Print the directories configured in the .env file."""
     print(f"obs_dir = {os.getenv('OBS_DIR')}")
     print(f"mo_cone_cov_dir = {os.getenv('MO_CONE_COV_DIR')}")
     print(f"donki_cov_dir = {os.getenv('DONKI_COV_DIR')}")
@@ -49,7 +52,15 @@ def print_environment_variables():
 
 
 class RunDataAssimilationRoutine:
-    def __init__(self):
+    """
+    Run the data assimilation experiment configured in da_surf_setup.Setup (see module docstring).
+
+    Example::
+
+        RunDataAssimilationRoutine().run_data_assimilation(run_start=0)
+    """
+    def __init__(self) -> None:
+        """Read every setting from Setup() into attributes and get the observations."""
         self.setup_class = Setup()
 
         # Get SURF parameters
@@ -74,6 +85,7 @@ class RunDataAssimilationRoutine:
         self.cme_fixed_duration: bool = surf_par_dict["cme_fixed_duration"]
         self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
 
+        # Number of longitudes / latitudes of the inner-boundary speed map (for the output file)
         if isinstance(self.vr_longs.value, float):
             self.n_lon_in: int = 1
         else:
@@ -115,9 +127,10 @@ class RunDataAssimilationRoutine:
         if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
             self.bias_term_bool = False
 
-        # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
+        # Truth CME (only used for synthetic observations / OSSEs)
         self.true_cme_par_dict: CmeParEns = self.setup_class.true_cme_par_dict
 
+        # Get the observations. Observer positions are made into one entry per observation.
         if self.use_synthetic_obs:
             # Generate observations
             self.observations: list[float] = self.get_observations()
@@ -130,6 +143,7 @@ class RunDataAssimilationRoutine:
             if not isinstance(self.obs_lat, list):
                 self.obs_lat = [self.obs_lat for _ in range(self.n_obs)]
         else:
+            # Real observations also replace obs_times, obs_lon and n_obs
             obs_tuple: tuple[
                 list[datetime.datetime], list[Quantity[u.deg]], list[float], int
             ] = self.get_observations()
@@ -185,14 +199,22 @@ class RunDataAssimilationRoutine:
         #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
 
 
+    # ------------------------------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------------------------------
     def generate_random_seed(
             self,
-            add_const: int=None,
-            mult_const: int=None,
-            run_no: int=None
-    ):
+            add_const: int | None = None,
+            mult_const: int | None = None,
+            run_no: int | None = None
+    ) -> int:
         """
-        Function to generate random seed for each model run
+        Reproducible random seed for each model run:
+            run_no >= 0: add_const + mult_const * run_no
+            run_no <  0: |add_const + mult_const / 2 + mult_const * run_no|   (distinct from the above)
+        :param add_const: Offset (default 42)
+        :param mult_const: Spacing between runs (default 10000)
+        :param run_no: Run number (default 0)
         :return: random_seed: Random seed for each model run
         """
         if add_const is None:
@@ -212,10 +234,14 @@ class RunDataAssimilationRoutine:
         return random_seed
 
 
-    def make_output_dir(self, cme_par_dict: CmeParEns, run_no: int):
+    def make_output_dir(self, cme_par_dict: CmeParEns, run_no: int) -> str:
         """
-        Function to make the output directory
-        :return: out_dir: Output directory
+        Make (if needed) and return the output directory for a run:
+            <OUT_BASE_DIR>/ens_<N>/<cme_cov_type>/model_<MODEL>/[bias_correction/...]/
+                <truth_... | obs_<craft>_<event>_<img>>/prior_<first guess>/<delta_aux_pf>/run_<NNN>
+        :param cme_par_dict: Current ensemble (unused)
+        :param run_no: Run number
+        :return: output_dir: Output directory
         """
         base_dir = os.path.join(
             os.getenv("OUT_BASE_DIR"),
@@ -371,7 +397,14 @@ class RunDataAssimilationRoutine:
             return obs_times_out, obs_lon_out, obs_out, n_obs
 
 
-    def initialise_mean_cme_pars(self, rng):
+    def initialise_mean_cme_pars(self, rng: Generator) -> dict:
+        """
+        Prior mean for this run: the first-guess CME parameters, each perturbed by
+        sd * U(-1, 1) (the sd_* are zero for runs with run_no < 0). For synthetic observations
+        only the speed, width and longitude are perturbed.
+        :param rng: Random number generator for this run
+        :return: Dictionary of mean_cme_* values
+        """
         #######################################################################
         if self.setup_class.get_use_synthetic_obs():
             # Initialise CME parameters
@@ -415,7 +448,13 @@ class RunDataAssimilationRoutine:
         return mean_cme_par_dict
 
 
-    def make_cme_par_dict(self, rng):
+    def make_cme_par_dict(self, rng: Generator) -> CmeParEns:
+        """
+        Draw the prior ensemble around the (perturbed) first guess using the prior selected by
+        cme_cov_type ("uncorr", "donki" or "mo_cone"; see make_prior_covariance_mat.py).
+        :param rng: Random number generator for this run
+        :return: cme_par_dict: Prior ensemble (uniform weights)
+        """
         # Get mean CME parameters
         mean_cme_par_dict = self.initialise_mean_cme_pars(rng=rng)
         mean_cme_t_init = (
@@ -427,6 +466,7 @@ class RunDataAssimilationRoutine:
         mean_cme_lat = mean_cme_par_dict["mean_cme_lat"]
         mean_cme_thick = mean_cme_par_dict["mean_cme_thick"]
 
+        # Prior mean in cme_par_array order (t_init in seconds after the model start)
         mean_cme_par_array = [
             mean_cme_t_init,
             mean_cme_speed,
@@ -518,6 +558,7 @@ class RunDataAssimilationRoutine:
             print(f"cme_cov_type must be in {self.setup_class.allowed_cov_types()}.")
             sys.exit()
 
+        # Put the (6, n_members) samples into the dictionary, with units
         cme_par_dict["t_init"] = [
             self.surf_init_time + datetime.timedelta(seconds=samples[0, i])
             for i in range(self.n_members)
@@ -531,9 +572,156 @@ class RunDataAssimilationRoutine:
         return cme_par_dict
 
 
-    def run_data_assimilation(self, run_start=0):
+    def save_ensemble_state(
+            self,
+            cme_saved_pars: npt.NDArray[float],
+            step: int,
+            cme_par_dict: CmeParEns
+    ) -> None:
         """
-        Function to run the data assimilation routine
+        Store the ensemble in cme_saved_pars[step] (unit-free; longitude wrapped to -180..180):
+            [..., 0] t_init (s after model start), 1 v (km/s), 2 width (deg), 3 lon (deg),
+            4 lat (deg), 5 thick (rS), 6 log_weight
+        :param cme_saved_pars: (n_obs + 1, n_members, 7) array, updated in place
+        :param step: 0 for the prior, yi + 1 after assimilating observation yi
+        :param cme_par_dict: Current ensemble
+        """
+        cme_saved_pars[step, :, 0] = [
+            (
+                    cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
+            ).total_seconds()
+            for i in range(self.n_members)
+        ]
+        cme_saved_pars[step, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
+        cme_saved_pars[step, :, 2] = cme_par_dict["width"].to(u.deg).value
+
+        cme_saved_pars[step, :, 3] = cme_par_dict["lon"].to(u.deg).value
+        lon_cond = cme_saved_pars[step, :, 3] > 180
+        cme_saved_pars[step, lon_cond, 3] = (
+                cme_saved_pars[step, lon_cond, 3] - 360
+        )
+
+        cme_saved_pars[step, :, 4] = cme_par_dict["lat"].to(u.deg).value
+        cme_saved_pars[step, :, 5] = cme_par_dict["thick"].to(u.solRad).value
+        cme_saved_pars[step, :, 6] = cme_par_dict["log_weight"]
+
+
+    def make_aux_pf(
+            self,
+            cme_par_dict: CmeParEns,
+            obs: float,
+            yi: int,
+            rng: Generator
+    ) -> AuxPF:
+        """
+        Set up the auxiliary particle filter for observation number yi.
+        :param cme_par_dict: Current ensemble
+        :param obs: Observed elongation (deg)
+        :param yi: Index of the observation (selects the observer position and time)
+        :param rng: Random number generator for this run
+        :return: AuxPF instance (call .aux_pf() to assimilate)
+        """
+        return AuxPF(
+            use_model=self.use_model,
+            cme_par_dict=cme_par_dict,
+            obs=obs,
+            obs_cov=self.obs_cov,
+            obs_radius=self.obs_radius[yi],
+            obs_lon=self.obs_lon[yi],
+            obs_lat=self.obs_lat[yi],
+            obs_time=self.obs_times[yi],
+            craft=self.craft,
+            true_cme_par_dict=self.true_cme_par_dict,
+            infl_fact=1,
+            pars_in_state=self.pars_in_state,
+            vr_in=self.vr_in,
+            vr_longs=self.vr_longs,
+            vr_lats=self.vr_lats,
+            n_lat_surf=self.n_lat_surf,
+            lon_start=self.lon_start,
+            lon_stop=self.lon_stop,
+            time_tolerance=self.time_tolerance,
+            dt_scale=self.dt_scale,
+            delta_aux_pf=self.delta_aux_pf,
+            r_min=self.r_min,
+            cme_init_rad=self.cme_init_rad,
+            cme_fixed_duration = self.cme_fixed_duration,
+            fixed_duration=self.fixed_duration,
+            bias_term_bool=self.bias_term_bool,
+            bias_term_5rs=self.bias_term_5rs,
+            bias_term_21rs=self.bias_term_21rs,
+            use_parallel=self.use_parallel,
+            rng=rng
+        )
+
+
+    def make_output_dataset(self, cme_saved_pars: npt.NDArray[float]) -> xr.Dataset:
+        """
+        Build the output dataset for one run (see module docstring for the variables).
+        2D models store the 1D ambient wind profile; compress_surf3d stores the 2D map and its coordinates.
+        :param cme_saved_pars: (n_obs + 1, n_members, 7) array filled by save_ensemble_state
+        :return: cme_par_ds
+        """
+        # Ensemble parameters at every assimilation step, shared by all models
+        ens_vars = dict(
+            t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
+            v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
+            width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
+            lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
+            lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
+            thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
+            log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
+        )
+
+        if self.use_model in ["surf", "huxt", "compress_surf"]:
+            cme_par_ds = xr.Dataset(
+                data_vars=dict(
+                    model_init_time=self.surf_init_time,
+                    cme_init_rad=self.cme_init_rad,
+                    r_min=self.r_min,
+                    ambient_vr=(["n_lon"], self.vr_in),
+                    **ens_vars,
+                ),
+                coords=dict(
+                    obs_no=("n_obs", range(self.n_obs + 1)),
+                    ens_no=("n_ens", range(self.n_members)),
+                    surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
+                ),
+            )
+        elif self.use_model in ["compress_surf3d"]:
+            print(np.shape(self.vr_in))
+            print(f"{self.n_lon_in}, {self.n_lat_in}")
+            cme_par_ds = xr.Dataset(
+                data_vars=dict(
+                    model_init_time=self.surf_init_time,
+                    cme_init_rad=self.cme_init_rad,
+                    r_min=self.r_min,
+                    ambient_vr=(["n_lat", "n_lon"], self.vr_in),
+                    vr_longs=(["n_lon"], self.vr_longs),
+                    vr_lats=(["n_lat"], self.vr_lats),
+                    **ens_vars,
+                ),
+                coords=dict(
+                    obs_no=("n_obs", range(self.n_obs + 1)),
+                    ens_no=("n_ens", range(self.n_members)),
+                    surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
+                    surf_lat=("n_lat", range(self.n_lat_in)),
+                ),
+            )
+        else:
+            sys.exit(f"Saving output for use_model = {self.use_model} is not supported")
+
+        return cme_par_ds
+
+
+    # ------------------------------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------------------------------
+    def run_data_assimilation(self, run_start: int = 0) -> None:
+        """
+        Run the data assimilation for n_runs runs and save each run's ensemble history.
+        :param run_start: First run number. If negative, runs run_start, run_start - 1, ... are done
+            instead, with an unperturbed first guess (used for real observations).
         :return: None
         """
         if run_start < 0:
@@ -542,13 +730,11 @@ class RunDataAssimilationRoutine:
         else:
             step = 1
 
-        if self.use_parallel:
-            n_runs_req = self.n_runs
-        else:
-            n_runs_req = self.n_runs
+        n_runs_req = self.n_runs
 
         for run_no in range(run_start, run_start + n_runs_req, step):
             print(f"run_no = {run_no}")
+            # Negative run numbers: use the first guess itself as the prior mean
             if run_no < 0:
                 self.fg_sd_cme_t_init: float = 0
                 self.fg_sd_cme_speed: float = 0
@@ -557,7 +743,7 @@ class RunDataAssimilationRoutine:
                 self.fg_sd_cme_lat: float = 0
                 self.fg_sd_cme_thick: float = 0
 
-            # Initialise random generator
+            # Initialise random generator (reproducible per run)
             rand_seed = self.generate_random_seed(
                 add_const=42,
                 mult_const=10000,
@@ -565,39 +751,21 @@ class RunDataAssimilationRoutine:
             )
             rng: Generator = np.random.default_rng(rand_seed)
 
+            # Draw the prior ensemble and save it as step 0
             cme_par_dict = self.make_cme_par_dict(rng=rng)
             cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
-
-            # Save prior state
-            cme_saved_pars[0, :, 0] = [
-                (
-                        cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
-                ).total_seconds()
-                for i in range(self.n_members)
-            ]
-            cme_saved_pars[0, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
-            cme_saved_pars[0, :, 2] = cme_par_dict["width"].to(u.deg).value
-
-            cme_saved_pars[0, :, 3] = cme_par_dict["lon"].to(u.deg).value
-            lon_cond = cme_saved_pars[0, :, 3] > 180
-            cme_saved_pars[0, lon_cond, 3] = (
-                    cme_saved_pars[0, lon_cond, 3] - 360
-            )
-
-            cme_saved_pars[0, :, 4] = cme_par_dict["lat"].to(u.deg).value
-            cme_saved_pars[0, :, 5] = cme_par_dict["thick"].to(u.solRad).value
-            cme_saved_pars[0, :, 6] = cme_par_dict["log_weight"]
+            self.save_ensemble_state(cme_saved_pars, 0, cme_par_dict)
 
             # Make output directory
             output_dir = self.make_output_dir(
                 cme_par_dict=cme_par_dict, run_no=run_no
             )
 
+            # Assimilate the observations one at a time
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
-                # Initial conditions for running the DA, that the observation time is after
-                #  the first-guess of the CME launch and that the observation is in the
-                #  set [elong_min, elong_max]
+                # Only assimilate if the observation time is after the first-guess CME launch and the
+                #  observation is in [elong_min, elong_max]
                 fg_cme_init_cond = self.obs_times[yi] > self.fg_mean_cme_t_init
                 obs_in_elon_range_cond = (
                     (obs >= self.elong_min) and (obs <= self.elong_max)
@@ -607,147 +775,25 @@ class RunDataAssimilationRoutine:
                     f" obs={obs}, obs_in_elon_range_cond = {obs_in_elon_range_cond}"
                 )
                 if fg_cme_init_cond and obs_in_elon_range_cond:
-                    aux_pf_class = AuxPF(
-                        use_model=self.use_model,
-                        cme_par_dict=cme_par_dict,
-                        obs=obs,
-                        obs_cov=self.obs_cov,
-                        obs_radius=self.obs_radius[yi],
-                        obs_lon=self.obs_lon[yi],
-                        obs_lat=self.obs_lat[yi],
-                        obs_time=self.obs_times[yi],
-                        craft=self.craft,
-                        true_cme_par_dict=self.true_cme_par_dict,
-                        infl_fact=1,
-                        pars_in_state=self.pars_in_state,
-                        vr_in=self.vr_in,
-                        vr_longs=self.vr_longs,
-                        vr_lats=self.vr_lats,
-                        n_lat_surf=self.n_lat_surf,
-                        lon_start=self.lon_start,
-                        lon_stop=self.lon_stop,
-                        time_tolerance=self.time_tolerance,
-                        dt_scale=self.dt_scale,
-                        delta_aux_pf=self.delta_aux_pf,
-                        r_min=self.r_min,
-                        cme_init_rad=self.cme_init_rad,
-                        cme_fixed_duration = self.cme_fixed_duration,
-                        fixed_duration=self.fixed_duration,
-                        bias_term_bool=self.bias_term_bool,
-                        bias_term_5rs=self.bias_term_5rs,
-                        bias_term_21rs=self.bias_term_21rs,
-                        use_parallel=self.use_parallel,
-                        rng=rng
-                    )
-
-                    cme_par_dict = aux_pf_class.aux_pf()
+                    cme_par_dict = self.make_aux_pf(cme_par_dict, obs, yi, rng).aux_pf()
                 elif fg_cme_init_cond:
-                    # (these two messages were previously swapped)
                     print("Observation is outside the permitted elongation range for the model")
                 elif obs_in_elon_range_cond:
                     print("Obs time before CME is expected to be in SURF model domain")
                 else:
                     print("Obs time before CME launch and obs outside permitted elongation range")
 
-                # Standardise the units and remove the astropy units
-                cme_saved_pars[yi + 1, :, 0] = [
-                    (
-                        cme_par_dict["t_init"][i] - cme_par_dict["surf_init_time"]
-                    ).total_seconds()
-                    for i in range(self.n_members)
-                ]
-                cme_saved_pars[yi + 1, :, 1] = cme_par_dict["v"].to(u.km / u.s).value
-                cme_saved_pars[yi + 1, :, 2] = cme_par_dict["width"].to(u.deg).value
+                # Save the ensemble after this step (unchanged if the observation was skipped)
+                self.save_ensemble_state(cme_saved_pars, yi + 1, cme_par_dict)
 
-                cme_saved_pars[yi + 1, :, 3] = cme_par_dict["lon"].to(u.deg).value
-                lon_cond = cme_saved_pars[yi + 1, :, 3] > 180
-                cme_saved_pars[yi + 1, lon_cond, 3] = (
-                        cme_saved_pars[yi + 1, lon_cond, 3] - 360
-                )
-
-                cme_saved_pars[yi + 1, :, 4] = cme_par_dict["lat"].to(u.deg).value
-                cme_saved_pars[yi + 1, :, 5] = cme_par_dict["thick"].to(u.solRad).value
-                cme_saved_pars[yi + 1, :, 6] = cme_par_dict["log_weight"]
-
+            # Summary of the ensemble mean at each step
             for par_ind in range(7):
                 if par_ind == 6:
                     print(f"weights_post = {np.exp(cme_saved_pars[-1, :, par_ind])}")
                 print(f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}")
 
             # Save cme_parameters into a .nc file
-            # Make an xarray object
-            if self.use_model in ["surf", "huxt"]:
-                cme_par_ds = xr.Dataset(
-                    data_vars=dict(
-                        model_init_time=self.surf_init_time,
-                        cme_init_rad=self.cme_init_rad,
-                        r_min=self.r_min,
-                        ambient_vr=(["n_lon"], self.vr_in),
-                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
-                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
-                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
-                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
-                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
-                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
-                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
-                    ),
-                    coords=dict(
-                        obs_no=("n_obs", range(self.n_obs + 1)),
-                        ens_no=("n_ens", range(self.n_members)),
-                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
-                    ),
-                )
-            elif self.use_model in ["compress_surf"]:
-                cme_par_ds = xr.Dataset(
-                    data_vars=dict(
-                        model_init_time=self.surf_init_time,
-                        cme_init_rad=self.cme_init_rad,
-                        r_min=self.r_min,
-                        ambient_vr=(["n_lon"], self.vr_in),
-                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
-                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
-                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
-                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
-                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
-                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
-                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
-                    ),
-                    coords=dict(
-                        obs_no=("n_obs", range(self.n_obs + 1)),
-                        ens_no=("n_ens", range(self.n_members)),
-                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
-                    ),
-                )
-            elif self.use_model in ["compress_surf3d"]:
-                print(np.shape(self.vr_in))
-                print(f"{self.n_lon_in}, {self.n_lat_in}")
-                cme_par_ds = xr.Dataset(
-                    data_vars=dict(
-                        model_init_time=self.surf_init_time,
-                        cme_init_rad=self.cme_init_rad,
-                        r_min=self.r_min,
-                        ambient_vr=(["n_lat", "n_lon"], self.vr_in),
-                        vr_longs=(["n_lon"], self.vr_longs),
-                        vr_lats=(["n_lat"], self.vr_lats),
-                        t_init=(["n_obs", "n_ens"], cme_saved_pars[:, :, 0]),
-                        v=(["n_obs", "n_ens"], cme_saved_pars[:, :, 1]),
-                        width=(["n_obs", "n_ens"], cme_saved_pars[:, :, 2]),
-                        lon=(["n_obs", "n_ens"], cme_saved_pars[:, :, 3]),
-                        lat=(["n_obs", "n_ens"], cme_saved_pars[:, :, 4]),
-                        thick=(["n_obs", "n_ens"], cme_saved_pars[:, :, 5]),
-                        log_weight=(["n_obs", "n_ens"], cme_saved_pars[:, :, 6]),
-                    ),
-                    coords=dict(
-                        obs_no=("n_obs", range(self.n_obs + 1)),
-                        ens_no=("n_ens", range(self.n_members)),
-                        surf_lon=("n_lon", (2 * np.pi / self.n_lon_in) * np.arange(self.n_lon_in)),
-                        surf_lat=("n_lat", range(self.n_lat_in)),
-                    ),
-                )
-
-            else:
-                sys.exit(f"Saving output for use_model = {self.use_model} is not supported")
-
+            cme_par_ds = self.make_output_dataset(cme_saved_pars)
             print(cme_par_ds)
             outParFile = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode='w')
@@ -755,7 +801,8 @@ class RunDataAssimilationRoutine:
         return None
 
 
-def main():
+def main() -> None:
+    """Run the experiment configured in da_surf_setup.py."""
     print_environment_variables()
 
     # Reuse the Setup instance built by RunDataAssimilationRoutine
@@ -766,6 +813,7 @@ def main():
 
     run_start = da_par_dict["run_start"]
 
+    # Real observations always use the negative-run (unperturbed first guess) mode
     if setup_class.get_use_synthetic_obs():
         run_da_class.run_data_assimilation(run_start=run_start)
     else:
@@ -774,4 +822,4 @@ def main():
     return None
 
 if __name__ == "__main__":
-    main()
+    main()

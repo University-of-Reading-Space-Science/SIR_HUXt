@@ -1,6 +1,14 @@
 """
-A module containing the class FromStateVector that converts from the state vector to the cme_par_array
- to update the cme_par_dict with the results of the data assimilation.
+from_state_vector.py
+
+``FromStateVector`` is the inverse of ``ToStateVector``: it writes an (updated) state-vector ensemble
+back into ``cme_par_array`` and then into ``cme_par_dict`` (re-attaching astropy units):
+
+    state_ens      --state_vector_to_cme_par_array()-->  cme_par_array
+    cme_par_array  --cme_par_array_to_cme_par_dict()-->  cme_par_dict   (filled IN PLACE and returned)
+
+Longitudes are stored in the array between -180 and +180 deg and converted back to 0-360 deg in
+the dictionary. See ``cme_par_dict_structure.py`` for the column layout of ``cme_par_array``.
 """
 
 import numpy as np
@@ -14,16 +22,27 @@ from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys, cme_par_get_indices
 
 class FromStateVector:
+    """Write a state-vector ensemble back into ``cme_par_array`` / ``cme_par_dict`` (see module docstring)."""
     def __init__(
             self,
             cme_par_array: npt.NDArray[float],
             cme_par_dict: CmeParEns,
             state_ens: npt.NDArray[float],
-            pars_in_state_vector=None,
-            weights=None,
-            x_mean=None,
-            x_std=None
+            pars_in_state_vector: list[str] | None = None,
+            weights: list[float] | None = None,
+            x_mean: npt.NDArray[float] | None = None,
+            x_std: npt.NDArray[float] | None = None
     ) -> None:
+        """
+        :param cme_par_array: (n_members, 6) array of CME parameters, updated IN PLACE
+        :param cme_par_dict: CME parameter dictionary, updated IN PLACE by cme_par_array_to_cme_par_dict
+        :param state_ens: (n_members, n_pars) state-vector ensemble
+        :param pars_in_state_vector: Keys of the parameters in the state vector, in column order
+            (defaults to all six CME parameters)
+        :param weights: Log-weights of the particles (default: uniform, -log(n_members))
+        :param x_mean, x_std: Means / standard deviations used if ``state_ens`` holds z-scores
+            (only needed for z_state_vector_to_cme_par_array)
+        """
         self.cme_par_array: npt.NDArray[float] = cme_par_array
         self.cme_par_dict: CmeParEns = cme_par_dict
 
@@ -40,9 +59,6 @@ class FromStateVector:
             self.weights = [-np.log(self.n_ensemble) for _ in range(self.n_ensemble)]
         else:
             self.weights = weights
-
-        #print(f"np.shape(state_ens) = {np.shape(state_ens)}")
-        #print(f"(self.n_ensemble, self.n_pars) = {(self.n_ensemble, self.n_pars)}")
 
         assert np.shape(state_ens) == (self.n_ensemble, self.n_pars)
         self.state_ens: npt.NDArray[float] = state_ens
@@ -66,11 +82,9 @@ class FromStateVector:
         """
         assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
 
-        #f"state_ens={self.state_ens}")
         for i, ip in enumerate(self.pars_in_state_vector):
             if ip in required_dict_keys():
                 cme_par_ind_req = cme_par_get_indices(ip)
-                #print(f"i={i}, ip={ip}: cme_par_ind_req={cme_par_ind_req}")
                 self.cme_par_array[:, cme_par_ind_req] = self.state_ens[:, i]
 
         return self.cme_par_array
@@ -170,7 +184,7 @@ class FromStateVector:
         :param cme_par_array: An (nEns, nPar) array that contains all CME parameters required
         :return: width_dict: Array of width values in deg
         """
-        # Get the required cme_par_array index for t_init
+        # Get the required cme_par_array index for width
         ind_req = cme_par_get_indices("width")
 
         width_dict: list[Quantity[u.deg]] = list(self.cme_par_array[:, ind_req]) * u.deg
@@ -190,14 +204,15 @@ class FromStateVector:
         :param cme_par_array: Array that contains all CME parameters required,
         :return: lon_dict: Array of longitude values converted to 0-360 degrees
         """
-        # Get the required cme_par_array index for t_init
+        # Get the required cme_par_array index for lon
         ind_req = cme_par_get_indices("lon")
 
         # Copy, so that the 0-360 conversion doesn't modify self.cme_par_array (kept in +/-180) in place
-        lon_arr: npt.NDArray[Quantity[None]] = np.copy(self.cme_par_array[:, ind_req])
+        lon_arr: npt.NDArray[float] = np.copy(self.cme_par_array[:, ind_req])
 
+        # Wrap [-180, 0) onto [180, 360)
         lon_cond: npt.NDArray[bool] = lon_arr < 0
-        lon_arr[lon_cond]: npt.NDArray[Quantity[None]] = lon_arr[lon_cond] + 360
+        lon_arr[lon_cond] = lon_arr[lon_cond] + 360
 
         lon_dict: list[Quantity[u.deg]] = list(lon_arr) * u.deg
 
@@ -216,7 +231,7 @@ class FromStateVector:
         :param cme_par_array: Array that contains all CME parameters required
         :return: lat_dict: Array of lat values in deg
         """
-        # Get the required cme_par_array index for t_init
+        # Get the required cme_par_array index for lat
         ind_req = cme_par_get_indices("lat")
 
         lat_dict: list[Quantity[u.deg]] = list(self.cme_par_array[:, ind_req]) * u.deg
@@ -236,7 +251,7 @@ class FromStateVector:
         :param cme_par_array: Dictionary that contains all CME parameters required
         :return: thick_dict: Array of thickness values in solar radii
         """
-        # Get the required cme_par_array index for t_init
+        # Get the required cme_par_array index for thick
         ind_req = cme_par_get_indices("thick")
 
         thick_dict: list[Quantity[u.solRad]] = list(self.cme_par_array[:, ind_req]) * u.solRad
@@ -265,7 +280,7 @@ class FromStateVector:
 
         assert all(p in self.cme_par_dict.keys() for p in req_keys)
 
-        # Standardise the units and then remove the astropy units
+        # Convert each column back into the dictionary, re-attaching astropy units
         self.cme_par_dict["t_init"]: list[datetime.datetime] = self.convert_t_init_array_to_dict()
         self.cme_par_dict["v"]: list[Quantity[u.km / u.s]] = self.convert_v_array_to_dict()
         self.cme_par_dict["width"]: list[Quantity[u.deg]] = self.convert_width_array_to_dict()

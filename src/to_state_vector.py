@@ -1,23 +1,38 @@
 """
-A module containing the class ToStateVector that converts from the cme_par_dictionary to the
-cme_par_array and then onto a state vector to be input into the data assimilation
+to_state_vector.py
+
+``ToStateVector`` converts the CME parameter dictionary (``cme_par_dict``, values carry astropy units)
+into unit-free arrays for the data assimilation:
+
+    cme_par_dict  --cme_par_dict_to_cme_par_array()-->  cme_par_array  (n_members, 6)
+    cme_par_dict  --cme_par_dict_to_state_vector()-->   state_ens      (n_members, n_pars_in_state)
+
+The state vector only holds the parameters being estimated (``pars_in_state_vector``), in that order.
+See ``cme_par_dict_structure.py`` for the column layout / units of ``cme_par_array`` and
+``from_state_vector.py`` for the inverse conversion.
 """
 import numpy as np
 import numpy.typing as npt
 
 import astropy.units as u
-from astropy.units import Quantity
 
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys, cme_par_get_keys
 
 class ToStateVector:
+    """Convert ``cme_par_dict`` into ``cme_par_array`` / a state-vector ensemble (see module docstring)."""
     def __init__(
         self,
-        cme_par_dict,
-        cme_par_array=None,
-        pars_in_state_vector=None
+        cme_par_dict: CmeParEns,
+        cme_par_array: npt.NDArray[float] | None = None,
+        pars_in_state_vector: list[str] | None = None
     ) -> None:
+        """
+        :param cme_par_dict: CME parameter ensemble dictionary
+        :param cme_par_array: Optional (n_members, 6) array to fill in place (a new zero array by default)
+        :param pars_in_state_vector: Keys of the parameters to put in the state vector
+            (defaults to all six CME parameters)
+        """
 
         self.cme_par_dict: CmeParEns = cme_par_dict
 
@@ -97,11 +112,12 @@ class ToStateVector:
         """
         assert "lon" in self.cme_par_dict.keys()
 
-        lon_arr: npt.NDArray[Quantity[None]] = np.array([
+        lon_arr: npt.NDArray[float] = np.array([
             lon.to(u.deg).value for lon in self.cme_par_dict["lon"][:]
         ])
+        # Wrap (180, 360] onto (-180, 0]
         lonCond: npt.NDArray[bool] = lon_arr > 180
-        lon_arr[lonCond]: Quantity[None] = lon_arr[lonCond] - 360
+        lon_arr[lonCond] = lon_arr[lonCond] - 360
 
         return lon_arr
 
@@ -241,4 +257,4 @@ class ToStateVector:
             else:
                 self.z_ens[:, i] = 0.0
 
-        return self.z_ens, self.x_mean, self.x_std
+        return self.z_ens, self.x_mean, self.x_std

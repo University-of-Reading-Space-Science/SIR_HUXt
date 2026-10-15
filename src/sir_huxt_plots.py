@@ -1,3 +1,15 @@
+"""
+sir_huxt_plots.py
+
+Plotting helpers for HUXt-based SIR experiments (used by osse_analysis.ipynb):
+    plot_huxt_multi                 : HUXt speed solution on a polar axis, with CMEs and planets/spacecraft
+    plot_huxt_with_observer         : as above, plus observers' modelled flank / field of view
+    get_fov_patch                   : polygon outlining an observer's field of view
+    animate_observer                : MP4 movie of the solution with an observer (moviepy)
+    plot_elon_profiles_at_analysis  : ensemble / truth time-elongation profiles at one analysis step
+
+NB: some imports below are unused here but kept, as notebooks may access them through this module.
+"""
 from astropy.time import Time
 import astropy.units as u
 import h5py
@@ -16,7 +28,7 @@ import huxt.huxt_inputs as Hin
 import huxt.huxt_analysis as Ha
 
 
-def plot_huxt_multi(ax, time, model):
+def plot_huxt_multi(ax: plt.Axes, time: u.Quantity, model: H.HUXt) -> None:
     """
     Plot the HUXt solution at a specified time, and (optionally) overlay the modelled flank location and field of view
     of a specified observer.
@@ -100,16 +112,25 @@ def plot_huxt_multi(ax, time, model):
     return
 
 
-def plot_huxt_with_observer(model, time, observer_list, fighandle=np.nan, axhandle=np.nan, add_flank=False, add_fov=False):
+def plot_huxt_with_observer(
+        model: H.HUXt,
+        time: u.Quantity,
+        observer_list: list,
+        fighandle=np.nan,
+        axhandle=np.nan,
+        add_flank: bool = False,
+        add_fov: bool = False
+):
     """
     Plot the HUXt solution at a specified time, and (optionally) overlay the modelled flank location and field of view
     of a specified observer.
-    :param time: The time to plot. The closest value in model.time_out is selected.
     :param model: A HUXt instance with the solution in.
-    :param observer: An Observer instance with the modelled flank.
+    :param time: The time to plot. The closest value in model.time_out is selected.
+    :param observer_list: Observer instances with the modelled flank.
+    :param fighandle, axhandle: Existing figure / polar axes to draw in (NaN = make a new figure)
     :param add_flank: If True, add the modelled flank.
     :param add_fov: If True, highlight the observers field of view.
-    :return:
+    :return: fig, ax
     """
     
     plotvmin = 200
@@ -216,7 +237,7 @@ def plot_huxt_with_observer(model, time, observer_list, fighandle=np.nan, axhand
     return fig, ax
 
 
-def get_fov_patch(ro, lo, el_min, el_max, col):
+def get_fov_patch(ro: u.Quantity, lo: u.Quantity, el_min: float, el_max: float, col: str):
     """
     Function to compute a matplotlib patch to higlight an observers field of view. 
     ro = radius of observer (in solRad)
@@ -266,10 +287,10 @@ def get_fov_patch(ro, lo, el_min, el_max, col):
     return fov_patch
 
 
-def animate_observer(model, obs, tag, add_flank=False, add_fov=False):
+def animate_observer(model: H.HUXt, obs, tag: str, add_flank: bool = False, add_fov: bool = False) -> None:
     """
     Animate the model solution, and save as an MP4.
-    :param model: A HXUt model instance with the solution in
+    :param model: A HUXt model instance with the solution in
     :param obs: An observer instance containing the modelled flank coords
     :param tag: String to append to filename
     :param add_flank: If True, the modelled flank is plotted
@@ -300,7 +321,16 @@ def animate_observer(model, obs, tag, add_flank=False, add_fov=False):
     return
 
 
-def plot_elon_profiles_at_analysis(step, model, observer, cme_truth_obs, t_obs, e_obs, ens_profiles, weights):
+def plot_elon_profiles_at_analysis(
+        step: int,
+        model: H.HUXt,
+        observer,
+        cme_truth_obs: pd.DataFrame,
+        t_obs: float,
+        e_obs: float,
+        ens_profiles: pd.DataFrame,
+        weights: np.ndarray
+) -> None:
     """
     Plot the time-elongation profiles of the truth cme, the full ensemble, and the observations.
     :param step: Integer number for the analysis step (used in naming)

@@ -1,7 +1,20 @@
 """
-Module containing functions that define the cme_par_dict structure and the associated indices required
-for the cme_par_array and functions to map between the indices and keys of the array and dictionary
-respectively.
+cme_par_dict_structure.py
+
+Functions that define the structure of ``cme_par_dict`` and how it maps onto ``cme_par_array``.
+
+``cme_par_array`` is an (n_members, 6) float array with one column per CME parameter:
+
+    column | key      | units (in the array)
+    -------+----------+-------------------------------------------
+       0   | t_init   | seconds after ``surf_init_time``
+       1   | v        | km/s
+       2   | width    | deg
+       3   | lon      | deg (between -180 and +180)
+       4   | lat      | deg
+       5   | thick    | solar radii
+
+The functions here are the single source of truth for that key <-> column mapping.
 """
 
 

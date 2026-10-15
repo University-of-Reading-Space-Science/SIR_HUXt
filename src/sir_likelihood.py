@@ -1,9 +1,22 @@
-import numpy as np
-import numpy.typing as npt
+"""
+sir_likelihood.py
+
+Gaussian likelihood of an observation given the model-predicted observation (the observation
+operator output, ``hx``). Used by the particle filter to weight each ensemble member.
+
+For a single observation y with error variance R:
+    log L = -0.5 * (y - Hx)^2 / R
+and for a vector of observations with error covariance matrix R:
+    log L = -0.5 * (y - Hx)^T R^{-1} (y - Hx)
+(both up to an additive constant, which cancels when the weights are normalised).
+"""
 import sys
 
+import numpy as np
+import numpy.typing as npt
 
-def _to_float_or_array(x) -> float | npt.NDArray[float]:
+
+def _to_float_or_array(x: float | list[float] | npt.NDArray[float]) -> float | npt.NDArray[float]:
     """
     Helper to standardise the inputs of LikelihoodFunction.
     Single-element inputs (python/numpy scalars, 0-d arrays, length-1 lists/arrays, 1x1 matrices)
@@ -16,15 +29,21 @@ def _to_float_or_array(x) -> float | npt.NDArray[float]:
 
 
 class LikelihoodFunction:
+    """
+    Gaussian likelihood of one (possibly multi-element) observation for one ensemble member.
+
+    Example::
+
+        log_l = LikelihoodFunction(obs=y, obs_cov=R, hx=hx_member).make_log_likelihood()
+    """
     def __init__(
             self,
             obs: float | list[float] | npt.NDArray[float],
             obs_cov: list[float] | npt.NDArray[float] | float,
             hx: list[float] | npt.NDArray[float] | float
-    ):
+    ) -> None:
         """
-        Class to calculate the likelihood function and store functions
-         related to different likelihood functions
+        Standardise and validate the inputs.
         :param obs: Observation of the CME flank
         :param obs_cov: Observation error covariance matrix of the CME flank
             (for a single observation this is the error *variance*)
