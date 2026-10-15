@@ -862,9 +862,11 @@ class ObservationOperator:
         """
         print(f"bias terms = 5rS: {self.bias_term_5rs}, 21rS: {self.bias_term_21rs}")
 
-        # Calculate gradient and constant terms for linear relation
-        m: float = (self.bias_term_5rs - self.bias_term_21rs) / 15.0
-        c: float = ((21 * self.bias_term_5rs) - (5 * self.bias_term_21rs)) / 15.0
+        # Straight line through (5, bias_term_5rs) and (21, bias_term_21rs)
+        #  (previously the gradient had the wrong sign and both terms were divided by 15 rather than
+        #   21 - 5 = 16, so e.g. equal biases of 2.5 gave a constant correction of 2.67)
+        m: float = (self.bias_term_21rs - self.bias_term_5rs) / 16.0
+        c: float = ((21 * self.bias_term_5rs) - (5 * self.bias_term_21rs)) / 16.0
 
         # Calculate bias required
         bias_corr = (m * elon) + c
