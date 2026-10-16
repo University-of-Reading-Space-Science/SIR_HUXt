@@ -36,6 +36,7 @@ from sir_likelihood import LikelihoodFunction
 from sir_observation_operator import ObservationOperator
 from sir_resampling_log_weights import jacobian_log, ResampleParsLogWeights
 from to_state_vector import ToStateVector
+from timing import timed
 
 # Members whose CME is never tracked give NaN observation operators; silence the resulting warnings
 warnings.filterwarnings(
@@ -86,6 +87,7 @@ class AuxPF:
             bias_term_5rs: float | None = None,
             bias_term_21rs: float | None = None,
             use_parallel: bool = False,
+            fixed_compressible_sim_time: bool = True,
             rng: Generator | None = None
     ) -> None:
         """
@@ -113,6 +115,7 @@ class AuxPF:
         :param plot_surf_output: Plot the model at the observation time for every member (slow)
         :param bias_term_bool, bias_term_5rs, bias_term_21rs: Optional linear elongation bias correction
         :param use_parallel: Run the ensemble members in parallel (multiprocessing)
+        :param fixed_compressible_sim_time: see ObservationOperator (False = shorter, faster compressible runs)
         :param rng: Random number generator (resampling and jitter)
         """
         self.use_model = use_model
@@ -144,6 +147,7 @@ class AuxPF:
         self.fixed_duration = fixed_duration
         self.plot_surf_output = plot_surf_output
         self.use_parallel = use_parallel
+        self.fixed_compressible_sim_time = fixed_compressible_sim_time
 
         if rng is None:
             self.rng = np.random.default_rng()
@@ -399,6 +403,7 @@ class AuxPF:
             bias_term_5rs=self.bias_term_5rs,
             bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
+            fixed_compressible_sim_time=self.fixed_compressible_sim_time,
         )
 
         hx = obs_op_class.make_obs_op()
@@ -543,6 +548,7 @@ class AuxPF:
         return ess
 
 
+    @timed("aux_pf.step_total")
     def aux_pf(self) -> CmeParEns:
         """
         Perform steps 2-5 of the auxiliary particle filter (step 1 is done in __init__).
@@ -561,7 +567,8 @@ class AuxPF:
         ess_prior2 = self.calc_ess_log_weights(self.log_weights)
 
         # Step 2: run the model for the shrunk particles m_i and compute the first-stage probabilities
-        obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
+        with timed("aux_pf.obs_op_shrunk_ensemble"):
+            obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_shrunk_ens = [
@@ -581,7 +588,8 @@ class AuxPF:
             n_ensemble=self.n_members,
             rng=self.rng
         )
-        resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
+        with timed("aux_pf.resample"):
+            resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
 
         # Step 4: draw jittered particles from normal(shrunk_par, h^2 * cov_state)
         resample_pars: npt.NDArray[float] = np.array(
@@ -603,7 +611,8 @@ class AuxPF:
         self.cme_par_dict = from_state_class.cme_par_array_to_cme_par_dict()
 
         # Step 5: run the model for the new particles and compute the second-stage weights
-        obs_op_post = self.get_observation_operator(self.cme_par_dict)
+        with timed("aux_pf.obs_op_posterior_ensemble"):
+            obs_op_post = self.get_observation_operator(self.cme_par_dict)
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_post = [

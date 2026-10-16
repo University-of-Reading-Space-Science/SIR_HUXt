@@ -25,6 +25,7 @@ import astropy.units as u
 from astropy.time import Time
 
 from osse_stats import weighted_median
+from timing import timed
 
 
 def _ds_scalar(ds: xr.Dataset, name: str) -> float:
@@ -354,7 +355,8 @@ def get_cme_stats_prior_post(
 
     # Make prior CME arrival times
     print(f"prior_cme: {prior_cme}")
-    model.solve([prior_cme])
+    with timed("arrival.solve_prior_member"):
+        model.solve([prior_cme])
     cme = solved_cmes(model)[0]
     prior_stats = cme.compute_arrival_at_body(cme_hit_object)
 
@@ -368,7 +370,8 @@ def get_cme_stats_prior_post(
         prior_count_hit = 0
 
     # Make posterior CME arrival times
-    model.solve([post_cme])
+    with timed("arrival.solve_posterior_member"):
+        model.solve([post_cme])
     cme = solved_cmes(model)[0]
     post_stats = cme.compute_arrival_at_body(cme_hit_object)
 
@@ -393,6 +396,7 @@ def get_cme_stats_prior_post(
     )
 
 
+@timed("arrival.get_cme_arrival_time")
 def get_cme_arrival_time(
         ds: xr.Dataset,
         use_model: str,

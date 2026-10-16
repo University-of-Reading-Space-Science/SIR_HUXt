@@ -27,6 +27,7 @@ from surf import surf_inputs
 
 from cme_par_dict_structure import cme_par_get_indices, cme_par_key_to_index
 from prior_cov_plots import plot_sample_cov, plot_pair_plot
+from timing import timed
 
 
 def filter_first_mo_cone_cme(
@@ -230,6 +231,7 @@ def make_mo_cone_file_list(
     return path_list
 
 
+@timed("prior.mo_cone.make_cov (incl. reading/caching cone files)")
 def make_mo_cone_cme_cov(
         file_dir: str,
         start_time: datetime.datetime,
@@ -334,25 +336,20 @@ def make_mo_cone_cme_cov(
             if file_name_end5 == "0100.in":
                 print(f"filename={file_name}")
 
+            # Build the DataFrame in one go (previously filled cell by cell with .loc, and re-ordered
+            #  after every row, which made reading thousands of files very slow)
+            cmes = [mo_cone_dict[i + 1] for i in range(len_mo_dict)]
             dfCMEpar = pd.DataFrame(
-                columns=["v", "width", "lon", "lat"], index=range(len_mo_dict)
+                {
+                    "v": [np.log(c["vcld"]) if use_log_v else c["vcld"] for c in cmes],
+                    "width": [2 * c["rmajor"] for c in cmes],
+                    "lon": [c["lon"] for c in cmes],
+                    "lat": [c["lat"] for c in cmes],
+                },
+                index=range(len_mo_dict), dtype=float,
             )
-            for i in range(len_mo_dict):
-                if use_log_v:
-                    dfCMEpar.loc[i, "v"] = np.log(mo_cone_dict[i + 1]["vcld"])
-                else:
-                    dfCMEpar.loc[i, "v"] = mo_cone_dict[i + 1]["vcld"]
-
-                dfCMEpar.loc[i, "width"] = 2 * mo_cone_dict[i + 1]["rmajor"]
-                dfCMEpar.loc[i, "lon"] = mo_cone_dict[i + 1]["lon"]
-                dfCMEpar.loc[i, "lat"] = mo_cone_dict[i + 1]["lat"]
-
-                # Reorder the parameters so they're in the correct order
-                cme_par_keys_ordered = cme_par_key_to_index().keys()
-                list_req_order = [
-                    r for r in cme_par_keys_ordered if r in dfCMEpar.columns
-                ]
-                dfCMEpar = dfCMEpar[list_req_order]
+            # Columns in cme_par_array order
+            dfCMEpar = dfCMEpar[[r for r in cme_par_keys_ordered if r in dfCMEpar.columns]]
 
             # Append dataframe to a list
             df_all_list.append(dfCMEpar)

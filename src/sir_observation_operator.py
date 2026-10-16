@@ -14,6 +14,7 @@ returning an (n_members, n_obs_times) array.
 The observer classes used to live in this module and are re-exported from here, so
 ``from sir_observation_operator import ObserverSynthHI`` (etc.) keeps working.
 """
+import atexit
 import datetime
 import os
 import sys
@@ -23,7 +24,6 @@ from multiprocessing import Pool
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from pandas import DataFrame
 
 import surf.surf as S
 import surf.surf_inputs as Sin
@@ -42,8 +42,112 @@ from init_sir import setup_huxt, setup_surf, setup_surf3d, initialise_cme_parame
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
+from timing import add_timing, collect_timings, merge_timings, timed
+
 # Re-exported for backwards compatibility (these classes were previously defined here)
 from sir_observers import background, SynthObsEphem, ObserverTracer, ObserverSynthHI  # noqa: F401
+
+
+# ---------------------------------------------------------------------------------------------
+# Performance helpers
+# ---------------------------------------------------------------------------------------------
+# The geometry of a real observing craft (its ephemeris on a dummy model's time grid, the position angle of
+#  Earth and the imager latitude range) depends only on the craft, the model start time and whether the
+#  model is 3D, but building it means a dummy SURF model plus one sunpy coordinate transform per model time
+#  step. It is computed once per process and reused by every ObservationOperator (previously it was rebuilt
+#  twice per observation in every run).
+_CRAFT_GEOMETRY_CACHE: dict = {}
+
+
+def _craft_geometry(
+        craft: str,
+        surf_init_time: datetime.datetime,
+        carr_rot: float,
+        carr_rot_lon_init: Quantity,
+        is_3d: bool,
+) -> dict:
+    """
+    Cached craft geometry (read-only; see _CRAFT_GEOMETRY_CACHE).
+    :return: dict with craft_observer, craft_observer_datetime (model output times) and, for 3D models,
+        ert_observer, psi_ert, elon_ert, psi_ert_avg, lat_min, lat_max
+    """
+    key = (str(craft).lower(), surf_init_time, bool(is_3d))
+    if key in _CRAFT_GEOMETRY_CACHE:
+        return _CRAFT_GEOMETRY_CACHE[key]
+
+    with timed("obs_op.craft_geometry (cache miss)"):
+        # Generate dummy model instance to get the craft's and Earth's position
+        dum_model = S.SURF(
+            v_boundary=np.ones(128) * 400 * u.km / u.s,
+            cr_num=carr_rot,
+            cr_lon_init=carr_rot_lon_init,
+        )
+        geom = {"craft_observer": dum_model.get_observer(craft)}
+        geom["craft_observer_datetime"] = [
+            surf_init_time + datetime.timedelta(seconds=t_out.to('s').value)
+            for t_out in dum_model.time_out
+        ]
+
+        if is_3d:
+            # Compute position angle of Earth from observing craft
+            geom["ert_observer"] = dum_model.get_observer("EARTH")
+            geom["psi_ert"], geom["elon_ert"] = Sim.compute_target_hpr_coords(
+                geom["craft_observer"], geom["ert_observer"]
+            )
+            geom["psi_ert_avg"] = np.mean(geom["psi_ert"].to(u.deg).value)
+
+            # Setup a SyntheticImager3D class instance to get the min and max latitudes
+            # TODO: Remove hard-coded values for min and max elongations and buff_lat
+            imgr = Sim.SyntheticImager3DOrig(
+                geom["craft_observer"],
+                pa=geom["psi_ert_avg"],
+                elon_min=5.0,
+                elon_max=30.0
+            )
+            buff_lat = 2.0 * u.deg
+            imgr._compute_fov_geometry(0)
+            geom["lat_min"] = imgr.lat_grid.min().to(u.deg) - buff_lat
+            geom["lat_max"] = imgr.lat_grid.max().to(u.deg) + buff_lat
+
+    _CRAFT_GEOMETRY_CACHE[key] = geom
+    return geom
+
+
+# One pool of worker processes, created on first use and reused by every ObservationOperator.
+#  (Previously a new Pool was started twice per observation; on Windows every new worker re-imports
+#  astropy/sunpy/SURF, which costs seconds per pool.)
+_POOL = None  # multiprocessing.pool.Pool, or None before first use
+_POOL_SIZE: int | None = None
+
+
+def get_worker_pool(n_proc: int):
+    """The shared worker pool (started, or restarted with a new size, if needed)."""
+    global _POOL, _POOL_SIZE
+    if _POOL is None or _POOL_SIZE != n_proc:
+        close_worker_pool()
+        with timed("obs_op.worker_pool_startup"):
+            _POOL = Pool(processes=n_proc)
+        _POOL_SIZE = n_proc
+    return _POOL
+
+
+def close_worker_pool() -> None:
+    """Shut down the shared worker pool (also called on errors and at interpreter exit)."""
+    global _POOL, _POOL_SIZE
+    if _POOL is not None:
+        _POOL.terminate()
+        _POOL.join()
+    _POOL, _POOL_SIZE = None, None
+
+
+atexit.register(close_worker_pool)
+
+
+def _cme_flank_task(operator, cme, obs_longitude, ens_no):
+    """Worker task: one member's flank profile, plus the timings recorded while computing it."""
+    with collect_timings() as worker_timings:
+        flank = operator.get_cme_flank_single_ens_member(cme=cme, obs_longitude=obs_longitude, ens_no=ens_no)
+    return flank, worker_timings
 
 
 class ObservationOperator:
@@ -89,6 +193,7 @@ class ObservationOperator:
             bias_term_5rs: float = None,
             bias_term_21rs: float = None,
             use_parallel: bool = True,
+            fixed_compressible_sim_time: bool = True,
     ) -> None:
         """
         Class to get observations operator for DA from
@@ -122,6 +227,10 @@ class ObservationOperator:
         :param bias_term_5rs: Float to determine bias term at 5Rs
         :param bias_term_21rs: Float to determine bias term at 21Rs
         :param use_parallel: Boolean to determine whether to use multiprocessing
+        :param fixed_compressible_sim_time: Run the compressible models (compress_surf / compress_surf3d) for a
+            fixed 3 days (default, as before). If False they are run for ``sim_time`` instead (the Aux-PF sets
+            this to the observation time + time_tolerance), which is faster for early observations but can
+            change the tracked elongations slightly.
         :param vr_longs, vr_lats: Coordinates of vr_in (needed for compress_surf3d)
         :param br_in, br_longs, br_lats: Inner-boundary magnetic field and coordinates (not currently used)
         :param n_lon_surf, n_lat_surf: Grid sizes for SURF3d
@@ -221,17 +330,13 @@ class ObservationOperator:
             self.obs_lat = obs_lat
         else:
             # Real spacecraft: the observer is fixed at the craft's position at the (first) observation time
-            # Generate dummy model instance to get the craft's and Earth's position
-            dum_model = S.SURF(
-                v_boundary=np.ones(128) * 400 * u.km / u.s,
-                cr_num=self.carr_rot,
-                cr_lon_init=self.carr_rot_lon_init,
+            #  (the craft geometry is computed once and cached, see _craft_geometry)
+            geom = _craft_geometry(
+                craft, surf_init_time, self.carr_rot, self.carr_rot_lon_init,
+                is_3d=(use_model in ["compress_surf3d"]),
             )
-            craft_observer = dum_model.get_observer(craft)
-            craft_observer_datetime: datetime.datetime = [
-                surf_init_time + datetime.timedelta(seconds=t_out.to('s').value)
-                for t_out in dum_model.time_out
-            ]
+            craft_observer = geom["craft_observer"]
+            craft_observer_datetime: list[datetime.datetime] = geom["craft_observer_datetime"]
             # Use the (first) observation time to locate the craft
             if isinstance(obs_time_in_datetime, datetime.datetime):
                 obs_ref_time = obs_time_in_datetime
@@ -249,35 +354,13 @@ class ObservationOperator:
             self.obs_lon = craft_observer.lon[ind_req].to(u.deg)
             self.obs_lat = craft_observer.lat[ind_req].to(u.deg)
 
-            craft_obs_class = SynthObsEphem(
-                surf_init_time=surf_init_time,
-                obs_times=self.obs_time_in_sec,
-                obs_rads=self.obs_radius,
-                obs_lats=self.obs_lat,
-                obs_lons=self.obs_lon,
-            )
-
             if use_model in ["compress_surf3d"]:
-                # Compute position angle of Earth from observing craft
-                self.ert_observer = dum_model.get_observer("EARTH")
-                self.psi_ert, self.elon_ert = Sim.compute_target_hpr_coords(craft_observer, self.ert_observer)
-                self.psi_ert_avg = np.mean(self.psi_ert.to(u.deg).value)
-
-                # Setup a SyntheticImager3D class instance to get the min and max latitudes
-                # TODO: Remove hard-coded values for min and max elongations and buff_lat
-                #print(f"psi_ert_avg = {self.psi_ert_avg}")
-
-                imgr = Sim.SyntheticImager3DOrig(
-                    craft_observer,#_class,
-                    pa=self.psi_ert_avg,
-                    elon_min=5.0,
-                    elon_max=30.0
-                )
-                buff_lat = 2.0 * u.deg
-                imgr._compute_fov_geometry(0)
-                self.lat_min = imgr.lat_grid.min().to(u.deg) - buff_lat
-                self.lat_max = imgr.lat_grid.max().to(u.deg) + buff_lat
-                #print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
+                # Position angle of Earth from the craft, and the imager's latitude range (cached)
+                self.ert_observer = geom["ert_observer"]
+                self.psi_ert, self.elon_ert = geom["psi_ert"], geom["elon_ert"]
+                self.psi_ert_avg = geom["psi_ert_avg"]
+                self.lat_min = geom["lat_min"]
+                self.lat_max = geom["lat_max"]
 
         # SURF3d needs a finite latitude range; fall back to setup_surf3d's defaults
         if self.use_model in ["compress_surf3d"]:
@@ -299,6 +382,10 @@ class ObservationOperator:
 
         # Determine whether to use parallel computation for each ensemble member
         self.use_parallel = use_parallel
+
+        # Run length for the compressible models (see fixed_compressible_sim_time)
+        self.fixed_compressible_sim_time = fixed_compressible_sim_time
+        self.compressible_sim_time = 3 * u.day if fixed_compressible_sim_time else self.sim_time
 
 
     # ------------------------------------------------------------------------------------------
@@ -570,7 +657,8 @@ class ObservationOperator:
         if obs_longitude is None:
             obs_longitude = self.obs_lon
 
-        # Build and solve a fresh model for this member (compressible runs use a fixed 3-day run length)
+        # Build and solve a fresh model for this member (compressible runs: see fixed_compressible_sim_time)
+        t_start = time.perf_counter()
         if self.use_model in ["surf"]:
             model: S.SURF = setup_surf(
                 start_datetime=self.surf_init_time,
@@ -584,7 +672,9 @@ class ObservationOperator:
             )
 
             # Run CME through SURF
-            model.solve([cme])
+            add_timing(f"obs_op.model_setup.{self.use_model}", time.perf_counter() - t_start)
+            with timed(f"obs_op.model_solve.{self.use_model}"):
+                model.solve([cme])
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["compress_surf"]:
@@ -593,14 +683,16 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
-                sim_time=3 * u.day,
+                sim_time=self.compressible_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
             )
 
             # Run CME through SURF
-            model.solve([cme])
+            add_timing(f"obs_op.model_setup.{self.use_model}", time.perf_counter() - t_start)
+            with timed(f"obs_op.model_solve.{self.use_model}"):
+                model.solve([cme])
             cme_member: S.ConeCME = model.cmes[0]
 
         elif self.use_model in ["compress_surf3d"]:
@@ -615,14 +707,16 @@ class ObservationOperator:
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
                 n_lon_surf=self.n_lon_surf,
-                sim_time=3 * u.day,
+                sim_time=self.compressible_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
             )
 
             # Run CME through SURF
-            model.solve([cme])
+            add_timing(f"obs_op.model_setup.{self.use_model}", time.perf_counter() - t_start)
+            with timed(f"obs_op.model_solve.{self.use_model}"):
+                model.solve([cme])
             cme_member: S.ConeCME = model.SURFlat[0].cmes[0]
 
         elif self.use_model in ["huxt"]:
@@ -636,7 +730,9 @@ class ObservationOperator:
                 r_min=self.r_min
             )
             # Run CME through SURF
-            model.solve([cme])
+            add_timing(f"obs_op.model_setup.{self.use_model}", time.perf_counter() - t_start)
+            with timed(f"obs_op.model_solve.{self.use_model}"):
+                model.solve([cme])
 
             cme_member: H.ConeCME = model.cmes[0]
         else:
@@ -651,6 +747,7 @@ class ObservationOperator:
 
         # Extract the CME's time-elongation profile:
         #  incompressible models -> tracer-particle flank; compressible models -> synthetic HI j-maps
+        t_observer = time.perf_counter()
         if self.use_model in ["huxt", "surf"]:
             observer_object: ObserverTracer = ObserverTracer(
                 use_model=self.use_model,
@@ -659,6 +756,7 @@ class ObservationOperator:
                 longitude=obs_longitude
             )
             cme_flank: pd.DataFrame = observer_object.model_flank
+            add_timing("obs_op.observer_tracer", time.perf_counter() - t_observer)
 
         elif self.use_model in ["compress_surf", "compress_surf3d"]:
             obs_datetime = np.array(self.obs_time_in_datetime)
@@ -679,6 +777,7 @@ class ObservationOperator:
                 el_max=30.0
             )
             cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
+            add_timing("obs_op.observer_synthetic_hi", time.perf_counter() - t_observer)
 
             if np.isnan(cme_flank['el'].values).any():
                 print("=====================================================")
@@ -707,141 +806,52 @@ class ObservationOperator:
     def get_cme_flanks(self) -> list[pd.DataFrame]:
         """
         Retrieve the CME flank dataframes for all ensemble members, in serial or in parallel
-        (one multiprocessing task per member). The three branches in each case only differ in how
-        the observer longitude is passed (0-d array, one value per member, or a single Quantity).
+        (one task per member on the shared worker pool, see get_worker_pool).
         :return: cme_flanks: List of CME flank dataframes, in ensemble-member order
         """
-        start_time = time.time()
-        cme_objects: list[S.ConeCME] | list[H.ConeCME] = self.make_cme_objects()
+        with timed("obs_op.get_cme_flanks"):
+            cme_objects: list[S.ConeCME] | list[H.ConeCME] = self.make_cme_objects()
 
-        if self.use_parallel:
-            def log_result(result):
-                # This is called whenever self.get_cme_flank_single_ens_member(i)
-                #  returns a result in parallel computation.
-                # result_list is modified only by the main process, not the pool workers.
-                result_list.append(result)
-
-            print("Using parallel execution")
-
-            # Initialise variables required for parallel computations
-            result_list = []
-            obj_res = [None] * self.n_members
-
-            n_proc = int(os.cpu_count() - 1)
-            if n_proc < 1:
-                n_proc = 1
-
-            cme_flanks: list[DataFrame] | list[None] = [None] * self.n_members
-
-            pool = Pool(processes=n_proc)
-            try:
-                if isinstance(self.obs_lon, np.ndarray):
-                    if np.ndim(self.obs_lon) == 0:
-                        # Get CME flanks for each ensemble member in parallel
-                        #  when self.obs_lon is a single value in an array
-                        obs_lon_val: Quantity[u.deg] = float(self.obs_lon.value) * u.deg
-
-                        for i, i_cme in enumerate(cme_objects):
-                            obj_res[i] = pool.apply_async(
-                                self.get_cme_flank_single_ens_member,
-                                kwds={
-                                    'cme': i_cme,
-                                    'obs_longitude': obs_lon_val,
-                                    'ens_no': i,
-                                },
-                                callback=log_result
-                            )
-                    else:
-                        # Get CME flanks for each ensemble member in parallel
-                        #  when self.obs_lon is an array with multiple values and
-                        #  extract relevant value
-                        for i, i_cme in enumerate(cme_objects):
-                            obj_res[i] = pool.apply_async(
-                                self.get_cme_flank_single_ens_member,
-                                kwds={
-                                    'cme': i_cme,
-                                    'obs_longitude': self.obs_lon[i],
-                                    'ens_no': i,
-                                },
-                                callback=log_result
-                            )
-                else:
-                    # Get CME flanks for each ensemble member in parallel
-                    #  when self.obs_lon is not in an array (i.e. a float)
-                    for i, i_cme in enumerate(cme_objects):
-                        obj_res[i] = pool.apply_async(
-                            self.get_cme_flank_single_ens_member,
-                            kwds={
-                                'cme': i_cme,
-                                'obs_longitude': self.obs_lon,
-                                'ens_no': i,
-                            },
-                            callback=log_result
-                        )
-
-                pool.close()
-                pool.join()
-            except BaseException:
-                # Release the worker processes if anything fails (or on Ctrl+C)
-                pool.terminate()
-                pool.join()
-                raise
-
-            for i, _ in enumerate(cme_objects):
-                cme_flanks[i] = obj_res[i].get()
-            print(f"Parallel cme_flanks={cme_flanks}")
-
-        else:
-            print("Using serial execution")
+            # Observer longitude for member i: self.obs_lon may be a 0-d array, one value per member,
+            #  or a single Quantity
             if isinstance(self.obs_lon, np.ndarray):
                 if np.ndim(self.obs_lon) == 0:
-                    # Get CME flanks for each ensemble member in serial
-                    #  when self.obs_lon is an array containing a single value
                     obs_lon_val: Quantity[u.deg] = float(self.obs_lon.value) * u.deg
-
-                    cme_flanks: list[pd.DataFrame] = [
-                        self.get_cme_flank_single_ens_member(
-                            cme=i_cme,
-                            obs_longitude=obs_lon_val,
-                            ens_no=i
-                        )
-                        for i, i_cme in enumerate(cme_objects)
-                    ]
+                    lon_for = lambda i: obs_lon_val
                 else:
-                    # Get CME flanks for each ensemble member in serial
-                    #  when self.obs_lon is an array containing multiple values
-                    #  and extract relevant value
-                    cme_flanks: list[pd.DataFrame] = [
-                        self.get_cme_flank_single_ens_member(
-                            cme=i_cme,
-                            obs_longitude=self.obs_lon[i],
-                            ens_no=i
-                        )
+                    lon_for = lambda i: self.obs_lon[i]
+            else:
+                lon_for = lambda i: self.obs_lon
+
+            if self.use_parallel:
+                n_proc = max(int(os.cpu_count() - 1), 1)
+                print(f"Using parallel execution ({n_proc} worker processes)")
+                pool = get_worker_pool(n_proc)
+                try:
+                    obj_res = [
+                        pool.apply_async(_cme_flank_task, (self, i_cme, lon_for(i), i))
                         for i, i_cme in enumerate(cme_objects)
                     ]
+                    results = [r.get() for r in obj_res]
+                except BaseException:
+                    # Release the worker processes if anything fails (or on Ctrl+C)
+                    close_worker_pool()
+                    raise
+
+                cme_flanks: list[pd.DataFrame] = []
+                for flank, worker_timings in results:
+                    merge_timings(worker_timings)
+                    cme_flanks.append(flank)
             else:
-                # Get CME flanks for each ensemble member in serial
-                #  when self.obs_lon is not in an array (i.e. a float)
+                print("Using serial execution")
                 cme_flanks: list[pd.DataFrame] = [
-                    self.get_cme_flank_single_ens_member(
-                        cme=i_cme,
-                        obs_longitude=self.obs_lon,
-                        ens_no=i
-                    )
+                    self.get_cme_flank_single_ens_member(cme=i_cme, obs_longitude=lon_for(i), ens_no=i)
                     for i, i_cme in enumerate(cme_objects)
                 ]
-            print(f"Serial cme_flanks = {cme_flanks}")
 
-        end_time = time.time()
-        time_taken = end_time - start_time
-
-        time_taken_minutes = int(time_taken / 60.0)
-        time_taken_rem_seconds = time_taken - (time_taken_minutes * 60.0)
-
-        print(
-            f"Time taken to complete get_cme_flanks:"
-            f" {time_taken_minutes} minutes and {time_taken_rem_seconds} seconds"
-        )
+        # Short summary (previously every member's full DataFrame was printed on every call)
+        n_no_el = sum(bool(np.isnan(f["el"].values).all()) for f in cme_flanks)
+        print(f"get_cme_flanks: {len(cme_flanks)} members, {n_no_el} without any valid elongation")
 
         return cme_flanks
 
@@ -874,6 +884,7 @@ class ObservationOperator:
         return bias_corr
 
 
+    @timed("obs_op.make_obs_op")
     def make_obs_op(self) -> npt.NDArray[float]:
         """
         obs_op: The purpose of this definition is to perform the observation operator

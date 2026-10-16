@@ -25,6 +25,7 @@ import xarray as xr
 from dotenv import load_dotenv
 
 from sir_observations import Observations
+from timing import timing_report
 
 # Re-exported for backwards compatibility (these functions were previously defined here)
 from osse_stats import weighted_median, numpy_nan_mean, numpy_nan_median, numpy_nan_std  # noqa: F401
@@ -658,6 +659,8 @@ def main() -> None:
             )
 
     # (multi-run plots: see plot_par_values_over_mult_runs and plot_par_histograms_over_mult_runs)
+
+    print(timing_report("osse_ana timing report"))
 
     return None
 

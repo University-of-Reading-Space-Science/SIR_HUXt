@@ -7,7 +7,6 @@ import json
 import pathlib
 
 import numpy as np
-import pytest
 
 DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 T0 = datetime.datetime(2012, 1, 1, 0, 0, 0)
@@ -105,6 +104,8 @@ def check_against_golden(name: str, results: dict, update: bool, rtol: float = 1
     If the baseline does not exist yet, or ``update`` is True, write it and skip the test, so the first
     run records the current behaviour and later runs check that it is reproduced.
     """
+    import pytest  # only needed here, so the helpers can also be used outside pytest (benchmark_da.py)
+
     path = DATA_DIR / f"{name}.json"
     serialisable = {k: np.asarray(v, dtype=float).tolist() for k, v in results.items()}
     if update or not path.exists():

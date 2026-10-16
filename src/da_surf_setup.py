@@ -589,7 +589,10 @@ class Setup:
             "n_runs": n_runs,
             "delta_aux_pf": delta_aux_pf,
             "pars_in_state": pars_in_state_vector,
-            "time_tolerance": time_tolerance
+            "time_tolerance": time_tolerance,
+            # Speed option: False runs the compressible observation-operator models only up to each observation
+            #  time + time_tolerance instead of a fixed 3 days (faster, may change results slightly)
+            "fixed_compressible_sim_time": True,
         }
 
         return da_par_dict

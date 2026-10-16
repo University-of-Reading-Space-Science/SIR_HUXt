@@ -34,6 +34,7 @@ from cme_par_ens import CmeParEns
 from da_surf_setup import Setup
 from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
+from timing import save_timing_report, timed, timing_report
 
 env_path = Path('.', '.env')
 load_dotenv(dotenv_path=env_path, override=True)
@@ -61,7 +62,8 @@ class RunDataAssimilationRoutine:
     """
     def __init__(self) -> None:
         """Read every setting from Setup() into attributes and get the observations."""
-        self.setup_class = Setup()
+        with timed("da.setup (incl. WSA map)"):
+            self.setup_class = Setup()
 
         # Get SURF parameters
         surf_par_dict = self.setup_class.surf_par_dict
@@ -133,7 +135,8 @@ class RunDataAssimilationRoutine:
         # Get the observations. Observer positions are made into one entry per observation.
         if self.use_synthetic_obs:
             # Generate observations
-            self.observations: list[float] = self.get_observations()
+            with timed("da.get_observations"):
+                self.observations: list[float] = self.get_observations()
             if not isinstance(self.obs_radius, list):
                 self.obs_radius = [self.obs_radius for _ in range(self.n_obs)]
 
@@ -144,9 +147,10 @@ class RunDataAssimilationRoutine:
                 self.obs_lat = [self.obs_lat for _ in range(self.n_obs)]
         else:
             # Real observations also replace obs_times, obs_lon and n_obs
-            obs_tuple: tuple[
-                list[datetime.datetime], list[Quantity[u.deg]], list[float], int
-            ] = self.get_observations()
+            with timed("da.get_observations"):
+                obs_tuple: tuple[
+                    list[datetime.datetime], list[Quantity[u.deg]], list[float], int
+                ] = self.get_observations()
 
             self.obs_times: list[datetime.datetime] = obs_tuple[0]
             self.obs_lon: list[Quantity[u.deg]] = obs_tuple[1]
@@ -196,6 +200,8 @@ class RunDataAssimilationRoutine:
         self.delta_aux_pf: float = da_par_dict["delta_aux_pf"]
         self.pars_in_state: list[str] = da_par_dict["pars_in_state"]
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
+        # Speed option (see ObservationOperator); older Setup versions do not define it
+        self.fixed_compressible_sim_time: bool = da_par_dict.get("fixed_compressible_sim_time", True)
         #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
 
 
@@ -651,6 +657,7 @@ class RunDataAssimilationRoutine:
             bias_term_5rs=self.bias_term_5rs,
             bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
+            fixed_compressible_sim_time=getattr(self, "fixed_compressible_sim_time", True),
             rng=rng
         )
 
@@ -717,6 +724,7 @@ class RunDataAssimilationRoutine:
     # ------------------------------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------------------------------
+    @timed("da.run_data_assimilation (all runs)")
     def run_data_assimilation(self, run_start: int = 0) -> None:
         """
         Run the data assimilation for n_runs runs and save each run's ensemble history.
@@ -752,7 +760,8 @@ class RunDataAssimilationRoutine:
             rng: Generator = np.random.default_rng(rand_seed)
 
             # Draw the prior ensemble and save it as step 0
-            cme_par_dict = self.make_cme_par_dict(rng=rng)
+            with timed("da.prior_draw"):
+                cme_par_dict = self.make_cme_par_dict(rng=rng)
             cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
             self.save_ensemble_state(cme_saved_pars, 0, cme_par_dict)
 
@@ -762,6 +771,8 @@ class RunDataAssimilationRoutine:
             )
 
             # Assimilate the observations one at a time
+            t_run = timed("da.assimilate_observations (per run)")
+            t_run.__enter__()
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
                 # Only assimilate if the observation time is after the first-guess CME launch and the
@@ -786,6 +797,8 @@ class RunDataAssimilationRoutine:
                 # Save the ensemble after this step (unchanged if the observation was skipped)
                 self.save_ensemble_state(cme_saved_pars, yi + 1, cme_par_dict)
 
+            t_run.__exit__(None, None, None)
+
             # Summary of the ensemble mean at each step
             for par_ind in range(7):
                 if par_ind == 6:
@@ -793,10 +806,15 @@ class RunDataAssimilationRoutine:
                 print(f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}")
 
             # Save cme_parameters into a .nc file
-            cme_par_ds = self.make_output_dataset(cme_saved_pars)
-            print(cme_par_ds)
-            outParFile = os.path.join(output_dir, "cme_pars.nc")
-            cme_par_ds.to_netcdf(outParFile, mode='w')
+            with timed("da.save_output"):
+                cme_par_ds = self.make_output_dataset(cme_saved_pars)
+                print(cme_par_ds)
+                outParFile = os.path.join(output_dir, "cme_pars.nc")
+                cme_par_ds.to_netcdf(outParFile, mode='w')
+
+            # Timing diagnostics so far (cumulative over the runs done in this process)
+            print(timing_report(f"Timing report after run {run_no} (cumulative)"))
+            save_timing_report(os.path.join(output_dir, "timings.json"))
 
         return None
 
@@ -818,6 +836,8 @@ def main() -> None:
         run_da_class.run_data_assimilation(run_start=run_start)
     else:
         run_da_class.run_data_assimilation(run_start=-1)
+
+    print(timing_report("Final timing report"))
 
     return None
 

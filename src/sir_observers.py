@@ -33,6 +33,8 @@ import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 
+from timing import timed
+
 
 def background(f: Callable) -> Callable:
     """
@@ -316,10 +318,11 @@ class ObserverSynthHI:
         ) * u.s
 
         self.n_synth_obs_times = len(self.synth_obs_times)
-        self.ast_times = Time([
-            surf_model_init_time + datetime.timedelta(seconds=s)
-            for s in self.model_times.value
-        ])
+        with timed("synth_hi.model_time_array"):
+            self.ast_times = Time([
+                surf_model_init_time + datetime.timedelta(seconds=s)
+                for s in self.model_times.value
+            ])
 
         # Observer: a real body, or a synthetic observer at a fixed position
         if craft is not None:
@@ -371,8 +374,10 @@ class ObserverSynthHI:
         # Calculate the j-maps and delta j-maps and track the CME
         if use_model == "compress_surf":
             synth_imager_class = Sim.SyntheticImager2D(synth_obs_class)
-            jmap, djmap = synth_imager_class.compute_jmap(model)
-            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+            with timed(f"synth_hi.compute_jmap.{use_model}"):
+                jmap, djmap = synth_imager_class.compute_jmap(model)
+            with timed(f"synth_hi.track_cmes.{use_model}"):
+                cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
             # Extract time and elongation profiles of synthetic HI-data
             try:
                 synth_imager_time = cme_profile["feature_00"]["t"][:]
@@ -391,8 +396,10 @@ class ObserverSynthHI:
                 elon_min=el_min,
                 elon_max=el_max
             )
-            jmap, djmap = synth_imager_class.compute_jmap(model)
-            cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+            with timed(f"synth_hi.compute_jmap.{use_model}"):
+                jmap, djmap = synth_imager_class.compute_jmap(model)
+            with timed(f"synth_hi.track_cmes.{use_model}"):
+                cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
             # Extract time and elongation profiles of synthetic HI-data
             try:
                 synth_imager_time = cme_profile["feature_00"]["t"][:]
