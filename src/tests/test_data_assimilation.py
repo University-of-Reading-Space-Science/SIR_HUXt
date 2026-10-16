@@ -33,7 +33,7 @@ for _mod in ("surf", "huxt", "sunpy", "dotenv", "stereo_spice", "tables"):
 import aux_pf
 import data_assimilation_routine as dar
 import sir_observations
-from da_test_helpers import AnalyticObservationOperator, check_against_golden
+from da_test_helpers import AnalyticArrivalTimes, AnalyticObservationOperator, check_against_golden
 from init_sir import initialise_cme_parameter_ensemble_dict
 
 T0 = datetime.datetime(2012, 1, 1, 0, 0, 0)
@@ -101,6 +101,7 @@ def analytic_model(monkeypatch):
     """Replace SURF with the analytic observation operator everywhere the DA uses it."""
     monkeypatch.setattr(aux_pf, "ObservationOperator", AnalyticObservationOperator)
     monkeypatch.setattr(sir_observations, "ObservationOperator", AnalyticObservationOperator)
+    monkeypatch.setattr(dar, "EnsembleArrivalTimes", AnalyticArrivalTimes)
 
 
 def read_runs(out_dir) -> list[dict]:

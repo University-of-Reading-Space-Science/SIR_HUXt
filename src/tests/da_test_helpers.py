@@ -75,7 +75,7 @@ class AnalyticObservationOperator:
     calls = 0
 
     def __init__(self, use_model, cme_par_dict, obs_time_in_datetime, obs_cov, craft=None, obs_lon=None,
-                 cme_init_rad=None, **kwargs):
+                 cme_init_rad=None, profile_times=None, **kwargs):
         self.cme_par_dict = cme_par_dict
         self.obs_times = (
             [obs_time_in_datetime] if isinstance(obs_time_in_datetime, datetime.datetime)
@@ -86,13 +86,66 @@ class AnalyticObservationOperator:
         import astropy.units as u
 
         self.cme_init_rad_rs = 12.0 if cme_init_rad is None else float(cme_init_rad.to(u.solRad).value)
+        self.profile_times = None if profile_times is None else list(profile_times)
+        self.model_profiles = None
+
+    def _elongations(self, times) -> np.ndarray:
+        return np.stack([
+            analytic_elongation(self.cme_par_dict, t, self.obs_lon_deg, self.cme_init_rad_rs) for t in times
+        ], axis=1)
 
     def make_obs_op(self) -> np.ndarray:
         type(self).calls += 1
-        return np.stack([
-            analytic_elongation(self.cme_par_dict, t, self.obs_lon_deg, self.cme_init_rad_rs)
-            for t in self.obs_times
-        ], axis=1)
+        if self.profile_times is not None:
+            # (n_members, n_profile_times), like ObservationOperator.model_profiles
+            self.model_profiles = self._elongations(self.profile_times)
+        return self._elongations(self.obs_times)
+
+
+class AnalyticArrivalTimes:
+    """
+    Drop-in replacement for ensemble_arrival.EnsembleArrivalTimes (same constructor keywords, same
+    ensemble_arrival() result) without SURF: each CME moves radially at constant speed from cme_init_rad at
+    t_init and hits Earth (longitude 0) if Earth is within half its width of the CME's longitude.
+    """
+    calls = 0
+
+    def __init__(self, surf_init_time, cme_init_rad=None, body="EARTH", sim_time=None, **kwargs):
+        import astropy.units as u
+
+        self.surf_init_time = surf_init_time
+        self.cme_init_rad_rs = 12.0 if cme_init_rad is None else float(cme_init_rad.to(u.solRad).value)
+        self.body = body
+        self.sim_time = 5 * u.day if sim_time is None else sim_time
+
+    def ensemble_arrival(self, cme_par_dict: dict) -> dict:
+        import astropy.units as u
+
+        type(self).calls += 1
+
+        def as_list(x):
+            if isinstance(x, datetime.datetime) or (hasattr(x, "ndim") and x.ndim == 0):
+                return [x]
+            return list(x)
+
+        t_init = as_list(cme_par_dict["t_init"])
+        v = np.array([float(x.to(u.km / u.s).value) for x in as_list(cme_par_dict["v"])])
+        lon = np.array([float(x.to(u.deg).value) for x in as_list(cme_par_dict["lon"])])
+        width = np.array([float(x.to(u.deg).value) for x in as_list(cme_par_dict["width"])])
+        travel_s = (215.032 - self.cme_init_rad_rs) * 695700.0 / v
+        arrival_s = np.array([(ti - self.surf_init_time).total_seconds() for ti in t_init]) + travel_s
+        dlon = np.abs(((lon + 180.0) % 360.0) - 180.0)
+        hit = (dlon <= width / 2.0) & (arrival_s <= float(self.sim_time.to(u.s).value))
+        arrival_s = np.where(hit, arrival_s, np.nan)
+        return {
+            "arrival_time": [
+                self.surf_init_time + datetime.timedelta(seconds=float(s)) if h else None
+                for s, h in zip(arrival_s, hit)
+            ],
+            "arrival_s": arrival_s,
+            "arrival_speed": np.where(hit, v, np.nan),
+            "hit": hit,
+        }
 
 
 # ---------------------------------------------------------------------------------------------

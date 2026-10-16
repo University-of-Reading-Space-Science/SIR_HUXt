@@ -88,6 +88,7 @@ class AuxPF:
             bias_term_21rs: float | None = None,
             use_parallel: bool = False,
             fixed_compressible_sim_time: bool = True,
+            profile_times: list[datetime.datetime] | None = None,
             rng: Generator | None = None
     ) -> None:
         """
@@ -116,6 +117,8 @@ class AuxPF:
         :param bias_term_bool, bias_term_5rs, bias_term_21rs: Optional linear elongation bias correction
         :param use_parallel: Run the ensemble members in parallel (multiprocessing)
         :param fixed_compressible_sim_time: see ObservationOperator (False = shorter, faster compressible runs)
+        :param profile_times: Optional times (e.g. all observation times) at which to also record each member's
+            modelled elongation profile, for output only (see the diagnostics set by aux_pf())
         :param rng: Random number generator (resampling and jitter)
         """
         self.use_model = use_model
@@ -148,6 +151,20 @@ class AuxPF:
         self.plot_surf_output = plot_surf_output
         self.use_parallel = use_parallel
         self.fixed_compressible_sim_time = fixed_compressible_sim_time
+        self.profile_times = None if profile_times is None else list(profile_times)
+
+        # Diagnostics filled in by aux_pf() (for output; see data_assimilation_routine / da_output):
+        #  hx_shrunk / hx_post: modelled elongation at obs_time of the shrunk (first-stage) and the new
+        #  (posterior) particles; profile_shrunk / profile_post: their profiles at profile_times;
+        #  ancestors: resampled indices; ess_prior / ess_post: effective sample sizes before / after.
+        self.hx_shrunk: npt.NDArray[float] | None = None
+        self.hx_post: npt.NDArray[float] | None = None
+        self.profile_shrunk: npt.NDArray[float] | None = None
+        self.profile_post: npt.NDArray[float] | None = None
+        self.ancestors: npt.NDArray[int] | None = None
+        self.ess_prior: float = np.nan
+        self.ess_post: float = np.nan
+        self.last_model_profiles: npt.NDArray[float] | None = None
 
         if rng is None:
             self.rng = np.random.default_rng()
@@ -404,9 +421,13 @@ class AuxPF:
             bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
             fixed_compressible_sim_time=self.fixed_compressible_sim_time,
+            profile_times=self.profile_times,
         )
 
         hx = obs_op_class.make_obs_op()
+
+        # Diagnostic profiles of this call (None if not requested or not provided by the operator)
+        self.last_model_profiles = getattr(obs_op_class, "model_profiles", None)
 
         return hx
 
@@ -557,6 +578,7 @@ class AuxPF:
         # If the prior weights are degenerate (ESS < N/2), reset them to uniform.
         #  NB: no resampling is done here, and the shrinkage in __init__ used the old weights.
         ess_prior = self.calc_ess_log_weights(self.log_weights)
+        self.ess_prior = float(ess_prior)
         if ess_prior < (self.n_members / 2.0):
             self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]
             self.weights = [1.0 / self.n_members for _ in range(self.n_members)]
@@ -569,6 +591,8 @@ class AuxPF:
         # Step 2: run the model for the shrunk particles m_i and compute the first-stage probabilities
         with timed("aux_pf.obs_op_shrunk_ensemble"):
             obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
+        self.hx_shrunk = np.asarray(obs_op_shrunk, dtype=float)[:, 0]
+        self.profile_shrunk = self.last_model_profiles
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_shrunk_ens = [
@@ -590,6 +614,7 @@ class AuxPF:
         )
         with timed("aux_pf.resample"):
             resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
+        self.ancestors = np.asarray(resample_ind, dtype=int)
 
         # Step 4: draw jittered particles from normal(shrunk_par, h^2 * cov_state)
         resample_pars: npt.NDArray[float] = np.array(
@@ -613,6 +638,8 @@ class AuxPF:
         # Step 5: run the model for the new particles and compute the second-stage weights
         with timed("aux_pf.obs_op_posterior_ensemble"):
             obs_op_post = self.get_observation_operator(self.cme_par_dict)
+        self.hx_post = np.asarray(obs_op_post, dtype=float)[:, 0]
+        self.profile_post = self.last_model_profiles
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_post = [
@@ -635,6 +662,7 @@ class AuxPF:
 
         # Calculate the effective sample size from the posterior weights
         ess_post_log = self.calc_ess_log_weights(log_weights_post)
+        self.ess_post = float(ess_post_log)
         print(f"ess_post_log = {ess_post_log}")
 
         return self.cme_par_dict

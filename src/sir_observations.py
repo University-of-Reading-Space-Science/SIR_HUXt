@@ -376,6 +376,8 @@ class Observations:
         )
 
         unpert_obs = obs_op_obj.make_obs_op()
+        # Noise-free elongations, kept for diagnostics (elongations.nc)
+        self.true_observations: list[float] = [float(x) for x in np.asarray(unpert_obs, dtype=float)[0, :]]
 
         # obs_cov is an error (co)variance, so the noise standard deviation is sqrt(obs_cov).
         #  (Previously scale=obs_cov was used, i.e. obs_cov was treated as a standard deviation.)

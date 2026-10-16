@@ -593,6 +593,17 @@ class Setup:
             # Speed option: False runs the compressible observation-operator models only up to each observation
             #  time + time_tolerance instead of a fixed 3 days (faster, may change results slightly)
             "fixed_compressible_sim_time": True,
+            # Diagnostic outputs in each run directory (see da_output.py):
+            #  elongations.nc: observed and modelled elongations at every observation step (cheap)
+            "save_elongation_output": True,
+            #  cme_arrival_times.nc: every member's arrival at arrival_body after every step. This needs one
+            #  extra model run of arrival_sim_time per member per assimilated observation (and for the prior);
+            #  set False to skip it. Members that have not arrived by the end of the run count as misses.
+            "compute_arrival_times": True,
+            "arrival_sim_time": 5 * u.day,
+            "arrival_body": "EARTH",
+            #  output cadence of the arrival runs (None = same as the DA's dt_scale; larger = less memory)
+            "arrival_dt_scale": None,
         }
 
         return da_par_dict

@@ -12,6 +12,12 @@ the observations (synthetic or from file), and for each run:
 
 Output file: variables t_init (s after model start), v (km/s), width, lon (-180..180), lat (deg),
 thick (rS) and log_weight, each (n_obs + 1, n_ens); index 0 along n_obs is the prior.
+
+Diagnostic outputs in the same directory (see da_output.py; both updated after every step):
+    elongations.nc        observed elongation profile and the modelled elongations of every member from the
+                          observation operator at each observation step (switch: save_elongation_output)
+    cme_arrival_times.nc  every member's CME arrival time at Earth after each step, from extra model runs
+                          (switch: compute_arrival_times; run length: arrival_sim_time)
 """
 import datetime
 import os
@@ -31,7 +37,9 @@ from dotenv import load_dotenv
 import make_prior_covariance_mat as mp_cov
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
+from da_output import ArrivalOutput, ElongationOutput
 from da_surf_setup import Setup
+from ensemble_arrival import EnsembleArrivalTimes
 from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
 from timing import save_timing_report, timed, timing_report
@@ -202,6 +210,12 @@ class RunDataAssimilationRoutine:
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
         # Speed option (see ObservationOperator); older Setup versions do not define it
         self.fixed_compressible_sim_time: bool = da_par_dict.get("fixed_compressible_sim_time", True)
+        # Diagnostic outputs (see da_output.py); older Setup versions do not define these
+        self.save_elongation_output: bool = da_par_dict.get("save_elongation_output", True)
+        self.compute_arrival_times: bool = da_par_dict.get("compute_arrival_times", True)
+        self.arrival_sim_time: Quantity[u.day] = da_par_dict.get("arrival_sim_time", 5 * u.day)
+        self.arrival_body: str = da_par_dict.get("arrival_body", "EARTH")
+        self.arrival_dt_scale: int | float | None = da_par_dict.get("arrival_dt_scale", None)
         #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
 
 
@@ -377,6 +391,8 @@ class RunDataAssimilationRoutine:
         # Get observations and update obs_times, n_obs and obs_lon if necessary
         if self.use_synthetic_obs:
             obs_out = obs_class.observations
+            # Noise-free truth elongations (written to elongations.nc)
+            self.true_observations = getattr(obs_class, "true_observations", None)
             return obs_out
         else:
             obs = obs_class.observations
@@ -658,8 +674,44 @@ class RunDataAssimilationRoutine:
             bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
             fixed_compressible_sim_time=getattr(self, "fixed_compressible_sim_time", True),
+            # Also sample every member's modelled profile at all observation times (for elongations.nc)
+            profile_times=list(self.obs_times) if getattr(self, "save_elongation_output", True) else None,
             rng=rng
         )
+
+
+    def make_arrival_calculator(self) -> EnsembleArrivalTimes:
+        """Arrival-time calculator using the data assimilation's model, ambient wind and CME settings."""
+        return EnsembleArrivalTimes(
+            use_model=self.use_model,
+            surf_init_time=self.surf_init_time,
+            vr_in=self.vr_in,
+            vr_longs=self.vr_longs,
+            vr_lats=self.vr_lats,
+            lon_start=self.lon_start,
+            lon_stop=self.lon_stop,
+            lat_min=getattr(self, "latitude_min", -30 * u.deg),
+            lat_max=getattr(self, "latitude_max", 30 * u.deg),
+            n_lat_surf=self.n_lat_surf,
+            r_min=self.r_min,
+            cme_init_rad=self.cme_init_rad,
+            cme_fixed_duration=self.cme_fixed_duration,
+            fixed_duration=self.fixed_duration,
+            sim_time=getattr(self, "arrival_sim_time", 5 * u.day),
+            dt_scale=getattr(self, "arrival_dt_scale", None) or self.dt_scale,
+            body=getattr(self, "arrival_body", "EARTH"),
+            use_parallel=self.use_parallel,
+        )
+
+
+    def get_true_arrival(self, calculator: EnsembleArrivalTimes) -> dict | None:
+        """Arrival of the truth CME (OSSEs only; computed once and reused by every run)."""
+        if not self.use_synthetic_obs or self.true_cme_par_dict is None:
+            return None
+        if getattr(self, "_true_arrival", None) is None:
+            with timed("da.true_cme_arrival"):
+                self._true_arrival = calculator.ensemble_arrival(self.true_cme_par_dict)
+        return self._true_arrival
 
 
     def make_output_dataset(self, cme_saved_pars: npt.NDArray[float]) -> xr.Dataset:
@@ -770,6 +822,38 @@ class RunDataAssimilationRoutine:
                 cme_par_dict=cme_par_dict, run_no=run_no
             )
 
+            # Diagnostic outputs (elongations.nc, cme_arrival_times.nc; see da_output.py)
+            save_elongations = getattr(self, "save_elongation_output", True)
+            compute_arrivals = getattr(self, "compute_arrival_times", True)
+            elong_out = ElongationOutput(
+                obs_times=self.obs_times[:len(self.observations)],
+                observations=self.observations,
+                obs_cov=self.obs_cov,
+                observer_lon=self.obs_lon[:len(self.observations)],
+                n_members=self.n_members,
+                use_model=self.use_model,
+                model_init_time=self.surf_init_time,
+                true_observations=getattr(self, "true_observations", None),
+            ) if save_elongations else None
+            arrival_out, arrival_calc = None, None
+            if compute_arrivals:
+                arrival_calc = self.make_arrival_calculator()
+                arrival_out = ArrivalOutput(
+                    obs_times=self.obs_times[:len(self.observations)],
+                    n_members=self.n_members,
+                    model_init_time=self.surf_init_time,
+                    use_model=self.use_model,
+                    body=arrival_calc.body,
+                    sim_time=arrival_calc.sim_time,
+                )
+                true_arrival = self.get_true_arrival(arrival_calc)
+                if true_arrival is not None:
+                    arrival_out.set_truth(true_arrival)
+                # Arrivals of the prior ensemble
+                with timed("da.arrival_times"):
+                    arrival_out.record(0, arrival_calc.ensemble_arrival(cme_par_dict), cme_par_dict["log_weight"])
+                arrival_out.save(output_dir, final=False)
+
             # Assimilate the observations one at a time
             t_run = timed("da.assimilate_observations (per run)")
             t_run.__enter__()
@@ -785,8 +869,10 @@ class RunDataAssimilationRoutine:
                     f"elong_min = {self.elong_min}, elong_max = {self.elong_max}, \n"
                     f" obs={obs}, obs_in_elon_range_cond = {obs_in_elon_range_cond}"
                 )
+                aux = None
                 if fg_cme_init_cond and obs_in_elon_range_cond:
-                    cme_par_dict = self.make_aux_pf(cme_par_dict, obs, yi, rng).aux_pf()
+                    aux = self.make_aux_pf(cme_par_dict, obs, yi, rng)
+                    cme_par_dict = aux.aux_pf()
                 elif fg_cme_init_cond:
                     print("Observation is outside the permitted elongation range for the model")
                 elif obs_in_elon_range_cond:
@@ -796,6 +882,19 @@ class RunDataAssimilationRoutine:
 
                 # Save the ensemble after this step (unchanged if the observation was skipped)
                 self.save_ensemble_state(cme_saved_pars, yi + 1, cme_par_dict)
+
+                # Diagnostics for this step (arrivals are only recomputed if the ensemble changed)
+                if elong_out is not None:
+                    elong_out.record_step(yi, aux, cme_par_dict["log_weight"])
+                    elong_out.save(output_dir, final=False)
+                if arrival_out is not None:
+                    if aux is not None:
+                        with timed("da.arrival_times"):
+                            arrivals = arrival_calc.ensemble_arrival(cme_par_dict)
+                    else:
+                        arrivals = None
+                    arrival_out.record(yi + 1, arrivals, cme_par_dict["log_weight"])
+                    arrival_out.save(output_dir, final=False)
 
             t_run.__exit__(None, None, None)
 
@@ -811,6 +910,10 @@ class RunDataAssimilationRoutine:
                 print(cme_par_ds)
                 outParFile = os.path.join(output_dir, "cme_pars.nc")
                 cme_par_ds.to_netcdf(outParFile, mode='w')
+                if elong_out is not None:
+                    print(f"Elongations saved to {elong_out.save(output_dir)}")
+                if arrival_out is not None:
+                    print(f"CME arrival times saved to {arrival_out.save(output_dir)}")
 
             # Timing diagnostics so far (cumulative over the runs done in this process)
             print(timing_report(f"Timing report after run {run_no} (cumulative)"))

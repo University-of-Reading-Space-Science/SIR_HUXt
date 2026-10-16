@@ -50,6 +50,37 @@ def background(f: Callable) -> Callable:
     return wrapped
 
 
+def sample_track(
+        track_time: npt.ArrayLike,
+        track_elon: npt.ArrayLike,
+        times: npt.ArrayLike,
+) -> npt.NDArray[float]:
+    """
+    Linearly interpolate a tracked time-elongation profile to ``times`` (same time units as track_time).
+    Unlike the observation operator's np.interp, times outside the tracked range give NaN rather than the
+    first/last tracked value.
+    :param track_time: Tracked times (may be a scalar NaN if nothing was tracked)
+    :param track_elon: Tracked elongations (deg)
+    :param times: Times to sample
+    :return: Elongations at ``times`` (NaN where unavailable)
+    """
+    times = np.atleast_1d(np.asarray(times, dtype=float))
+    t = np.atleast_1d(np.asarray(track_time, dtype=float))
+    e = np.atleast_1d(np.asarray(track_elon, dtype=float))
+    out = np.full(times.shape, np.nan)
+    if t.shape != e.shape:
+        return out
+    ok = np.isfinite(t) & np.isfinite(e)
+    if not ok.any():
+        return out
+    t, e = t[ok], e[ok]
+    order = np.argsort(t)
+    t, e = t[order], e[order]
+    inside = (times >= t[0]) & (times <= t[-1])
+    out[inside] = np.interp(times[inside], t, e)
+    return out
+
+
 class SynthObsEphem:
     """
     Class to hold observation time, radius, latitude and longitude for use in initialising
@@ -246,6 +277,7 @@ class ObserverSynthHI:
             el_min: float=4.0,
             el_max: float=30.0,
             hi_resolution: Quantity[u.s] | Quantity[u.hour] | Quantity[u.day]=1.0 * u.hour,
+            profile_times: list[datetime.datetime] | None = None,
     ):
         """
         Generate the synthetic HI profile and extract the elongation at the observation time(s)
@@ -261,6 +293,8 @@ class ObserverSynthHI:
         :param el_min: Minimum elongation
         :param el_max: Maximum elongation
         :param hi_resolution: Temporal resolution to model the HI data in
+        :param profile_times: Optional extra times at which to sample the tracked profile (diagnostics);
+            the result is ``self.model_profile`` (NaN outside the tracked time range, no extrapolation)
         """
 
         self.use_model: str = use_model
@@ -430,3 +464,11 @@ class ObserverSynthHI:
         }
 
         self.model_flank: pd.DataFrame = pd.DataFrame(flank_data)
+
+        # Tracked profile sampled at the optional diagnostic times
+        self.model_profile: npt.NDArray[float] | None = None
+        if profile_times is not None:
+            profile_days = np.array([
+                (pt - surf_model_init_time).total_seconds() for pt in profile_times
+            ]) / 86400.0
+            self.model_profile = sample_track(synth_imager_time, synth_imager_elon, profile_days)

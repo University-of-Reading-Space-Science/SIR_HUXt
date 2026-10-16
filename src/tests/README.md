@@ -18,6 +18,7 @@ Tests needing a package that isn't installed (astropy, xarray, surf, huxt, sunpy
 | `test_state_vector_and_priors.py` | dict <-> array <-> state-vector conversions, uncorrelated / uniform / Blair priors, Met Office cone file selection |
 | `test_setup_and_operators.py` | `init_sir`, `da_surf_setup.Setup` (no WSA download), observation-operator helpers, bias correction, arrival-time helpers, WSA URLs |
 | `test_aux_pf.py` | Liu & West shrinkage, kernel covariance, ESS, weight normalisation, convergence towards the observation, NaN handling, ancestor bookkeeping, determinism |
+| `test_da_output.py` | `elongations.nc` / `cme_arrival_times.nc`: profile sampling, Aux-PF bookkeeping, arrival statistics, the whole pipeline with analytic stand-ins (outputs consistent with `cme_pars.nc`, skipped steps, switches, results unchanged); `--run-slow`: real SURF/HUXt arrivals and a small SURF pipeline |
 | `test_data_assimilation.py` | `RunDataAssimilationRoutine` helpers and the whole pipeline, plus the **regression tests** |
 
 ## Regression tests

@@ -194,6 +194,7 @@ class ObservationOperator:
             bias_term_21rs: float = None,
             use_parallel: bool = True,
             fixed_compressible_sim_time: bool = True,
+            profile_times: list[datetime.datetime] | None = None,
     ) -> None:
         """
         Class to get observations operator for DA from
@@ -231,6 +232,10 @@ class ObservationOperator:
             fixed 3 days (default, as before). If False they are run for ``sim_time`` instead (the Aux-PF sets
             this to the observation time + time_tolerance), which is faster for early observations but can
             change the tracked elongations slightly.
+        :param profile_times: Optional extra times (e.g. every observation time) at which to sample each
+            member's modelled elongation profile, for diagnostics only (does not change make_obs_op's result).
+            After make_obs_op, ``self.model_profiles`` is an (n_members, len(profile_times)) array, NaN where
+            the profile is not available (see get_member_profile).
         :param vr_longs, vr_lats: Coordinates of vr_in (needed for compress_surf3d)
         :param br_in, br_longs, br_lats: Inner-boundary magnetic field and coordinates (not currently used)
         :param n_lon_surf, n_lat_surf: Grid sizes for SURF3d
@@ -386,6 +391,12 @@ class ObservationOperator:
         # Run length for the compressible models (see fixed_compressible_sim_time)
         self.fixed_compressible_sim_time = fixed_compressible_sim_time
         self.compressible_sim_time = 3 * u.day if fixed_compressible_sim_time else self.sim_time
+
+        # Optional diagnostic profile times (see get_member_profile) and the result of the last make_obs_op
+        self.profile_times: list[datetime.datetime] | None = (
+            None if profile_times is None else list(profile_times)
+        )
+        self.model_profiles: npt.NDArray[float] | None = None
 
 
     # ------------------------------------------------------------------------------------------
@@ -774,7 +785,8 @@ class ObservationOperator:
                 obs_longitude=obs_longitude,
                 obs_latitude=obs_latitude,
                 el_min=4.0,
-                el_max=30.0
+                el_max=30.0,
+                profile_times=self.profile_times,
             )
             cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
             add_timing("obs_op.observer_synthetic_hi", time.perf_counter() - t_observer)
@@ -797,10 +809,52 @@ class ObservationOperator:
         if ens_no is not None:
             cme_flank.index = [ens_no for _ in range(len(cme_flank.index))]
 
+        # Diagnostic profile at self.profile_times, carried back (also from worker processes) in the
+        #  DataFrame's attrs
+        if self.profile_times is not None:
+            if self.use_model in ["huxt", "surf"]:
+                cme_flank.attrs["el_profile"] = self.tracer_profile(cme_flank)
+            else:
+                cme_flank.attrs["el_profile"] = obs_synth_HI_class.model_profile
+
         if self.plot_surf_output:
             self.plot_surf(model)
 
         return cme_flank
+
+
+    def tracer_profile(self, cme_flank: pd.DataFrame) -> npt.NDArray[float]:
+        """
+        Elongation of a tracer flank profile (surf / huxt) at self.profile_times: the value at the nearest
+        model output time, as make_obs_op does (including the optional bias correction). NaN for times
+        outside the model run.
+        :param cme_flank: Flank DataFrame on the model time grid ("time" in JD, "el" in deg)
+        :return: (len(profile_times),) array
+        """
+        model_jd = np.asarray(cme_flank["time"].values, dtype=float)
+        el = np.asarray(cme_flank["el"].values, dtype=float)
+        profile = np.full(len(self.profile_times), np.nan)
+        if model_jd.size == 0:
+            return profile
+        # Half an output step of tolerance at either end of the run
+        half_step = 0.5 * float(np.median(np.diff(model_jd))) if model_jd.size > 1 else 0.0
+        for k, t_jd in enumerate(Time(self.profile_times, format="datetime").jd):
+            if (t_jd < model_jd.min() - half_step) or (t_jd > model_jd.max() + half_step):
+                continue
+            value = el[int(np.argmin(np.round(np.abs(model_jd - t_jd), 9)))]
+            if self.bias_term_bool and np.isfinite(value):
+                value = value + self.obs_op_bias_correction(elon=value)
+            profile[k] = value
+        return profile
+
+
+    def get_member_profile(self, cme_flank: pd.DataFrame) -> npt.NDArray[float]:
+        """The diagnostic profile attached to a member's flank DataFrame (all NaN if there is none)."""
+        profile = cme_flank.attrs.get("el_profile", None) if hasattr(cme_flank, "attrs") else None
+        n_times = len(self.profile_times)
+        if profile is None or np.size(profile) != n_times:
+            return np.full(n_times, np.nan)
+        return np.asarray(profile, dtype=float).reshape(n_times)
 
 
     def get_cme_flanks(self) -> list[pd.DataFrame]:
@@ -848,6 +902,10 @@ class ObservationOperator:
                     self.get_cme_flank_single_ens_member(cme=i_cme, obs_longitude=lon_for(i), ens_no=i)
                     for i, i_cme in enumerate(cme_objects)
                 ]
+
+        # Diagnostic profiles (NaN for members without one, e.g. operators that do not compute them)
+        if self.profile_times is not None:
+            self.model_profiles = np.array([self.get_member_profile(f) for f in cme_flanks], dtype=float)
 
         # Short summary (previously every member's full DataFrame was printed on every call)
         n_no_el = sum(bool(np.isnan(f["el"].values).all()) for f in cme_flanks)
