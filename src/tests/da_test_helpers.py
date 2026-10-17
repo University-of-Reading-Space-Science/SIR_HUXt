@@ -5,6 +5,7 @@ stands in for SURF in the fast regression test, and baseline (golden file) handl
 import datetime
 import json
 import pathlib
+import time
 
 import numpy as np
 
@@ -67,15 +68,28 @@ def analytic_elongation(cme_par_dict: dict, obs_time: datetime.datetime, obs_lon
     return el
 
 
+# Emulated cost of the stand-ins (seconds of sleep per member per model-day; 0 = free). compare_da_schemes.py
+#  sets it so that timings reflect the number AND length of the model runs a scheme makes.
+EMULATED_SECONDS_PER_MODEL_DAY = 0.0
+
+
+def _emulate_cost(n_members: int, days: float) -> None:
+    if EMULATED_SECONDS_PER_MODEL_DAY > 0:
+        time.sleep(EMULATED_SECONDS_PER_MODEL_DAY * n_members * days)
+
+
 class AnalyticObservationOperator:
     """
     Drop-in replacement for sir_observation_operator.ObservationOperator (same constructor keywords,
     same make_obs_op() output shape) that uses analytic_elongation instead of running SURF.
+    With arrival_body set it also gives member_arrivals from the same "runs" (AnalyticArrivalTimes' formula).
+    Emulated run length (EMULATED_SECONDS_PER_MODEL_DAY): 3 days, or arrival_sim_time if arrivals are asked for.
     """
     calls = 0
 
     def __init__(self, use_model, cme_par_dict, obs_time_in_datetime, obs_cov, craft=None, obs_lon=None,
-                 cme_init_rad=None, profile_times=None, **kwargs):
+                 cme_init_rad=None, profile_times=None, arrival_body=None, arrival_sim_time=None,
+                 surf_init_time=None, **kwargs):
         self.cme_par_dict = cme_par_dict
         self.obs_times = (
             [obs_time_in_datetime] if isinstance(obs_time_in_datetime, datetime.datetime)
@@ -88,6 +102,10 @@ class AnalyticObservationOperator:
         self.cme_init_rad_rs = 12.0 if cme_init_rad is None else float(cme_init_rad.to(u.solRad).value)
         self.profile_times = None if profile_times is None else list(profile_times)
         self.model_profiles = None
+        self.arrival_body = arrival_body
+        self.arrival_sim_time = 5 * u.day if arrival_sim_time is None else arrival_sim_time
+        self.surf_init_time = surf_init_time or cme_par_dict.get("surf_init_time")
+        self.member_arrivals = None
 
     def _elongations(self, times) -> np.ndarray:
         return np.stack([
@@ -95,10 +113,22 @@ class AnalyticObservationOperator:
         ], axis=1)
 
     def make_obs_op(self) -> np.ndarray:
+        import astropy.units as u
+
         type(self).calls += 1
+        n = int(self.cme_par_dict["n_members"])
+        days = 3.0
         if self.profile_times is not None:
             # (n_members, n_profile_times), like ObservationOperator.model_profiles
             self.model_profiles = self._elongations(self.profile_times)
+        if self.arrival_body is not None:
+            calc = AnalyticArrivalTimes(self.surf_init_time, cme_init_rad=self.cme_init_rad_rs * u.solRad,
+                                        sim_time=self.arrival_sim_time, emulate=False)
+            res = calc.ensemble_arrival(self.cme_par_dict)
+            self.member_arrivals = [(t, float(v), bool(h)) for t, v, h in
+                                    zip(res["arrival_time"], res["arrival_speed"], res["hit"])]
+            days = max(days, float(self.arrival_sim_time.to(u.day).value))
+        _emulate_cost(n, days)
         return self._elongations(self.obs_times)
 
 
@@ -110,9 +140,10 @@ class AnalyticArrivalTimes:
     """
     calls = 0
 
-    def __init__(self, surf_init_time, cme_init_rad=None, body="EARTH", sim_time=None, **kwargs):
+    def __init__(self, surf_init_time, cme_init_rad=None, body="EARTH", sim_time=None, emulate=True, **kwargs):
         import astropy.units as u
 
+        self.emulate = emulate
         self.surf_init_time = surf_init_time
         self.cme_init_rad_rs = 12.0 if cme_init_rad is None else float(cme_init_rad.to(u.solRad).value)
         self.body = body
@@ -121,7 +152,8 @@ class AnalyticArrivalTimes:
     def ensemble_arrival(self, cme_par_dict: dict) -> dict:
         import astropy.units as u
 
-        type(self).calls += 1
+        if self.emulate:
+            type(self).calls += 1
 
         def as_list(x):
             if isinstance(x, datetime.datetime) or (hasattr(x, "ndim") and x.ndim == 0):
@@ -129,6 +161,8 @@ class AnalyticArrivalTimes:
             return list(x)
 
         t_init = as_list(cme_par_dict["t_init"])
+        if self.emulate:
+            _emulate_cost(len(t_init), float(self.sim_time.to(u.day).value))
         v = np.array([float(x.to(u.km / u.s).value) for x in as_list(cme_par_dict["v"])])
         lon = np.array([float(x.to(u.deg).value) for x in as_list(cme_par_dict["lon"])])
         width = np.array([float(x.to(u.deg).value) for x in as_list(cme_par_dict["width"])])

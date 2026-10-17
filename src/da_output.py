@@ -17,12 +17,15 @@ elongations.nc  - observed elongation profile and the modelled elongations from 
     ancestor(step, n_ens)            resampled (first-stage) index of each new particle (-1 if skipped)
     log_weight(step, n_ens)          posterior log-weights after step k
     ess_prior(step), ess_posterior(step)  effective sample size before / after step k
+    lookahead_reused(step, n_ens)    1 if the member's first-stage value came from its stored track
+                                     (reuse_lookahead_tracks), 0 if it was run at its shrunk point
+    model_runs(step)                 forward-model runs made in the step (first + second stage)
 
 cme_arrival_times.nc - arrival of every member at the target body (Earth) after every step
     dims: n_obs (0 = prior, k + 1 = after assimilating observation k, as in cme_pars.nc), n_ens
     arrival_time(n_obs, n_ens)       datetime (NaT if the member misses or has not arrived by the end of the run)
     arrival_time_s(n_obs, n_ens)     seconds after model_init_time (NaN for a miss)
-    arrival_speed(n_obs, n_ens)      km/s (NaN for a miss)
+    arrival_speed(n_obs, n_ens)      km/s (NaN for a miss; compressible models: model wind speed at Earth on arrival)
     hit(n_obs, n_ens), log_weight(n_obs, n_ens)
     hit_fraction / weighted_hit_fraction(n_obs), weighted_mean_arrival_time(n_obs),
     weighted_sd_arrival_hours(n_obs), median_arrival_time(n_obs)   (weights renormalised over the hits)
@@ -83,7 +86,9 @@ class ElongationOutput:
             use_model: str,
             model_init_time: datetime.datetime,
             true_observations: list[float] | None = None,
+            reuse_lookahead_tracks: bool = False,
     ) -> None:
+        self.reuse_lookahead_tracks = bool(reuse_lookahead_tracks)
         self.obs_times = list(obs_times)
         self.observations = np.asarray(observations, dtype=float)
         self.n_obs = len(self.obs_times)
@@ -106,6 +111,11 @@ class ElongationOutput:
         self.log_weight = np.full((n, m), np.nan)
         self.ess_prior = np.full(n, np.nan)
         self.ess_posterior = np.full(n, np.nan)
+        self.lookahead_reused = np.zeros((n, m), dtype=np.int8)
+        self.model_runs = np.zeros(n, dtype=np.int32)
+        self.hx_at_shrunk_points = np.full((n, m), np.nan)
+        # forward-model runs of the prior particles before the first step (combine_arrival_runs)
+        self.prior_model_runs = 0
 
     def record_step(self, step: int, aux, log_weight: npt.ArrayLike) -> None:
         """
@@ -127,6 +137,11 @@ class ElongationOutput:
         self.ancestor[step] = aux.ancestors
         self.ess_prior[step] = aux.ess_prior
         self.ess_posterior[step] = aux.ess_post
+        self.lookahead_reused[step] = np.asarray(getattr(aux, "lookahead_reused", np.zeros(self.n_members)),
+                                                 dtype=np.int8)
+        self.model_runs[step] = int(getattr(aux, "n_model_runs", 0))
+        if getattr(aux, "hx_at_shrunk_points", None) is not None:
+            self.hx_at_shrunk_points[step] = aux.hx_at_shrunk_points
 
     def to_dataset(self) -> xr.Dataset:
         """The collected values as an xarray Dataset."""
@@ -152,6 +167,12 @@ class ElongationOutput:
             log_weight=(["step", "n_ens"], self.log_weight, {"long_name": "posterior log-weight after step"}),
             ess_prior=(["step"], self.ess_prior, {"long_name": "effective sample size before the step"}),
             ess_posterior=(["step"], self.ess_posterior, {"long_name": "effective sample size after the step"}),
+            lookahead_reused=(["step", "n_ens"], self.lookahead_reused,
+                              {"long_name": "1 if the first-stage value came from the member's stored track"}),
+            model_runs=(["step"], self.model_runs, {"long_name": "forward-model runs in the step (both stages)"}),
+            hx_at_shrunk_points=(["step", "n_ens"], self.hx_at_shrunk_points,
+                                 {"units": "deg", "long_name": "check_lookahead_tracks only: modelled elongation at "
+                                                              "the shrunk points (what the original scheme uses)"}),
         )
         if self.true_observations is not None:
             data_vars["obs_true_elongation"] = (
@@ -165,7 +186,9 @@ class ElongationOutput:
                 ens_no=("n_ens", np.arange(self.n_members)),
                 obs_time=("obs", to_datetime64(self.obs_times)),
             ),
-            attrs={"use_model": self.use_model,
+            attrs={"use_model": self.use_model, "reuse_lookahead_tracks": int(self.reuse_lookahead_tracks),
+                   "total_model_runs": int(self.model_runs.sum()) + int(self.prior_model_runs),
+                   "prior_model_runs": int(self.prior_model_runs),
                    "description": "Observed and modelled (observation-operator) elongations; see da_output.py"},
         )
 
@@ -204,6 +227,9 @@ class ArrivalOutput:
         self.log_weight = np.full((n, m), np.nan)
         self.true_arrival_time: datetime.datetime | None = None
         self.true_arrival_speed: float = np.nan
+        # "separate": own model runs (ensemble_arrival); "combined": from the data assimilation's runs
+        self.source = "separate"
+        self.separate_runs = 0
 
     def record(self, step: int, result: dict | None, log_weight: npt.ArrayLike) -> None:
         """
@@ -301,7 +327,8 @@ class ArrivalOutput:
                 # time of the observation assimilated in each step (NaT for the prior)
                 obs_time=("n_obs", to_datetime64([None] + self.obs_times)),
             ),
-            attrs={"use_model": self.use_model, "body": self.body,
+            attrs={"use_model": self.use_model, "body": self.body, "arrival_source": self.source,
+                   "separate_arrival_runs": int(self.separate_runs),
                    "description": "CME arrival times of every ensemble member after every assimilation step; "
                                   "step 0 is the prior (see da_output.py)"},
         )

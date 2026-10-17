@@ -39,7 +39,8 @@ TRUTH_T_INIT = T0 + datetime.timedelta(hours=1)
 
 
 def make_osse(out_dir: str, use_model: str, n_members: int, n_obs: int, n_runs: int, use_parallel: bool,
-              n_lat_surf: int = 9, fixed_compressible_sim_time: bool = True):
+              n_lat_surf: int = 9, fixed_compressible_sim_time: bool = True,
+              reuse_lookahead_tracks: bool = False):
     """A RunDataAssimilationRoutine configured as a small synthetic OSSE (bypasses Setup / WSA)."""
     import data_assimilation_routine as dar
     from init_sir import initialise_cme_parameter_ensemble_dict
@@ -88,10 +89,23 @@ def make_osse(out_dir: str, use_model: str, n_members: int, n_obs: int, n_runs: 
     r.n_members, r.n_runs, r.delta_aux_pf = n_members, n_runs, 0.98
     r.pars_in_state, r.time_tolerance = ["v", "width", "lon"], 0.5 * u.day
     r.fixed_compressible_sim_time = fixed_compressible_sim_time
+    r.reuse_lookahead_tracks = reuse_lookahead_tracks
     with timing.timed("da.get_observations"):
         r.observations = r.get_observations()
     r.obs_radius, r.obs_lon, r.obs_lat = [r.obs_radius] * n_obs, [r.obs_lon] * n_obs, [r.obs_lat] * n_obs
     return r
+
+
+def use_analytic_model() -> None:
+    """Replace SURF by the analytic stand-ins used by the tests (observation operator and arrival times)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+    import aux_pf
+    import data_assimilation_routine
+    import sir_observations
+    from da_test_helpers import AnalyticArrivalTimes, AnalyticObservationOperator
+    aux_pf.ObservationOperator = AnalyticObservationOperator
+    sir_observations.ObservationOperator = AnalyticObservationOperator
+    data_assimilation_routine.EnsembleArrivalTimes = AnalyticArrivalTimes
 
 
 def main(argv=None) -> None:
@@ -101,10 +115,12 @@ def main(argv=None) -> None:
     p.add_argument("--members", type=int, default=8)
     p.add_argument("--obs", type=int, default=3)
     p.add_argument("--runs", type=int, default=1)
-    p.add_argument("--n-lat-surf", type=int, default=9, help="latitudes for compress_surf3d")
+    p.add_argument("--n-lat-surf", type=int, default=9, help="not used by the DA runs any more: compress_surf3d uses the imager FoV grid (1 deg)")
     p.add_argument("--parallel", action="store_true", help="run the members on the worker pool")
     p.add_argument("--short-runs", action="store_true",
                    help="fixed_compressible_sim_time=False: run compressible models only to each obs time")
+    p.add_argument("--reuse-lookahead", action="store_true",
+                   help="reuse_lookahead_tracks=True: first stage from the stored tracks (N instead of 2N runs)")
     p.add_argument("--no-arrivals", action="store_true",
                    help="skip the per-step CME arrival-time runs (compute_arrival_times=False)")
     p.add_argument("--profile", action="store_true", help="also print a cProfile listing")
@@ -114,15 +130,7 @@ def main(argv=None) -> None:
 
     use_model = a.model
     if a.model == "analytic":
-        # Replace SURF by the analytic stand-in used by the regression tests
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
-        import aux_pf
-        import sir_observations
-        import data_assimilation_routine
-        from da_test_helpers import AnalyticArrivalTimes, AnalyticObservationOperator
-        aux_pf.ObservationOperator = AnalyticObservationOperator
-        sir_observations.ObservationOperator = AnalyticObservationOperator
-        data_assimilation_routine.EnsembleArrivalTimes = AnalyticArrivalTimes
+        use_analytic_model()
         use_model = "compress_surf"
 
     out_dir = a.out or tempfile.mkdtemp(prefix="sir_benchmark_")
@@ -134,7 +142,8 @@ def main(argv=None) -> None:
     if profiler:
         profiler.enable()
     routine = make_osse(out_dir, use_model, a.members, a.obs, a.runs, a.parallel, a.n_lat_surf,
-                        fixed_compressible_sim_time=not a.short_runs)
+                        fixed_compressible_sim_time=not a.short_runs,
+                        reuse_lookahead_tracks=a.reuse_lookahead)
     routine.compute_arrival_times = not a.no_arrivals
     routine.run_data_assimilation(run_start=0)
     if profiler:

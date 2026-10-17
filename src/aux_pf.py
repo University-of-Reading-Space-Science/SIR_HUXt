@@ -17,6 +17,15 @@ Algorithm for one observation y (``AuxPF.aux_pf``), with particles x_i and log-w
 
 ``delta_aux_pf`` (typically 0.95-0.99) is Liu & West's discount factor: values close to one give little
 shrinkage and little jitter.
+
+Optional look-ahead reuse (``lookahead``, see data_assimilation_routine ``reuse_lookahead_tracks``): the
+first-stage weights may use any positive g_i, provided the second stage divides by the same g. Instead of running
+the model at the shrunk points m_i (step 2), g_i = p(y | x_i) can be taken from the elongation tracks that the
+previous step's second-stage runs already produced for the current particles x_i (their runs cover all later
+observation times). Steps 1 (shrink) and 4 (jitter) are unchanged, so the kernel still preserves the ensemble mean
+and covariance; only N rather than 2N model runs are needed per observation. Members without a usable stored track
+fall back to a run at m_i (standard Liu-West), and the reuse is skipped if the observer position differs from the
+one the tracks were computed for.
 """
 import copy
 import datetime
@@ -42,6 +51,38 @@ from timing import timed
 warnings.filterwarnings(
     "ignore", message="invalid value encountered in divide"
 )
+
+
+def same_observer(a, b) -> bool:
+    """Whether two observer ids (AuxPF.observer_of) describe the same observer."""
+    if a is None or b is None:
+        return False
+    a, b = tuple(a), tuple(b)
+    if a and isinstance(a[0], str):
+        if not (b and isinstance(b[0], str)) or a[0] != b[0] or len(a) != len(b):
+            return False
+        if a[0] == "craft":
+            return a[1] == b[1]
+        return bool(np.allclose(np.asarray(a[1:], dtype=float), np.asarray(b[1:], dtype=float), rtol=0, atol=1e-6))
+    # legacy (r, lon, lat) tuples
+    return len(a) == len(b) and bool(np.allclose(np.asarray(a, dtype=float), np.asarray(b, dtype=float),
+                                                 rtol=0, atol=1e-6))
+
+
+def subset_cme_par_dict(cme_par_dict: CmeParEns, indices: npt.ArrayLike) -> CmeParEns:
+    """A copy of cme_par_dict containing only the members ``indices`` (per-member entries are indexed)."""
+    idx = np.asarray(indices, dtype=int)
+    n = cme_par_dict["n_members"]
+    out = {}
+    for key, value in cme_par_dict.items():
+        if isinstance(value, Quantity) and value.ndim == 1 and len(value) == n:
+            out[key] = value[idx]
+        elif isinstance(value, (list, tuple, np.ndarray)) and len(value) == n:
+            out[key] = [value[i] for i in idx]
+        else:
+            out[key] = copy.deepcopy(value)
+    out["n_members"] = int(idx.size)
+    return out
 
 
 class AuxPF:
@@ -89,6 +130,13 @@ class AuxPF:
             use_parallel: bool = False,
             fixed_compressible_sim_time: bool = True,
             profile_times: list[datetime.datetime] | None = None,
+            lookahead: dict | None = None,
+            sim_time_end: datetime.datetime | None = None,
+            check_lookahead: bool = False,
+            moving_craft_observer: bool = False,
+            arrival_body: str | None = None,
+            arrival_sim_time: Quantity[u.day] | None = None,
+            n_workers: int | None = None,
             rng: Generator | None = None
     ) -> None:
         """
@@ -119,6 +167,20 @@ class AuxPF:
         :param fixed_compressible_sim_time: see ObservationOperator (False = shorter, faster compressible runs)
         :param profile_times: Optional times (e.g. all observation times) at which to also record each member's
             modelled elongation profile, for output only (see the diagnostics set by aux_pf())
+        :param lookahead: Optional stored tracks of the CURRENT particles for the first stage (see the module
+            docstring): {"profiles": (n_members, n_profile_times) elongations from the previous step's
+            second-stage runs, "index": column of profiles at obs_time, "observer": (r AU, lon deg, lat deg) the
+            tracks were computed for}
+        :param sim_time_end: Optional time the model runs must reach (surf / huxt only; e.g. the last observation
+            time, so that the second-stage tracks can be reused at later observations)
+        :param check_lookahead: Diagnostic only: when stored tracks are used, ALSO run the shrunk points and keep
+            their elongations in self.hx_at_shrunk_points, to measure the look-ahead approximation (extra runs,
+            not counted in n_model_runs; the filter still uses the stored tracks)
+        :param moving_craft_observer: see ObservationOperator (real craft: image from the craft's trajectory, so
+            stored tracks can be reused at later observation times)
+        :param arrival_body, arrival_sim_time: If arrival_body is set, the second-stage runs also give every new
+            particle's arrival at that body (self.post_arrivals), see ObservationOperator
+        :param n_workers: Members to run at the same time (default: limited by CPUs and memory, memory_budget.py)
         :param rng: Random number generator (resampling and jitter)
         """
         self.use_model = use_model
@@ -152,6 +214,17 @@ class AuxPF:
         self.use_parallel = use_parallel
         self.fixed_compressible_sim_time = fixed_compressible_sim_time
         self.profile_times = None if profile_times is None else list(profile_times)
+        self.lookahead = lookahead
+        self.sim_time_end = sim_time_end
+        self.check_lookahead = check_lookahead
+        self.moving_craft_observer = moving_craft_observer
+        self.arrival_body = arrival_body
+        self.arrival_sim_time = arrival_sim_time
+        self.n_workers = n_workers
+        #  post_arrivals: [(arrival datetime or None, speed km/s, hit)] of the new particles (arrival_body only)
+        self.post_arrivals: list | None = None
+        self.last_member_arrivals: list | None = None
+        self.hx_at_shrunk_points: npt.NDArray[float] | None = None
 
         # Diagnostics filled in by aux_pf() (for output; see data_assimilation_routine / da_output):
         #  hx_shrunk / hx_post: modelled elongation at obs_time of the shrunk (first-stage) and the new
@@ -165,6 +238,13 @@ class AuxPF:
         self.ess_prior: float = np.nan
         self.ess_post: float = np.nan
         self.last_model_profiles: npt.NDArray[float] | None = None
+        #  lookahead_reused: True for members whose first-stage value came from a stored track;
+        #  n_model_runs: members run through the forward model in this step (first + second stage);
+        #  post_observer: observer position (r AU, lon deg, lat deg) of the second-stage runs
+        self.lookahead_reused: npt.NDArray[bool] = np.zeros(cme_par_dict["n_members"], dtype=bool)
+        self.n_model_runs: int = 0
+        self.post_observer: tuple | None = None
+        self.last_observer: tuple | None = None
 
         if rng is None:
             self.rng = np.random.default_rng()
@@ -344,6 +424,13 @@ class AuxPF:
 
         sim_time = (obs_astro_time - init_astro_time).to(u.day) + self.time_tolerance
 
+        # surf / huxt run only as long as needed; extend them so their tracks cover later observations
+        #  (the compressible models already run for a fixed length, see ObservationOperator)
+        end = getattr(self, "sim_time_end", None)
+        if end is not None and self.use_model in ["surf", "huxt"] and end > self.obs_time:
+            end_astro_time = Time(end, format="datetime", scale="utc")
+            sim_time = (end_astro_time - init_astro_time).to(u.day) + self.time_tolerance
+
         return sim_time
 
 
@@ -386,14 +473,20 @@ class AuxPF:
         return log_weights
 
 
-    def get_observation_operator(self, state_dict_in: CmeParEns) -> npt.NDArray[float]:
+    def make_observation_operator(self, state_dict_in: CmeParEns, with_arrival: bool = False):
         """
-        Run the forward model for every ensemble member in state_dict_in and return the predicted
-        observations.
-        :param state_dict_in: CME parameter ensemble to run
-        :return: hx: (n_members, n_obs_times) array of model elongations at self.obs_time
+        The observation operator for an ensemble (constructing it runs no model).
+        :param with_arrival: also compute the members' arrival at self.arrival_body from the same runs
         """
-        obs_op_class = ObservationOperator(
+        extra = {}
+        if getattr(self, "n_workers", None) is not None:
+            extra["n_workers"] = self.n_workers
+        if self.moving_craft_observer:
+            extra["moving_craft_observer"] = True
+        if with_arrival and self.arrival_body is not None:
+            extra["arrival_body"] = self.arrival_body
+            extra["arrival_sim_time"] = self.arrival_sim_time
+        return ObservationOperator(
             use_model=self.use_model,
             cme_par_dict=state_dict_in,
             obs_radius=self.obs_radius,
@@ -422,13 +515,97 @@ class AuxPF:
             use_parallel=self.use_parallel,
             fixed_compressible_sim_time=self.fixed_compressible_sim_time,
             profile_times=self.profile_times,
+            **extra,
         )
 
+
+    def observer_of(self, obs_op_class) -> tuple:
+        """
+        What the operator's modelled tracks depend on, observer-wise (ObservationOperator.observer_id):
+        ("craft", name) when the imager follows a real craft's trajectory, else ("position", r AU, lon deg,
+        lat deg) of the fixed observer (for a real craft without moving_craft_observer: its position at the
+        observation time; operators without observer_id: the position given to AuxPF).
+        """
+        oid = getattr(obs_op_class, "observer_id", None)
+        if isinstance(oid, tuple):
+            return oid
+
+        def value(x, unit, default):
+            x = getattr(obs_op_class, x, None)
+            x = default if x is None else x
+            q = u.Quantity(x)
+            return float(np.ravel(q.to(unit).value)[0]) if q.unit != u.dimensionless_unscaled \
+                else float(np.ravel(q.value)[0])
+        return ("position", round(value("obs_radius", u.AU, self.obs_radius), 9),
+                round(value("obs_lon", u.deg, self.obs_lon), 9), round(value("obs_lat", u.deg, self.obs_lat), 9))
+
+
+    def get_observation_operator(self, state_dict_in: CmeParEns, with_arrival: bool = False
+                                 ) -> npt.NDArray[float]:
+        """
+        Run the forward model for every ensemble member in state_dict_in and return the predicted
+        observations.
+        :param state_dict_in: CME parameter ensemble to run
+        :param with_arrival: also compute the arrivals (self.last_member_arrivals), see make_observation_operator
+        :return: hx: (n_members, n_obs_times) array of model elongations at self.obs_time
+        """
+        obs_op_class = self.make_observation_operator(state_dict_in, with_arrival=with_arrival)
         hx = obs_op_class.make_obs_op()
+        self.last_member_arrivals = getattr(obs_op_class, "member_arrivals", None) if with_arrival else None
+        self.n_model_runs += int(state_dict_in["n_members"])
+        self.last_observer = self.observer_of(obs_op_class)
 
         # Diagnostic profiles of this call (None if not requested or not provided by the operator)
         self.last_model_profiles = getattr(obs_op_class, "model_profiles", None)
 
+        return hx
+
+
+    def lookahead_usable(self) -> bool:
+        """True if stored tracks were given and were computed for the observer this step uses."""
+        la = self.lookahead
+        if la is None or la.get("profiles") is None or la.get("observer") is None:
+            return False
+        profiles = np.asarray(la["profiles"], dtype=float)
+        if profiles.ndim != 2 or profiles.shape[0] != self.n_members or not (0 <= la["index"] < profiles.shape[1]):
+            return False
+        expected = self.observer_of(self.make_observation_operator(self.cme_par_dict))
+        return same_observer(expected, la["observer"])
+
+
+    def get_first_stage_observations(self) -> npt.NDArray[float]:
+        """
+        Modelled observations for the first-stage weights: the stored tracks of the current particles x_i where
+        available (see the module docstring), otherwise a model run at the shrunk point m_i (standard Liu-West).
+        Sets self.lookahead_reused and self.last_model_profiles (the profiles behind the values used).
+        :return: (n_members, 1) array
+        """
+        if not self.lookahead_usable():
+            self.lookahead_reused = np.zeros(self.n_members, dtype=bool)
+            return self.get_observation_operator(self.state_vector_shrunk_dict)
+
+        profiles = np.array(self.lookahead["profiles"], dtype=float)
+        hx = profiles[:, int(self.lookahead["index"])].reshape(self.n_members, 1)
+        reused = np.isfinite(hx[:, 0])
+        missing = np.flatnonzero(~reused)
+        if missing.size:
+            # Members without a stored value: run them at their shrunk points
+            sub = subset_cme_par_dict(self.state_vector_shrunk_dict, missing)
+            hx_sub = self.get_observation_operator(sub)
+            hx[missing, 0] = np.asarray(hx_sub, dtype=float)[:, 0]
+            if self.last_model_profiles is not None and np.shape(self.last_model_profiles)[1] == profiles.shape[1]:
+                profiles[missing] = self.last_model_profiles
+            else:
+                profiles[missing] = np.nan
+        if self.check_lookahead:
+            saved = (self.n_model_runs, self.last_observer)
+            self.hx_at_shrunk_points = np.asarray(
+                self.get_observation_operator(self.state_vector_shrunk_dict), dtype=float)[:, 0]
+            self.n_model_runs, self.last_observer = saved
+        self.lookahead_reused = reused
+        self.last_model_profiles = profiles
+        print(f"First stage: {int(reused.sum())}/{self.n_members} members from stored tracks, "
+              f"{missing.size} run at their shrunk points")
         return hx
 
 
@@ -590,7 +767,7 @@ class AuxPF:
 
         # Step 2: run the model for the shrunk particles m_i and compute the first-stage probabilities
         with timed("aux_pf.obs_op_shrunk_ensemble"):
-            obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
+            obs_op_shrunk = self.get_first_stage_observations()
         self.hx_shrunk = np.asarray(obs_op_shrunk, dtype=float)[:, 0]
         self.profile_shrunk = self.last_model_profiles
 
@@ -637,15 +814,19 @@ class AuxPF:
 
         # Step 5: run the model for the new particles and compute the second-stage weights
         with timed("aux_pf.obs_op_posterior_ensemble"):
-            obs_op_post = self.get_observation_operator(self.cme_par_dict)
+            obs_op_post = self.get_observation_operator(self.cme_par_dict, with_arrival=True)
+        self.post_arrivals = self.last_member_arrivals
         self.hx_post = np.asarray(obs_op_post, dtype=float)[:, 0]
         self.profile_post = self.last_model_profiles
+        self.post_observer = self.last_observer
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_post = [
             self.calculate_log_likelihood_single_ens(obs_op_post[i, :])
             for i in range(self.n_members)
         ]
+        # (divides by the SAME first-stage likelihood used to pick the ancestor, whether it came from a run at
+        #  m_k or from a stored track at x_k, which keeps the weights exact)
         log_weights_post = [
             log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
             for i in range(len(resample_ind))

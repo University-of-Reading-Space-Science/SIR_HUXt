@@ -39,7 +39,7 @@ from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 from da_output import ArrivalOutput, ElongationOutput
 from da_surf_setup import Setup
-from ensemble_arrival import EnsembleArrivalTimes
+from ensemble_arrival import EnsembleArrivalTimes, arrivals_to_result
 from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
 from timing import save_timing_report, timed, timing_report
@@ -216,6 +216,20 @@ class RunDataAssimilationRoutine:
         self.arrival_sim_time: Quantity[u.day] = da_par_dict.get("arrival_sim_time", 5 * u.day)
         self.arrival_body: str = da_par_dict.get("arrival_body", "EARTH")
         self.arrival_dt_scale: int | float | None = da_par_dict.get("arrival_dt_scale", None)
+        # Liu-West first stage from the stored tracks of the current particles (see aux_pf.py); default off here
+        #  so that older Setup versions keep the original scheme
+        self.reuse_lookahead_tracks: bool = da_par_dict.get("reuse_lookahead_tracks", False)
+        # Diagnostic: also run the shrunk points to measure the reuse approximation (extra runs; off by default)
+        self.check_lookahead_tracks: bool = da_par_dict.get("check_lookahead_tracks", False)
+        # A: real craft: synthetic imager follows the craft's trajectory (lets the look-ahead reuse work)
+        self.moving_craft_observer: bool = da_par_dict.get("moving_craft_observer", False)
+        # B: arrival times from the second-stage runs (made arrival_sim_time long) instead of separate runs
+        self.combine_arrival_runs: bool = da_par_dict.get("combine_arrival_runs", False)
+        # Parallel members: at most max_workers, and only as many as fit in memory_fraction of the free memory
+        #  (a 5-day, 45-latitude SURF3d member needs ~9 GiB; see memory_budget.py)
+        self.max_workers: int | None = da_par_dict.get("max_workers", None)
+        self.memory_fraction: float = da_par_dict.get("memory_fraction", 0.7)
+        self.n_parallel_members: int | None = da_par_dict.get("n_parallel_members", None)
         #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
 
 
@@ -633,7 +647,8 @@ class RunDataAssimilationRoutine:
             cme_par_dict: CmeParEns,
             obs: float,
             yi: int,
-            rng: Generator
+            rng: Generator,
+            lookahead: dict | None = None,
     ) -> AuxPF:
         """
         Set up the auxiliary particle filter for observation number yi.
@@ -641,8 +656,10 @@ class RunDataAssimilationRoutine:
         :param obs: Observed elongation (deg)
         :param yi: Index of the observation (selects the observer position and time)
         :param rng: Random number generator for this run
+        :param lookahead: Stored tracks of the current particles for the first stage (reuse_lookahead_tracks)
         :return: AuxPF instance (call .aux_pf() to assimilate)
         """
+        reuse = getattr(self, "reuse_lookahead_tracks", False)
         return AuxPF(
             use_model=self.use_model,
             cme_par_dict=cme_par_dict,
@@ -674,10 +691,120 @@ class RunDataAssimilationRoutine:
             bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
             fixed_compressible_sim_time=getattr(self, "fixed_compressible_sim_time", True),
-            # Also sample every member's modelled profile at all observation times (for elongations.nc)
-            profile_times=list(self.obs_times) if getattr(self, "save_elongation_output", True) else None,
+            # Also sample every member's modelled profile at all observation times (for elongations.nc, and
+            #  for the next step's first stage when reuse_lookahead_tracks is on)
+            profile_times=(list(self.obs_times) if (getattr(self, "save_elongation_output", True) or reuse)
+                           else None),
+            lookahead=lookahead if reuse else None,
+            sim_time_end=self.obs_times[len(self.observations) - 1] if reuse else None,
+            check_lookahead=reuse and getattr(self, "check_lookahead_tracks", False),
+            moving_craft_observer=getattr(self, "moving_craft_observer", False),
+            arrival_body=self.arrival_body_for_runs(),
+            arrival_sim_time=getattr(self, "arrival_sim_time", 5 * u.day),
+            n_workers=self.parallel_workers(),
             rng=rng
         )
+
+
+    def member_memory_bytes(self) -> float:
+        """
+        Memory of the largest single-member model run this configuration makes (memory_budget.py): the
+        observation-operator runs (3 days for the compressible models, or arrival_sim_time with
+        combine_arrival_runs; surf/huxt up to the last observation with reuse_lookahead_tracks) and the separate
+        arrival-time runs. SURF3d runs are solved plane by plane (init_sir.solve_surf3d), so lean estimates.
+        """
+        from memory_budget import estimate_run_bytes
+        compressible = self.use_model in ["compress_surf", "compress_surf3d"]
+        imaging_days = (3.0 if (compressible and getattr(self, "fixed_compressible_sim_time", True))
+                        else (self.obs_times[-1] - self.surf_init_time).total_seconds() / 86400.0
+                        + self.time_tolerance.to(u.day).value)
+        arrival_days = getattr(self, "arrival_sim_time", 5 * u.day).to(u.day).value
+        combined = self.arrival_body_for_runs() is not None
+        grid = dict(dt_scale=self.dt_scale, lon_start=self.lon_start, lon_stop=self.lon_stop, r_min=self.r_min)
+
+        n_lat = 1
+        if self.use_model == "compress_surf3d":
+            n_lat = max(len(self.surf3d_latitudes(yi)) for yi in range(len(self.obs_times)))
+        # Observation-operator runs (SURF3d: solved plane by plane, density kept over the imaging window)
+        sizes = [estimate_run_bytes(self.use_model, (max(imaging_days, arrival_days) if combined else imaging_days)
+                                    * u.day, n_lat=n_lat, lean=True, imaging_time=imaging_days * u.day,
+                                    keep_wind=combined, **grid)]
+        # Separate arrival-time runs (SURF3d: only the plane nearest Earth)
+        if getattr(self, "compute_arrival_times", True):
+            sizes.append(estimate_run_bytes(self.use_model, arrival_days * u.day, n_lat=1, lean=True,
+                                            keep_wind=True, **grid))
+        return max(sizes)
+
+
+    def surf3d_latitudes(self, yi: int = 0) -> Quantity:
+        """
+        SURF3d latitudes of the observation operator for observation yi (compress_surf3d): every 1 deg over the
+        imager's field of view +/- 2 deg (sir_observation_operator.imager_surf_latitudes), plus the arrival
+        body's latitude if it is outside that range and arrival times are computed.
+        """
+        from sir_observation_operator import imager_surf_latitudes
+        body = getattr(self, "arrival_body", "EARTH") if getattr(self, "compute_arrival_times", True) else None
+        return imager_surf_latitudes(self.craft, self.surf_init_time, self.obs_radius[yi], self.obs_lon[yi],
+                                     self.obs_lat[yi], include_body=body)
+
+
+    def parallel_workers(self) -> int:
+        """Members to run at the same time, decided once per process so the worker pool is not resized."""
+        if getattr(self, "_n_workers", None) is None:
+            from memory_budget import format_memory_requirements, memory_requirements, worker_count
+            per_member = self.member_memory_bytes()
+            requested = getattr(self, "n_parallel_members", None)
+            self._n_workers = worker_count(per_member, getattr(self, "max_workers", None),
+                                           getattr(self, "memory_fraction", 0.7), requested=requested)
+            print(format_memory_requirements(memory_requirements(
+                per_member, requested or self._n_workers, memory_fraction=getattr(self, "memory_fraction", 0.7))))
+        return self._n_workers
+
+
+    def save_memory_requirements(self, path: str) -> dict:
+        """
+        Write the memory needed for the parallel members (estimate, and the measured peak of the worker processes
+        and of this process so far) to a JSON file. Returns the dict.
+        """
+        import json
+        from memory_budget import memory_requirements, process_peak_bytes
+        n = self.parallel_workers()
+        requested = getattr(self, "n_parallel_members", None)
+        req = memory_requirements(self.member_memory_bytes(), requested or n, main_bytes=process_peak_bytes(),
+                                  memory_fraction=getattr(self, "memory_fraction", 0.7))
+        req.update({"n_workers_used": int(n), "n_parallel_members_requested": requested,
+                    "use_model": self.use_model, "dt_scale": float(self.dt_scale)})
+        with open(path, "w") as f:
+            json.dump(req, f, indent=2)
+        return req
+
+
+    def arrival_body_for_runs(self) -> str | None:
+        """The body whose arrival the second-stage runs compute (combine_arrival_runs), else None."""
+        if getattr(self, "combine_arrival_runs", False) and getattr(self, "compute_arrival_times", True):
+            return getattr(self, "arrival_body", "EARTH")
+        return None
+
+
+    def assimilable(self, yi: int, obs: float) -> bool:
+        """True if observation yi is assimilated: after the first-guess launch and in [elong_min, elong_max]."""
+        return (self.obs_times[yi] > self.fg_mean_cme_t_init) and (self.elong_min <= obs <= self.elong_max)
+
+
+    def run_prior_ensemble(self, cme_par_dict: CmeParEns, rng: Generator) -> dict:
+        """
+        One forward-model run of every prior particle (combine_arrival_runs): gives the prior arrival times and,
+        with reuse_lookahead_tracks, the stored tracks for the first assimilated observation's look-ahead (so
+        that step needs no runs at the shrunk points). Uses the operator settings of the first assimilated
+        observation (or of observation 0 if none is assimilated); draws nothing from rng.
+        :return: {"arrivals": list, "profiles": (n_members, n_obs) or None, "observer": observer id, "runs": N}
+        """
+        first = next((yi for yi, obs in enumerate(self.observations) if self.assimilable(yi, obs)), 0)
+        aux = self.make_aux_pf(cme_par_dict, self.observations[first], first, rng)
+        with timed("da.prior_ensemble_run"):
+            aux.get_observation_operator(cme_par_dict, with_arrival=True)
+        return {"arrivals": aux.last_member_arrivals, "profiles": aux.last_model_profiles,
+                "observer": aux.last_observer, "runs": int(aux.n_model_runs)}
 
 
     def make_arrival_calculator(self) -> EnsembleArrivalTimes:
@@ -701,6 +828,8 @@ class RunDataAssimilationRoutine:
             dt_scale=getattr(self, "arrival_dt_scale", None) or self.dt_scale,
             body=getattr(self, "arrival_body", "EARTH"),
             use_parallel=self.use_parallel,
+            n_workers=self.parallel_workers(),
+            latitudes=self.surf3d_latitudes(0) if self.use_model == "compress_surf3d" else None,
         )
 
 
@@ -814,6 +943,10 @@ class RunDataAssimilationRoutine:
             # Draw the prior ensemble and save it as step 0
             with timed("da.prior_draw"):
                 cme_par_dict = self.make_cme_par_dict(rng=rng)
+            # Diagnostic (compare_da_schemes.py): a different random stream for the filter itself, with the same
+            #  prior, to measure the filter's Monte Carlo variability. Not set in normal use.
+            if getattr(self, "filter_seed_offset", None) is not None:
+                rng = np.random.default_rng(rand_seed + int(self.filter_seed_offset))
             cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
             self.save_ensemble_state(cme_saved_pars, 0, cme_par_dict)
 
@@ -834,7 +967,10 @@ class RunDataAssimilationRoutine:
                 use_model=self.use_model,
                 model_init_time=self.surf_init_time,
                 true_observations=getattr(self, "true_observations", None),
+                reuse_lookahead_tracks=getattr(self, "reuse_lookahead_tracks", False),
             ) if save_elongations else None
+            # Stored tracks of the current particles (from the last second-stage runs), for the first stage
+            tracks = None
             arrival_out, arrival_calc = None, None
             if compute_arrivals:
                 arrival_calc = self.make_arrival_calculator()
@@ -849,9 +985,28 @@ class RunDataAssimilationRoutine:
                 true_arrival = self.get_true_arrival(arrival_calc)
                 if true_arrival is not None:
                     arrival_out.set_truth(true_arrival)
+
+            # B: one run of the prior particles gives the prior arrivals (and the first look-ahead's tracks)
+            combine = self.arrival_body_for_runs() is not None
+            prior_runs = 0
+            if combine:
+                prior = self.run_prior_ensemble(cme_par_dict, rng)
+                prior_runs = prior["runs"]
+                if getattr(self, "reuse_lookahead_tracks", False) and prior["profiles"] is not None:
+                    tracks = {"profiles": prior["profiles"], "observer": prior["observer"]}
+            if elong_out is not None:
+                elong_out.prior_model_runs = prior_runs
+
+            if arrival_out is not None:
                 # Arrivals of the prior ensemble
                 with timed("da.arrival_times"):
-                    arrival_out.record(0, arrival_calc.ensemble_arrival(cme_par_dict), cme_par_dict["log_weight"])
+                    if combine and prior["arrivals"] is not None:
+                        prior_arrivals = arrivals_to_result(prior["arrivals"], self.surf_init_time)
+                        arrival_out.source = "combined"
+                    else:
+                        prior_arrivals = arrival_calc.ensemble_arrival(cme_par_dict)
+                        arrival_out.separate_runs += self.n_members
+                    arrival_out.record(0, prior_arrivals, cme_par_dict["log_weight"])
                 arrival_out.save(output_dir, final=False)
 
             # Assimilate the observations one at a time
@@ -864,15 +1019,18 @@ class RunDataAssimilationRoutine:
                 fg_cme_init_cond = self.obs_times[yi] > self.fg_mean_cme_t_init
                 obs_in_elon_range_cond = (
                     (obs >= self.elong_min) and (obs <= self.elong_max)
-                )
+                )  # (= self.assimilable(yi, obs))
                 print(
                     f"elong_min = {self.elong_min}, elong_max = {self.elong_max}, \n"
                     f" obs={obs}, obs_in_elon_range_cond = {obs_in_elon_range_cond}"
                 )
                 aux = None
                 if fg_cme_init_cond and obs_in_elon_range_cond:
-                    aux = self.make_aux_pf(cme_par_dict, obs, yi, rng)
+                    lookahead = None if tracks is None else {**tracks, "index": yi}
+                    aux = self.make_aux_pf(cme_par_dict, obs, yi, rng, lookahead=lookahead)
                     cme_par_dict = aux.aux_pf()
+                    if getattr(self, "reuse_lookahead_tracks", False):
+                        tracks = {"profiles": aux.profile_post, "observer": aux.post_observer}
                 elif fg_cme_init_cond:
                     print("Observation is outside the permitted elongation range for the model")
                 elif obs_in_elon_range_cond:
@@ -888,11 +1046,15 @@ class RunDataAssimilationRoutine:
                     elong_out.record_step(yi, aux, cme_par_dict["log_weight"])
                     elong_out.save(output_dir, final=False)
                 if arrival_out is not None:
+                    arrivals = None
                     if aux is not None:
                         with timed("da.arrival_times"):
-                            arrivals = arrival_calc.ensemble_arrival(cme_par_dict)
-                    else:
-                        arrivals = None
+                            if combine and aux.post_arrivals is not None:
+                                # B: from the second-stage runs just made
+                                arrivals = arrivals_to_result(aux.post_arrivals, self.surf_init_time)
+                            else:
+                                arrivals = arrival_calc.ensemble_arrival(cme_par_dict)
+                                arrival_out.separate_runs += self.n_members
                     arrival_out.record(yi + 1, arrivals, cme_par_dict["log_weight"])
                     arrival_out.save(output_dir, final=False)
 
@@ -918,6 +1080,10 @@ class RunDataAssimilationRoutine:
             # Timing diagnostics so far (cumulative over the runs done in this process)
             print(timing_report(f"Timing report after run {run_no} (cumulative)"))
             save_timing_report(os.path.join(output_dir, "timings.json"))
+            if self.use_parallel:
+                from memory_budget import format_memory_requirements
+                print(format_memory_requirements(
+                    self.save_memory_requirements(os.path.join(output_dir, "memory_requirements.json"))))
 
         return None
 

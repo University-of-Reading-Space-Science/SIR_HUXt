@@ -182,11 +182,18 @@ class Setup:
         # Model domain and CME settings
         lon_start: Quantity[u.deg] = -70 * u.deg
         lon_stop: Quantity[u.deg] = 70 * u.deg
+        # compress_surf3d: the observation operator and arrival runs build SURF3d every 1 deg over the imager's
+        #  field of view +/- 2 deg (sir_observation_operator.imager_surf_latitudes); these three are only used
+        #  where a SURF3d is built without that grid
         latitude_min = -30 * u.deg
         latitude_max = 30 * u.deg
         n_lat_surf = 45
         sim_time: Quantity[u.day] = 2 * u.day
-        dt_scale: int = 1
+        # Model output cadence: every dt_scale-th model time step (dt = 348 s) is saved, i.e. every 58 min for 10.
+        #  Memory per member is proportional to 1 / dt_scale. NB: the 3D synthetic imager images every output time
+        #  and the 2D imager uses the output time nearest each hourly image, so this changes the modelled
+        #  elongations (and the arrival times are interpolated from coarser CME tracks); was 1.
+        dt_scale: int = 10
         cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
         r_min: Quantity[u.solRad] = 21.5 * u.solRad
         cme_fixed_duration: bool = True
@@ -571,7 +578,7 @@ class Setup:
         from -1 (used for real observations); otherwise runs run_start .. run_start + n_runs - 1.
         :return: da_par_dict
         """
-        n_members: int = 25
+        n_members: int = 50
 
         run_start = -1
         n_runs: int = 1
@@ -604,6 +611,26 @@ class Setup:
             "arrival_body": "EARTH",
             #  output cadence of the arrival runs (None = same as the DA's dt_scale; larger = less memory)
             "arrival_dt_scale": None,
+            # Liu-West first stage from the tracks the previous step's second-stage runs already made for the
+            #  current particles, instead of new runs at the shrunk points: N instead of 2N model runs per
+            #  observation; the shrinkage and jitter are unchanged (see aux_pf.py and LOOKAHEAD_REUSE.md)
+            "reuse_lookahead_tracks": True,
+            # A: real craft: the synthetic imager follows the craft's trajectory (its ephemeris at every image time)
+            #  instead of a fixed observer at the craft's position at each observation time. Needed for the
+            #  look-ahead reuse with real observations; slightly changes the modelled elongations (more realistic)
+            "moving_craft_observer": True,
+            # B: arrival times from the data assimilation's own second-stage runs (run arrival_sim_time long; the
+            #  imager still images the original window, so the modelled elongations are unchanged) instead of
+            #  separate arrival runs (see OPTIMISED_RUNS.md)
+            "combine_arrival_runs": True,
+            # Members run at the same time (use_parallel): n_parallel_members worker processes (None =
+            #  cpu_count - 1), at most max_workers, and only as many as fit in memory_fraction of the free memory
+            #  (a request that does not fit is reduced, with a message giving the memory it needs). The memory needed
+            #  is printed at the start and written, with the measured peak per worker, to memory_requirements.json
+            #  in each run directory. Estimate for a configuration: python memory_budget.py --workers 15 --dt-scale 10
+            "n_parallel_members": 15,
+            "max_workers": None,
+            "memory_fraction": 0.7,
         }
 
         return da_par_dict

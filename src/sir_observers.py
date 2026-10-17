@@ -36,6 +36,26 @@ from astropy.time import Time
 from timing import timed
 
 
+
+def fixed_observer_position(obs_radius, obs_longitude, obs_latitude) -> tuple[Quantity, Quantity, Quantity]:
+    """
+    The single position of a fixed synthetic observer: (r in AU, lon in deg, lat in deg) as scalars. Each input may
+    be a scalar or an array / list of identical values (e.g. the same position repeated for every observation
+    time). Different values (a moving synthetic observer) are not supported and raise a ValueError.
+    """
+    out = []
+    for name, x, unit in (("obs_radius", obs_radius, u.AU), ("obs_longitude", obs_longitude, u.deg),
+                          ("obs_latitude", obs_latitude, u.deg)):
+        v = np.atleast_1d(u.Quantity(x).to(unit).value).astype(float).ravel()
+        if v.size == 0:
+            raise ValueError(f"{name} is empty")
+        if np.any(v != v[0]):
+            raise ValueError(f"{name} varies ({v.min()}..{v.max()} {unit}): only a fixed synthetic observer is "
+                             f"supported; give one position")
+        out.append(v[0] * unit)
+    return out[0], out[1], out[2]
+
+
 def background(f: Callable) -> Callable:
     """
     Decorator that runs ``f`` in the default asyncio executor and returns a future
@@ -79,6 +99,57 @@ def sample_track(
     inside = (times >= t[0]) & (times <= t[-1])
     out[inside] = np.interp(times[inside], t, e)
     return out
+
+
+def n_output_steps(run, sim_time: Quantity) -> int:
+    """
+    Number of output times a SURF run of length sim_time has (SURF's time_grid: nt = floor(T / dt),
+    nt_out = int(nt / dt_scale)); dt depends only on the grid and v_max, not on the run length.
+    """
+    dt = run.dt.to(u.s).value
+    dt_scale = float(np.ravel(u.Quantity(run.dt_scale).value)[0])
+    nt = int(np.floor(sim_time.to(u.s).value / dt))
+    return int(nt / dt_scale)
+
+
+def _truncated_run(run, n_keep: int):
+    """Shallow copy of one solved SURF run with its output-time axis (and its CMEs' tracer coords) cut."""
+    import copy as _copy
+    r = _copy.copy(run)
+    r.time_out = run.time_out[:n_keep]
+    cmes = []
+    for cme in getattr(run, "cmes", []) or []:
+        c = _copy.copy(cme)
+        if isinstance(getattr(cme, "coords", None), dict):
+            c.coords = {j: v for j, v in cme.coords.items() if j < n_keep}
+        cmes.append(c)
+    r.cmes = cmes
+    return r
+
+
+def truncated_model_view(model, end: Quantity):
+    """
+    A shallow view of a solved SURF / SURF3d model whose output-time axis (time_out, and the CMEs' tracer
+    coords) stops where a run of length ``end`` would have stopped. The solution arrays are shared, not
+    copied, and indexing by output step is unchanged, so the synthetic imagers (which loop over time_out /
+    the observer times, index rho_grid[time_step] and use the CMEs' coords) see exactly what a run of length
+    ``end`` would give: SURF's time step depends only on the grid and v_max, and the solution is causal.
+    Returns the model itself if it is not longer than ``end``.
+    """
+    import copy as _copy
+    runs = getattr(model, "SURFlat", None)
+    reference = runs[0] if runs else model
+    try:
+        n_keep = n_output_steps(reference, end)
+    except AttributeError:
+        return model
+    if n_keep >= len(reference.time_out):
+        return model
+    if runs:
+        view = _copy.copy(model)
+        view.SURFlat = [_truncated_run(run, n_keep) for run in runs]
+        return view
+    return _truncated_run(model, n_keep)
 
 
 class SynthObsEphem:
@@ -278,6 +349,7 @@ class ObserverSynthHI:
             el_max: float=30.0,
             hi_resolution: Quantity[u.s] | Quantity[u.hour] | Quantity[u.day]=1.0 * u.hour,
             profile_times: list[datetime.datetime] | None = None,
+            imaging_end: Quantity[u.s] | None = None,
     ):
         """
         Generate the synthetic HI profile and extract the elongation at the observation time(s)
@@ -290,11 +362,16 @@ class ObserverSynthHI:
         :param obs_radius: Observation radius
         :param obs_longitude: Observation longitude
         :param obs_latitude: Observation latitude
+            (synthetic observer: a FIXED position, one value each; a moving synthetic observer is not supported)
         :param el_min: Minimum elongation
         :param el_max: Maximum elongation
         :param hi_resolution: Temporal resolution to model the HI data in
         :param profile_times: Optional extra times at which to sample the tracked profile (diagnostics);
             the result is ``self.model_profile`` (NaN outside the tracked time range, no extrapolation)
+        :param imaging_end: Only image (and track) the model up to this time after the model start, even if
+            the model ran longer (e.g. so that the same run also gives the CME's arrival at Earth). SURF's time
+            step does not depend on the run length and the solution is causal, so the j-map, the tracked
+            profile and the elongations are then the same as for a run of length ``imaging_end``.
         """
 
         self.use_model: str = use_model
@@ -338,16 +415,21 @@ class ObserverSynthHI:
         hi_resolution_sec = hi_resolution.to(u.s).value
         hi_resolution_day = hi_resolution.to(u.day).value
 
+        # Model OUTPUT times: the 3D imager looks the observer up by output-time index (as for a real craft,
+        #  whose ephemeris model.get_observer gives at time_out); time_out == time only for dt_scale = 1
         if use_model == "compress_surf":
-            self.model_times = model.time
+            self.model_times = model.time_out
 
         elif use_model == "compress_surf3d":
-            self.model_times = model.SURFlat[0].time
+            self.model_times = model.SURFlat[0].time_out
 
-        # Times at which to make synthetic images: 0 .. simtime at the HI cadence
+        # Times at which to make synthetic images: 0 .. simtime (or imaging_end) at the HI cadence
+        imaging_window_sec = surf_model_sim_time
+        if imaging_end is not None:
+            imaging_window_sec = min(surf_model_sim_time, float(imaging_end.to(u.s).value))
         self.synth_obs_times = np.arange(
             0,
-            surf_model_sim_time + (hi_resolution_sec / 2.0),
+            imaging_window_sec + (hi_resolution_sec / 2.0),
             hi_resolution_sec
         ) * u.s
 
@@ -358,7 +440,7 @@ class ObserverSynthHI:
                 for s in self.model_times.value
             ])
 
-        # Observer: a real body, or a synthetic observer at a fixed position
+        # Observer: a real body, or a synthetic observer at a fixed position (see fixed_observer_position)
         if craft is not None:
             # 3D imager: the craft at the model output times (as for the synthetic observer below)
             self.craft_observer = model.get_observer(craft)
@@ -380,16 +462,25 @@ class ObserverSynthHI:
                 for s in self.synth_obs_times.value
             ])
 
-            self.obs_r: npt.NDArray[Quantity[u.AU]] = obs_radius * np.ones(self.n_synth_obs_times)
-            self.obs_lon: npt.NDArray[Quantity[u.deg]] = obs_longitude * np.ones(self.n_synth_obs_times)
-            self.obs_lat: npt.NDArray[Quantity[u.deg]] = obs_latitude * np.ones(self.n_synth_obs_times)
+            # The synthetic observer is fixed: one position
+            r0, lon0, lat0 = fixed_observer_position(obs_radius, obs_longitude, obs_latitude)
 
-            # Make dictionary for input into the Observer class for a synthetic observer
+            # 2D imager (SynthObsEphem): the position at every synthetic-image time
+            self.obs_r: npt.NDArray[Quantity[u.AU]] = r0 * np.ones(self.n_synth_obs_times)
+            self.obs_lon: npt.NDArray[Quantity[u.deg]] = lon0 * np.ones(self.n_synth_obs_times)
+            self.obs_lat: npt.NDArray[Quantity[u.deg]] = lat0 * np.ones(self.n_synth_obs_times)
+
+            # 3D imager (S.Observer): SURF requires the given positions to span every requested (model output)
+            #  time, i.e. the whole run, which can be longer than the imaging window (imaging_end, e.g. a 5-day
+            #  run imaged over 3 days). The position is fixed, so its value at the start and end of the run is
+            #  enough.
+            run_end_s = max(float(self.model_times[-1].to(u.s).value), float(self.synth_obs_times[-1].to(u.s).value))
             synth_heeq_pos = {
-                "time": self.obs_times,
-                "r": self.obs_r,
-                "lon": self.obs_lon,
-                "lat": self.obs_lat,
+                "time": Time([surf_model_init_time,
+                              surf_model_init_time + datetime.timedelta(seconds=run_end_s)]),
+                "r": r0 * np.ones(2),
+                "lon": lon0 * np.ones(2),
+                "lat": lat0 * np.ones(2),
             }
             self.craft_observer = S.Observer(
                 body="SYNTHETIC",
@@ -408,10 +499,12 @@ class ObserverSynthHI:
         # Calculate the j-maps and delta j-maps and track the CME
         if use_model == "compress_surf":
             synth_imager_class = Sim.SyntheticImager2D(synth_obs_class)
+            # Image a view of the model that ends at imaging_end (see truncated_model_view)
+            imaging_model = truncated_model_view(model, imaging_window_sec * u.s)
             with timed(f"synth_hi.compute_jmap.{use_model}"):
-                jmap, djmap = synth_imager_class.compute_jmap(model)
+                jmap, djmap = synth_imager_class.compute_jmap(imaging_model)
             with timed(f"synth_hi.track_cmes.{use_model}"):
-                cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+                cme_profile = synth_imager_class.track_cmes(imaging_model, djmap)[0]
             # Extract time and elongation profiles of synthetic HI-data
             try:
                 synth_imager_time = cme_profile["feature_00"]["t"][:]
@@ -430,10 +523,13 @@ class ObserverSynthHI:
                 elon_min=el_min,
                 elon_max=el_max
             )
+            # The 3D imager images every model output time: give it a view of the model that ends at
+            #  imaging_end (only the output-time axis is shortened; see truncated_model_view)
+            imaging_model = truncated_model_view(model, imaging_window_sec * u.s)
             with timed(f"synth_hi.compute_jmap.{use_model}"):
-                jmap, djmap = synth_imager_class.compute_jmap(model)
+                jmap, djmap = synth_imager_class.compute_jmap(imaging_model)
             with timed(f"synth_hi.track_cmes.{use_model}"):
-                cme_profile = synth_imager_class.track_cmes(model, djmap)[0]
+                cme_profile = synth_imager_class.track_cmes(imaging_model, djmap)[0]
             # Extract time and elongation profiles of synthetic HI-data
             try:
                 synth_imager_time = cme_profile["feature_00"]["t"][:]

@@ -16,9 +16,9 @@ The observer classes used to live in this module and are re-exported from here, 
 """
 import atexit
 import datetime
-import os
 import sys
 import time
+import types
 from multiprocessing import Pool
 
 import numpy as np
@@ -38,11 +38,14 @@ from astropy.units import Quantity
 from astropy.time import Time
 import matplotlib.pyplot as plt
 
-from init_sir import setup_huxt, setup_surf, setup_surf3d, initialise_cme_parameter_ensemble_dict
+from init_sir import (setup_huxt, setup_surf, setup_surf3d, initialise_cme_parameter_ensemble_dict,
+                      fov_latitude_grid, solve_surf3d)
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 
 from timing import add_timing, collect_timings, merge_timings, timed
+from memory_budget import (estimate_run_bytes, note_memory_error, process_peak_bytes, record_worker_peak,
+                           worker_count)
 
 # Re-exported for backwards compatibility (these classes were previously defined here)
 from sir_observers import background, SynthObsEphem, ObserverTracer, ObserverSynthHI  # noqa: F401
@@ -96,21 +99,207 @@ def _craft_geometry(
             )
             geom["psi_ert_avg"] = np.mean(geom["psi_ert"].to(u.deg).value)
 
-            # Setup a SyntheticImager3D class instance to get the min and max latitudes
-            # TODO: Remove hard-coded values for min and max elongations and buff_lat
-            imgr = Sim.SyntheticImager3DOrig(
-                geom["craft_observer"],
-                pa=geom["psi_ert_avg"],
-                elon_min=5.0,
-                elon_max=30.0
-            )
-            buff_lat = 2.0 * u.deg
-            imgr._compute_fov_geometry(0)
-            geom["lat_min"] = imgr.lat_grid.min().to(u.deg) - buff_lat
-            geom["lat_max"] = imgr.lat_grid.max().to(u.deg) + buff_lat
+            # Latitude range of the imager's lines of sight at the first model time
+            geom["fov_lat_min"], geom["fov_lat_max"] = imager_fov_latitudes(geom["craft_observer"],
+                                                                            geom["psi_ert_avg"])
+            geom["lat_min"] = geom["fov_lat_min"] - FOV_LAT_BUFFER
+            geom["lat_max"] = geom["fov_lat_max"] + FOV_LAT_BUFFER
 
     _CRAFT_GEOMETRY_CACHE[key] = geom
     return geom
+
+
+# The synthetic heliospheric imager used by the observation operator (ObserverSynthHI in get_cme_flank) and
+#  the SURF3d latitude grid built around its field of view: every FOV_LAT_RESOLUTION from the lowest to the
+#  highest latitude of its lines of sight, plus FOV_LAT_BUFFER on either side.
+HI_ELON_MIN: float = 4.0    # deg
+HI_ELON_MAX: float = 30.0   # deg
+FOV_LAT_BUFFER: Quantity = 2.0 * u.deg
+FOV_LAT_RESOLUTION: Quantity = 1.0 * u.deg
+
+_SYNTHETIC_FOV_CACHE: dict = {}
+
+
+def imager_fov_latitudes(observer, pa: float, elon_min: float = HI_ELON_MIN,
+                         elon_max: float = HI_ELON_MAX) -> tuple[Quantity, Quantity]:
+    """
+    (min, max) latitude (deg, HEEQ/Stonyhurst) of the 3D synthetic imager's lines of sight for ``observer`` at
+    its first time (SyntheticImager3DOrig._compute_fov_geometry(0)).
+    :param observer: S.Observer-like object with r, lon, lat (arrays) and time
+    :param pa: Position angle of the imager slice (deg)
+    """
+    imgr = Sim.SyntheticImager3DOrig(observer, pa=pa, elon_min=elon_min, elon_max=elon_max)
+    imgr._compute_fov_geometry(0)
+    return imgr.lat_grid.min().to(u.deg), imgr.lat_grid.max().to(u.deg)
+
+
+def _first_value(x, unit) -> float:
+    """First value of a scalar / list / array Quantity in ``unit``."""
+    if isinstance(x, (list, tuple)):
+        x = x[0]
+    return float(np.ravel(u.Quantity(x).to(unit).value)[0])
+
+
+def synthetic_observer_geometry(
+        surf_init_time: datetime.datetime,
+        obs_radius,
+        obs_lon,
+        obs_lat,
+        pa: float = 90.0,
+) -> dict:
+    """
+    FoV latitude range of the imager for a synthetic ("twin") observer fixed at (obs_radius, obs_lon, obs_lat)
+    (the first value if a list is given), as used by ObserverSynthHI. Cached.
+    :return: dict with fov_lat_min, fov_lat_max (deg)
+    """
+    r_au, lon_deg, lat_deg = (_first_value(obs_radius, u.AU), _first_value(obs_lon, u.deg),
+                              _first_value(obs_lat, u.deg))
+    key = (surf_init_time, round(r_au, 9), round(lon_deg, 9), round(lat_deg, 9), float(pa))
+    if key in _SYNTHETIC_FOV_CACHE:
+        return _SYNTHETIC_FOV_CACHE[key]
+    with timed("obs_op.synthetic_fov_geometry (cache miss)"):
+        t0 = Time([surf_init_time])
+        # The imager only reads r, lon, lat and time of its observer (a fixed position here)
+        observer = types.SimpleNamespace(time=t0, r=np.array([r_au]) * u.AU, lon=np.array([lon_deg]) * u.deg,
+                                         lat=np.array([lat_deg]) * u.deg)
+        fov_min, fov_max = imager_fov_latitudes(observer, pa)
+        geom = {"fov_lat_min": fov_min, "fov_lat_max": fov_max}
+    _SYNTHETIC_FOV_CACHE[key] = geom
+    return geom
+
+
+def imager_surf_latitudes(
+        craft: str | None,
+        surf_init_time: datetime.datetime,
+        obs_radius=1 * u.AU,
+        obs_lon=0 * u.deg,
+        obs_lat=0 * u.deg,
+        include_body: str | None = None,
+) -> Quantity:
+    """
+    The SURF3d latitudes the observation operator uses for compress_surf3d: every FOV_LAT_RESOLUTION (1 deg)
+    over the imager's field of view (_compute_fov_geometry(0)) +/- FOV_LAT_BUFFER (2 deg). For a real craft
+    the imager looks along Earth's position angle from the craft; for a synthetic observer it uses the fixed
+    observer position and position angle 90 deg (as ObserverSynthHI does).
+    :param include_body: e.g. "EARTH": also give that body's latitude (at surf_init_time) a SURF plane (one
+        extra latitude, only if it is outside the field of view), so the CME arrival at the body can be computed
+        from the same model (solved_cmes uses the plane nearest the body). The extra plane is never used by the
+        imager, so the modelled elongations are the same with or without it.
+    """
+    is_real_craft = not ((craft is None) or (str(craft).lower() == "twin"))
+    if is_real_craft:
+        carr_rot, carr_rot_lon_init = Sin.datetime2surfinputs(surf_init_time)
+        geom = _craft_geometry(craft, surf_init_time, carr_rot, carr_rot_lon_init, is_3d=True)
+    else:
+        geom = synthetic_observer_geometry(surf_init_time, obs_radius, obs_lon, obs_lat)
+    return fov_latitude_grid(geom["fov_lat_min"], geom["fov_lat_max"], buffer=FOV_LAT_BUFFER,
+                             resolution=FOV_LAT_RESOLUTION,
+                             include=[body_latitude(include_body, surf_init_time)] if include_body else None)
+
+
+_BODY_LAT_CACHE: dict = {}
+
+
+def body_latitude(body: str, when: datetime.datetime) -> Quantity:
+    """HEEQ latitude (deg) of a body (e.g. "EARTH") at a time, from SURF's ephemeris. Cached."""
+    key = (str(body).upper(), when)
+    if key not in _BODY_LAT_CACHE:
+        _BODY_LAT_CACHE[key] = S.Observer(str(body).upper(), Time([when])).lat[0].to(u.deg)
+    return _BODY_LAT_CACHE[key]
+
+
+def solved_run(model):
+    """
+    The 2D run whose CME gives the arrival: the model itself, or for SURF3d (which has no ``cmes``; each
+    latitude slice holds its own) the slice closest to Earth's latitude (as in osse_arrival.py).
+    """
+    if hasattr(model, "SURFlat"):
+        earth_lat = np.mean(model.get_observer("EARTH").lat.to(u.rad).value)
+        slice_lats = np.array([m.latitude.to(u.rad).value for m in model.SURFlat])
+        return model.SURFlat[int(np.argmin(np.abs(slice_lats - earth_lat)))]
+    return model
+
+
+def solved_cmes(model) -> list:
+    """The solved CMEs of a model (for SURF3d those of the slice closest to Earth's latitude, see solved_run)."""
+    return solved_run(model).cmes
+
+
+def _longitude_rad(lon) -> float:
+    """
+    A longitude in radians. SURF's compute_arrival_at_location multiplies an already-radian Quantity by u.rad
+    again (hit_lon = zerototwopi(...) * u.rad), so its "lon" can carry rad**2; the value is then still radians.
+    """
+    q = u.Quantity(lon)
+    try:
+        return float(np.ravel(q.to(u.rad).value)[0])
+    except Exception:  # astropy's UnitConversionError (rad**2)
+        return float(np.ravel(q.value)[0])
+
+
+def wind_speed_at_arrival(run, stats: dict) -> float:
+    """
+    Model solar-wind speed (km/s) at the body when the CME arrives: run.v_grid interpolated linearly in time
+    (between the output times either side of stats["t_arrive"]), radius (stats["r"], the body's distance) and
+    longitude (stats["lon"], the body's longitude in the model frame at the hit). NaN outside the model domain.
+    This is the arrival speed for the compressible solver, whose CME tracer particles carry no speed (SURF fills
+    cme_particles_v with NaN); it is what an in-situ instrument at the body would measure at the arrival time.
+    :param run: A solved 2D SURF / HUXt run (v_grid (nt_out, nr, nlon), r, lon, time_out, time_init)
+    :param stats: compute_arrival_at_body's result for a hit
+    """
+    v_grid = np.asarray(u.Quantity(run.v_grid).to(u.km / u.s).value, dtype=float)
+    r_grid = np.asarray(u.Quantity(run.r).to(u.solRad).value, dtype=float).ravel()
+    lon_grid = np.asarray(u.Quantity(run.lon).to(u.rad).value, dtype=float).ravel()
+    t_out = np.asarray(u.Quantity(run.time_out).to(u.s).value, dtype=float).ravel()
+
+    r0 = float(np.ravel(u.Quantity(stats["r"]).to(u.solRad).value)[0])
+    lon0 = _longitude_rad(stats["lon"])
+    t0 = (float(np.ravel(stats["t_arrive"].jd)[0]) - float(np.ravel(run.time_init.jd)[0])) * 86400.0
+    if not (np.isfinite(r0) and np.isfinite(lon0) and np.isfinite(t0)):
+        return np.nan
+    if r0 < r_grid.min() or r0 > r_grid.max() or t0 < t_out[0] or t0 > t_out[-1]:
+        return np.nan
+
+    # Longitudes relative to the body, in (-pi, pi], so a domain across 0 / 2 pi interpolates correctly
+    dlon = np.mod(lon_grid - lon0 + np.pi, 2.0 * np.pi) - np.pi
+    order = np.argsort(dlon)
+    dlon = dlon[order]
+    if lon_grid.size > 1 and not np.any(np.abs(dlon) < 1e-12):
+        # The body must lie between two neighbouring model longitudes (not in the gap outside the wedge)
+        k = int(np.searchsorted(dlon, 0.0))
+        if k == 0 or k == dlon.size:
+            return np.nan
+        spacing = float(np.median(np.diff(dlon)))
+        if dlon[k] - dlon[k - 1] > 1.5 * spacing:
+            return np.nan                                  # the body is outside the model's longitudes
+
+    def at_step(j: int) -> float:
+        v_r = np.array([np.interp(r0, r_grid, v_grid[j, :, k]) for k in range(v_grid.shape[2])])[order]
+        return float(v_r[0]) if v_r.size == 1 else float(np.interp(0.0, dlon, v_r))
+
+    j1 = int(np.clip(np.searchsorted(t_out, t0), 1, t_out.size - 1)) if t_out.size > 1 else 0
+    if t_out.size == 1:
+        return at_step(0)
+    j0 = j1 - 1
+    w = (t0 - t_out[j0]) / (t_out[j1] - t_out[j0])
+    return (1.0 - w) * at_step(j0) + w * at_step(j1)
+
+
+def arrival_at_body(model, body: str) -> tuple:
+    """
+    CME arrival of a solved model (one CME) at a body.
+    :return: (arrival datetime or None, arrival speed in km/s or NaN, hit). The speed is the CME front's
+        tracer speed where SURF provides one (incompressible solver, HUXt); for the compressible solver, whose
+        tracers carry no speed, it is the model solar-wind speed at the body at the arrival time
+        (wind_speed_at_arrival).
+    """
+    stats = solved_cmes(model)[0].compute_arrival_at_body(body)
+    if not stats["hit"]:
+        return None, np.nan, False
+    v = float(np.ravel(u.Quantity(stats["v"]).to(u.km / u.s).value)[0])
+    if not np.isfinite(v):
+        v = wind_speed_at_arrival(solved_run(model), stats)
+    return stats["t_arrive"].datetime, v, True
 
 
 # One pool of worker processes, created on first use and reused by every ObservationOperator.
@@ -143,11 +332,39 @@ def close_worker_pool() -> None:
 atexit.register(close_worker_pool)
 
 
+def run_on_pool(task, task_args: list, n_proc: int) -> tuple[list, bool]:
+    """
+    task(*args) for every args in task_args, on the shared pool with n_proc workers, results in order.
+    Returns (results, in_process): in_process is True if the tasks ran in this process (timings the tasks
+    collected are then already in this process's timing table and must not be merged again).
+    A MemoryError (e.g. numpy's _ArrayMemoryError while a worker builds a large SURF3d) halves the number of
+    workers for the rest of the process and retries; with one worker left the tasks run in this process (after
+    shutting the pool down so the idle workers' memory is released). Other errors close the pool and propagate.
+    """
+    while n_proc > 1:
+        pool = get_worker_pool(n_proc)
+        try:
+            jobs = [pool.apply_async(task, args) for args in task_args]
+            return [job.get() for job in jobs], False
+        except MemoryError:
+            close_worker_pool()
+            n_proc = note_memory_error(n_proc)
+        except BaseException:
+            # Release the worker processes if anything fails (or on Ctrl+C)
+            close_worker_pool()
+            raise
+    close_worker_pool()
+    return [task(*args) for args in task_args], True
+
+
 def _cme_flank_task(operator, cme, obs_longitude, ens_no):
-    """Worker task: one member's flank profile, plus the timings recorded while computing it."""
+    """
+    Worker task: one member's flank profile, plus the timings recorded while computing it and the worker
+    process's peak memory so far (memory_budget.process_peak_bytes).
+    """
     with collect_timings() as worker_timings:
         flank = operator.get_cme_flank_single_ens_member(cme=cme, obs_longitude=obs_longitude, ens_no=ens_no)
-    return flank, worker_timings
+    return flank, worker_timings, process_peak_bytes()
 
 
 class ObservationOperator:
@@ -195,6 +412,13 @@ class ObservationOperator:
             use_parallel: bool = True,
             fixed_compressible_sim_time: bool = True,
             profile_times: list[datetime.datetime] | None = None,
+            moving_craft_observer: bool = False,
+            arrival_body: str | None = None,
+            arrival_sim_time: Quantity[u.day] | None = None,
+            n_workers: int | None = None,
+            max_workers: int | None = None,
+            memory_fraction: float = 0.7,
+            surf_latitudes: Quantity[u.deg] | None = None,
     ) -> None:
         """
         Class to get observations operator for DA from
@@ -236,11 +460,26 @@ class ObservationOperator:
             member's modelled elongation profile, for diagnostics only (does not change make_obs_op's result).
             After make_obs_op, ``self.model_profiles`` is an (n_members, len(profile_times)) array, NaN where
             the profile is not available (see get_member_profile).
+        :param moving_craft_observer: Real craft, compressible models only: model the synthetic imager from the
+            craft's actual trajectory (its ephemeris at every image time) instead of a fixed observer at the
+            craft's position at the observation time. A member's track is then valid at every observation time,
+            which lets the Liu-West look-ahead reuse it for real events (see aux_pf.py).
+        :param arrival_body: If set (e.g. "EARTH"), also compute every member's CME arrival at this body from the
+            same model runs (``self.member_arrivals`` after make_obs_op). The runs are then made at least
+            ``arrival_sim_time`` long; the synthetic imager still only images the original window, so the
+            modelled elongations are unchanged (see ObserverSynthHI ``imaging_end``).
+        :param arrival_sim_time: Run length needed for the arrival (default 5 days)
+        :param n_workers: Members to run at the same time (use_parallel). Default: cpu_count - 1, limited by the
+            memory one member's model needs (see memory_budget.py; a 5-day, 45-latitude SURF3d member is ~9 GiB)
+        :param max_workers, memory_fraction: Limits for that default (memory_fraction of the available memory)
         :param vr_longs, vr_lats: Coordinates of vr_in (needed for compress_surf3d)
         :param br_in, br_longs, br_lats: Inner-boundary magnetic field and coordinates (not currently used)
-        :param n_lon_surf, n_lat_surf: Grid sizes for SURF3d
-        :param lat_min, lat_max: Latitude range for SURF3d (derived from the imager field of view when a
-            real craft is given; otherwise -30/+30 deg if not set)
+        :param n_lon_surf: Number of longitudes of the full SURF3d longitude grid
+        :param n_lat_surf, lat_min, lat_max: Not used for compress_surf3d any more (kept for compatibility): the
+            SURF3d latitudes are every 1 deg over the synthetic imager's field of view (at the first model time)
+            +/- 2 deg, see imager_surf_latitudes, plus the arrival body's latitude if arrival_body is set and it
+            is outside that range. self.lat_min / self.lat_max are set to the ends of that grid.
+        :param surf_latitudes: Explicit SURF3d latitudes instead of that grid (e.g. for tests)
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
                INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE
                IN CASE OF REAL OBS
@@ -329,7 +568,10 @@ class ObservationOperator:
 
         # Initialise observation related quantities.
         #  craft=None is treated like "twin": use the observer position provided.
-        if (craft is None) or (str(craft).lower() == "twin"):
+        self.craft = craft
+        self.is_real_craft: bool = not ((craft is None) or (str(craft).lower() == "twin"))
+        self.moving_craft_observer = bool(moving_craft_observer)
+        if not self.is_real_craft:
             self.obs_radius = obs_radius
             self.obs_lon = obs_lon
             self.obs_lat = obs_lat
@@ -360,19 +602,22 @@ class ObservationOperator:
             self.obs_lat = craft_observer.lat[ind_req].to(u.deg)
 
             if use_model in ["compress_surf3d"]:
-                # Position angle of Earth from the craft, and the imager's latitude range (cached)
+                # Position angle of Earth from the craft (the imager's slice; cached)
                 self.ert_observer = geom["ert_observer"]
                 self.psi_ert, self.elon_ert = geom["psi_ert"], geom["elon_ert"]
                 self.psi_ert_avg = geom["psi_ert_avg"]
-                self.lat_min = geom["lat_min"]
-                self.lat_max = geom["lat_max"]
 
-        # SURF3d needs a finite latitude range; fall back to setup_surf3d's defaults
+        # SURF3d latitudes: only the imager's field of view (+/- FOV_LAT_BUFFER, every FOV_LAT_RESOLUTION),
+        #  plus a plane at the arrival body's latitude when the same runs give the arrival times
+        self.surf_latitudes: Quantity | None = None
         if self.use_model in ["compress_surf3d"]:
-            if np.isnan(self.lat_min) or np.isnan(self.lat_max):
-                print("lat_min/lat_max not set for compress_surf3d, defaulting to -30/+30 deg")
-                self.lat_min = -30 * u.deg
-                self.lat_max = 30 * u.deg
+            if surf_latitudes is not None:
+                self.surf_latitudes = np.sort(np.unique(u.Quantity(surf_latitudes).to(u.deg).value)) * u.deg
+            else:
+                self.surf_latitudes = imager_surf_latitudes(
+                    self.craft, surf_init_time, obs_radius, obs_lon, obs_lat, include_body=arrival_body)
+            self.lat_min = self.surf_latitudes.min()
+            self.lat_max = self.surf_latitudes.max()
 
         self.obs_cov = obs_cov
 
@@ -397,6 +642,69 @@ class ObservationOperator:
             None if profile_times is None else list(profile_times)
         )
         self.model_profiles: npt.NDArray[float] | None = None
+
+        # Arrival times from the same runs (see arrival_body); the run length grows to cover the arrival
+        self.arrival_body: str | None = arrival_body
+        self.arrival_sim_time = (5 * u.day if arrival_sim_time is None else arrival_sim_time)
+        self.member_arrivals: list | None = None
+        self.n_workers = n_workers
+        self.max_workers = max_workers
+        self.memory_fraction = memory_fraction
+        if self.arrival_body is not None:
+            self.run_sim_time = max(self.sim_time.to(u.day), self.arrival_sim_time.to(u.day))
+            self.run_compressible_sim_time = max(self.compressible_sim_time.to(u.day),
+                                                 self.arrival_sim_time.to(u.day))
+        else:
+            self.run_sim_time = self.sim_time
+            self.run_compressible_sim_time = self.compressible_sim_time
+
+
+    def member_memory_bytes(self) -> float:
+        """Approximate memory one member's model run needs (memory_budget.estimate_run_bytes)."""
+        compressible = self.use_model in ["compress_surf", "compress_surf3d"]
+        return estimate_run_bytes(
+            self.use_model, self.run_compressible_sim_time if compressible else self.run_sim_time,
+            dt_scale=self.dt_scale, n_lat=self.n_surf_latitudes, lon_start=self.lon_start, lon_stop=self.lon_stop,
+            r_min=self.r_min, lean=True, imaging_time=self.compressible_sim_time,
+            keep_wind=self.arrival_body is not None,
+        )
+
+
+    @property
+    def n_surf_latitudes(self) -> int:
+        """Number of SURF planes of one member's model (1 except for compress_surf3d)."""
+        return 1 if self.surf_latitudes is None else int(len(self.surf_latitudes))
+
+
+    def parallel_workers(self) -> int:
+        """Members to run at the same time: n_workers if given, else what the CPUs and memory allow."""
+        if self.n_workers is not None:
+            return max(int(self.n_workers), 1)
+        return worker_count(self.member_memory_bytes(), self.max_workers, self.memory_fraction)
+
+
+    @property
+    def uses_moving_craft(self) -> bool:
+        """True if the synthetic imager follows the craft's ephemeris (real craft, compressible models)."""
+        return self.moving_craft_observer and self.is_real_craft and \
+            self.use_model in ["compress_surf", "compress_surf3d"]
+
+
+    @property
+    def observer_id(self) -> tuple:
+        """
+        What a member's modelled track depends on, observer-wise: ("craft", name) when the imager follows the
+        craft's ephemeris (valid at every time), else ("position", r AU, lon deg, lat deg) of the fixed observer.
+        Two operators with the same observer_id give the same track for the same CME (aux_pf look-ahead reuse).
+        """
+        if self.uses_moving_craft:
+            return ("craft", str(self.craft).lower())
+
+        def value(x, unit):
+            q = u.Quantity(x)
+            v = q.to(unit).value if q.unit != u.dimensionless_unscaled else q.value
+            return round(float(np.ravel(v)[0]), 9)
+        return ("position", value(self.obs_radius, u.AU), value(self.obs_lon, u.deg), value(self.obs_lat, u.deg))
 
 
     # ------------------------------------------------------------------------------------------
@@ -676,7 +984,7 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
-                sim_time=self.sim_time,
+                sim_time=self.run_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
@@ -694,7 +1002,7 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
-                sim_time=self.compressible_sim_time,
+                sim_time=self.run_compressible_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
@@ -712,22 +1020,23 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 vr_lons=self.vr_longs,
                 vr_lats=self.vr_lats,
-                lat_min=self.lat_min,
-                lat_max=self.lat_max,
-                n_lat_surf=self.n_lat_surf,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
                 n_lon_surf=self.n_lon_surf,
-                sim_time=self.compressible_sim_time,
+                sim_time=self.run_compressible_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
+                latitudes=self.surf_latitudes,
+                lazy=True,
             )
 
-            # Run CME through SURF
+            # Run CME through SURF one latitude plane at a time, keeping only what the imager (density over the
+            #  imaging window) and the arrival (speed of the plane nearest Earth) need: see init_sir.solve_surf3d
             add_timing(f"obs_op.model_setup.{self.use_model}", time.perf_counter() - t_start)
             with timed(f"obs_op.model_solve.{self.use_model}"):
-                model.solve([cme])
+                solve_surf3d(model, [cme], keep_until=self.compressible_sim_time.to(u.s),
+                             keep_wind_nearest_earth=self.arrival_body is not None)
             cme_member: S.ConeCME = model.SURFlat[0].cmes[0]
 
         elif self.use_model in ["huxt"]:
@@ -736,7 +1045,7 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
-                sim_time=self.sim_time,
+                sim_time=self.run_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min
             )
@@ -775,7 +1084,6 @@ class ObservationOperator:
             obs_longitude = np.array(self.obs_lon.to(u.deg).value) * u.deg
             obs_latitude = np.array(self.obs_lat.to(u.deg).value) * u.deg
 
-            # TODO: Remove hard-coded numbers input into el_min and el_max
             obs_synth_HI_class = ObserverSynthHI(
                 use_model=self.use_model,
                 model=model,
@@ -784,9 +1092,11 @@ class ObservationOperator:
                 obs_radius=obs_radius,
                 obs_longitude=obs_longitude,
                 obs_latitude=obs_latitude,
-                el_min=4.0,
-                el_max=30.0,
+                el_min=HI_ELON_MIN,
+                el_max=HI_ELON_MAX,
                 profile_times=self.profile_times,
+                craft=self.craft if self.uses_moving_craft else None,
+                imaging_end=self.compressible_sim_time,
             )
             cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
             add_timing("obs_op.observer_synthetic_hi", time.perf_counter() - t_observer)
@@ -816,6 +1126,10 @@ class ObservationOperator:
                 cme_flank.attrs["el_profile"] = self.tracer_profile(cme_flank)
             else:
                 cme_flank.attrs["el_profile"] = obs_synth_HI_class.model_profile
+
+        # Arrival at the target body from this same run (arrival_body), carried back in attrs
+        if self.arrival_body is not None:
+            cme_flank.attrs["arrival"] = self.member_arrival(model, ens_no)
 
         if self.plot_surf_output:
             self.plot_surf(model)
@@ -848,6 +1162,18 @@ class ObservationOperator:
         return profile
 
 
+    def member_arrival(self, model, ens_no: int | None = None) -> tuple:
+        """
+        Arrival of a solved member's CME at self.arrival_body.
+        :return: (arrival datetime or None, arrival speed in km/s or NaN, hit)
+        """
+        try:
+            return arrival_at_body(model, self.arrival_body)
+        except Exception as err:  # e.g. the CME never enters the domain: a miss
+            print(f"Arrival not computed for member {ens_no}: {type(err).__name__}: {err}")
+            return None, np.nan, False
+
+
     def get_member_profile(self, cme_flank: pd.DataFrame) -> npt.NDArray[float]:
         """The diagnostic profile attached to a member's flank DataFrame (all NaN if there is none)."""
         profile = cme_flank.attrs.get("el_profile", None) if hasattr(cme_flank, "attrs") else None
@@ -877,24 +1203,19 @@ class ObservationOperator:
             else:
                 lon_for = lambda i: self.obs_lon
 
-            if self.use_parallel:
-                n_proc = max(int(os.cpu_count() - 1), 1)
+            if self.use_parallel and len(cme_objects) > 1:
+                # As many members at a time as the CPUs and the memory allow (see memory_budget.py)
+                n_proc = min(self.parallel_workers(), len(cme_objects))
                 print(f"Using parallel execution ({n_proc} worker processes)")
-                pool = get_worker_pool(n_proc)
-                try:
-                    obj_res = [
-                        pool.apply_async(_cme_flank_task, (self, i_cme, lon_for(i), i))
-                        for i, i_cme in enumerate(cme_objects)
-                    ]
-                    results = [r.get() for r in obj_res]
-                except BaseException:
-                    # Release the worker processes if anything fails (or on Ctrl+C)
-                    close_worker_pool()
-                    raise
+                results, in_process = run_on_pool(
+                    _cme_flank_task, [(self, i_cme, lon_for(i), i) for i, i_cme in enumerate(cme_objects)], n_proc
+                )
 
                 cme_flanks: list[pd.DataFrame] = []
-                for flank, worker_timings in results:
-                    merge_timings(worker_timings)
+                for flank, worker_timings, peak in results:
+                    if not in_process:
+                        merge_timings(worker_timings)
+                        record_worker_peak(peak)
                     cme_flanks.append(flank)
             else:
                 print("Using serial execution")
@@ -906,6 +1227,11 @@ class ObservationOperator:
         # Diagnostic profiles (NaN for members without one, e.g. operators that do not compute them)
         if self.profile_times is not None:
             self.model_profiles = np.array([self.get_member_profile(f) for f in cme_flanks], dtype=float)
+        if self.arrival_body is not None:
+            self.member_arrivals = [
+                f.attrs.get("arrival", (None, np.nan, False)) if hasattr(f, "attrs") else (None, np.nan, False)
+                for f in cme_flanks
+            ]
 
         # Short summary (previously every member's full DataFrame was printed on every call)
         n_no_el = sum(bool(np.isnan(f["el"].values).all()) for f in cme_flanks)
