@@ -14,7 +14,7 @@ from sir_observation_operator import ObservationOperator
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
 
-# sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests')
+# sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\code\\tests_previous')
 from tests.cme_par_array import CmeParArray
 from tests.cme_par_dict import CmeParDict
 

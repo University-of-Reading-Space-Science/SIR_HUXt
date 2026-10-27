@@ -115,6 +115,11 @@ class Observer:
                 lon_cme = lon_cme[id_sub]
                 r_cme = r_cme[id_sub]
 
+            # No CME points in the observer's field of view: record NaN rather than crash in np.argmax
+            if np.size(e_obs) == 0:
+                flank.loc[i, ['lon', 'r', 'el']] = np.nan
+                continue
+
             # Find the flank coordinate and update output
             id_obs_flank = np.argmax(e_obs)       
             flank.loc[i, 'lon'] = lon_cme[id_obs_flank].value

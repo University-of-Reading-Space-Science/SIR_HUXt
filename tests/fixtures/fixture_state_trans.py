@@ -12,7 +12,7 @@ from cme_par_ens import CmeParEns
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
 
-#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\tests')
+#sys.path.append('C:\\Users\\ss905122\\PycharmProjects\\SIR_HUXt\\tests_previous')
 from cme_par_array import CmeParArray
 from cme_par_dict import CmeParDict
 

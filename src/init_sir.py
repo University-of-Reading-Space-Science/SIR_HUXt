@@ -246,7 +246,7 @@ def setup_surf3d(
 
     #len_lon = len(vr_lons)
     shape_vr = np.shape(vr_in)
-    print(f"shape_vr={shape_vr}, len_lat={len_lat}, len_lon={len_lon}")
+    #print(f"shape_vr={shape_vr}, len_lat={len_lat}, len_lon={len_lon}")
     assert len(shape_vr) == 2
     assert shape_vr == (len_lat, len_lon)
 

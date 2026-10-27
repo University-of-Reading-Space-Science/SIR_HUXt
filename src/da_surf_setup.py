@@ -170,7 +170,7 @@ class Setup:
         latitude_max = 30 * u.deg
         n_lat_surf = 45
         sim_time: Quantity[u.day] = 3 * u.day
-        dt_scale: int = 1
+        dt_scale: int = 10
         cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
         r_min: Quantity[u.solRad] = 21.5 * u.solRad
         cme_fixed_duration: bool = True
@@ -926,9 +926,9 @@ class Setup:
         dist_in_km: Quantity[u.km] = (surf_r_min - surf_cme_ir).to(u.km)
         seconds_to_r_min: float = dist_in_km.to(u.km).value / fg_cme_speed
 
-        fg_cme_t_init: datetime.datetime = (
-                cme_at_12rs + datetime.timedelta(seconds=seconds_to_r_min)
-        )
+        fg_cme_t_init: datetime.datetime = cme_at_12rs #(
+        #        cme_at_12rs + datetime.timedelta(seconds=seconds_to_r_min)
+        #)
 
         if self.get_use_synthetic_obs():
             sd_cme_t_init: float = 0  # In seconds
@@ -990,7 +990,7 @@ class Setup:
             sd_t_init: float = 0  # In seconds
 
             if use_log_v:
-                sd_speed: float = 0.1  # Multiplicative variance
+                sd_speed: float = 0.3  # Multiplicative variance
             else:
                 sd_speed: float = 50  # In km/s
             sd_width: float = 5  # In deg
@@ -1002,7 +1002,7 @@ class Setup:
             sd_t_init: float = 3600  # In seconds
 
             if use_log_v:
-                sd_speed: float = 0.1  # Multiplicative variance
+                sd_speed: float = 0.3  # Multiplicative variance
             else:
                 sd_speed: float = 50  # In km/s
             sd_width: float = 5  # In deg
@@ -1049,6 +1049,11 @@ class Setup:
 
         ssw_event, craft, img = self.get_ssw_event_craft()
         if use_synthetic_obs:
+            # Synthetic (twin/OSSE) observations are taken from the observer defined above (obs_radius,
+            #  obs_lon, obs_lat). Without this, craft is still the real spacecraft of ssw_event (e.g.
+            #  "sta"), which ObservationOperator uses to overwrite obs_lon with that craft's real position
+            #  for both the truth run and every ensemble member, so obs_lon = 300 deg was silently ignored.
+            craft = "twin"
             bias_term_bool = False  # True
             obs_filenames: list[str] = [
                 "Synth_obs"
@@ -1102,9 +1107,12 @@ class Setup:
 
         use_parallel: bool = self.get_use_parallel()
 
-        # Set limits on minimum and maximum elongation observations to use
+        # Set limits on minimum and maximum elongation to use for simulating HI
         elong_min = 4.0
         elong_max = 30.0
+        # Set limits on minimum and maximum elongation observations to use
+        elong_min_obs = 4.0
+        elong_max_obs = 30.0
 
         obs_par_dict = {
             "n_obs": n_obs,
@@ -1114,6 +1122,8 @@ class Setup:
             "obs_cov": obs_cov,
             "elong_min": elong_min,
             "elong_max": elong_max,
+            "elong_min_obs": elong_min_obs,
+            "elong_max_obs": elong_max_obs,
             "obs_times": obs_times,
             "use_synthetic_obs": use_synthetic_obs,
             "obs_filenames": obs_filenames,
@@ -1131,7 +1141,7 @@ class Setup:
 
 
     def initialise_da_parameters(self):
-        n_members: int = 50
+        n_members: int = 20
 
         run_start = -1
         n_runs: int = 1

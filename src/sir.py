@@ -16,7 +16,8 @@ import huxt.huxt_analysis as HA
 
 import surf.surf as S
 import surf.surf_analysis as SA
-from mypy.build import TypedDict
+# (removed `from mypy.build import TypedDict`: TypedDict comes from typing above, and importing
+#  mypy at runtime fails unless mypy is installed)
 from scipy.special.cython_special import log_wright_bessel
 
 import sir_huxt_mono_obs as shmo
@@ -142,7 +143,9 @@ def add_units_from_cme_par(
 
     cme_par_dict["lon"]: Quantity[u.deg] = cme_par_array[:, 3] * u.deg
     lonCond: list[bool] = cme_par_dict["lon"] < 0 * u.deg
-    cme_par_dict["lon"]: Quantity[u.deg] = cme_par_dict["lon"][lonCond] + 360 * u.deg
+    # (previously `cme_par_dict["lon"] = cme_par_dict["lon"][lonCond] + 360 * u.deg`, which threw
+    #  away every non-negative longitude and returned a shorter array)
+    cme_par_dict["lon"][lonCond] = cme_par_dict["lon"][lonCond] + 360 * u.deg
 
     cme_par_dict["lat"]: Quantity[u.deg] = cme_par_array[:, 4] * u.deg
     cme_par_dict["thick"]: Quantity[u.solRad] = cme_par_array[:, 5] * u.solRad
@@ -635,8 +638,11 @@ def log_likelihood_function_gaussian(
     """
 
     # Calculate the observation operator (what the model thinks the observation should be)
+    # (use_model was missing, so cme_par was passed as use_model and every later argument shifted)
+    use_model = "huxt" if isinstance(surfObject, H.HUXt) else "surf"
     hx = obs_op(
         surfObject,
+        use_model,
         cme_par,
         obs_lon,
         obs_time_in_jd,
@@ -655,14 +661,15 @@ def log_likelihood_function_gaussian(
     if np.ndim(obs_cov) == 0:
         obs_cov_1 = 1.0 / obs_cov
 
-        loglik = -obs_cov_1 * innov * innov
+        # Gaussian: -0.5 * innov^2 / R (the 0.5 was missing, i.e. the obs error variance was halved)
+        loglik = -0.5 * obs_cov_1 * innov * innov
 
         # print("loglik: ", loglik)
         return loglik
     else:
         obs_cov_1 = np.linalg.pinv(obs_cov)
 
-        loglik = -np.transpose(innov).dot(obs_cov_1.dot(innov))
+        loglik = -0.5 * np.transpose(innov).dot(obs_cov_1.dot(innov))
 
         # print("loglik: ", loglik)
         return loglik
@@ -877,6 +884,8 @@ def calc_eff_sample_size(log_weights):
     :return: n_eff_ens
     """
 
+    # np.asarray: `2 * log_weights` on a python list repeats the list instead of doubling it
+    log_weights = np.asarray(log_weights, dtype=float)
     log_n_eff = 2 * jacob_log(log_weights) - jacob_log(2 * log_weights)
     # print(f"log(N_eff) = ", log_n_eff)
     n_eff_ens = np.exp(log_n_eff)
@@ -1078,11 +1087,16 @@ def auxPf(
         else:
             indReq = [n for n, i in enumerate(logCDF) if i > log_rand_value][0]
 
+        # Keep the parent's index: indReq is reused as a parameter index in the loop below, which
+        #  previously overwrote it before it was needed
+        parent_ind = indReq
+
         # print(f'indReq: {indReq}')
         # print(f"shrunk_pars[indReq, :]: {shrunk_pars[indReq, :]}")
         #        sys.exit()
-        resampPar[j, :] = np.random.multivariate_normal(
-            mean=shrunk_pars[indReq, :], cov=stoch_weight_cov
+        # (use the seeded rng passed in, not numpy's global generator, so runs are reproducible)
+        resampPar[j, :] = rng.multivariate_normal(
+            mean=shrunk_pars[parent_ind, :], cov=stoch_weight_cov
         )
 
         # Calculate the log-likelihood for this ensemble member
@@ -1095,7 +1109,8 @@ def auxPf(
                 indReq = pars_in_state.index(parVal)
                 par_arr_j.append(resampPar[j, indReq])
             else:
-                par_arr_j.append(parsNoUnits[j, ip])
+                # non-state parameters come from the parent particle (previously from member j)
+                par_arr_j.append(parsNoUnits[parent_ind, ip])
 
         cme_poste_par[j, :] = par_arr_j
         # Get the likelihood of the resampled parameters
@@ -1109,7 +1124,9 @@ def auxPf(
             r_min=r_min,
             cme_init_rad=cme_init_rad,
         )
-        resampWeights[j] = resamp_log_likelihood - log_likelihood_normed[j]
+        # Second-stage weight: p(y | theta_j) / p(y | mu_parent) (previously divided by member j's
+        #  first-stage likelihood rather than the parent's)
+        resampWeights[j] = resamp_log_likelihood - log_likelihood_normed[parent_ind]
 
     resampWeightNorm = jacob_log(resampWeights)
     resampWeights = resampWeights - resampWeightNorm

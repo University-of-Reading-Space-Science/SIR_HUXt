@@ -421,7 +421,10 @@ class Observations:
                     times_datetime.append(datetime_obs)
 
                     elong.append(float(line_split[2].strip()))
-                    obs_lon.append(float(line_split[3].strip()))
+                    # Attach degree units, consistent with read_obs_from_file (the observation operator
+                    #  calls obs_lon.to(u.deg) and ObserverTracer requires an angle Quantity; a bare
+                    #  float raised there)
+                    obs_lon.append(float(line_split[3].strip()) * u.deg)
 
         obs_times_out = [
             x for i, x in enumerate(times_datetime) if ~np.isnan(elong[i])
@@ -430,7 +433,7 @@ class Observations:
             x for i, x in enumerate(obs_lon) if ~np.isnan(elong[i])
         ]
         obs_lat_out = [
-            obs_lat for i, _ in enumerate(elong) if ~np.isnan(elong[i])
+            obs_lat * u.deg for i, _ in enumerate(elong) if ~np.isnan(elong[i])
         ]
         obs_out = [
             x for i, x in enumerate(elong) if ~np.isnan(elong[i])

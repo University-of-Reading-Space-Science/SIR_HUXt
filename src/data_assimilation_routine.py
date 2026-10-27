@@ -29,6 +29,7 @@ from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
 
 from da_surf_setup import Setup
+from sir_observation_operator import shutdown_worker_pool, ObservationOperator
 import time
 from multiprocessing import Pool
 from typing import Generator
@@ -100,6 +101,8 @@ class RunDataAssimilationRoutine:
         self.obs_times: list[datetime.datetime] = obs_par_dict["obs_times"]
         self.elong_min: float = obs_par_dict["elong_min"]
         self.elong_max: float = obs_par_dict["elong_max"]
+        self.elong_min_obs: float = obs_par_dict["elong_min_obs"]
+        self.elong_max_obs: float = obs_par_dict["elong_max_obs"]
         self.use_synthetic_obs: bool = obs_par_dict["use_synthetic_obs"]
         self.obs_filenames: list[str] = obs_par_dict["obs_filenames"]
         self.obs_rng_seed: int = obs_par_dict["obs_rng_seed"]
@@ -531,21 +534,241 @@ class RunDataAssimilationRoutine:
         return cme_par_dict
 
 
+    def write_elongation_file(
+            self,
+            output_dir: str,
+            elon_saved: dict,
+            log_weights: npt.NDArray[float],
+            profiles: dict | None = None,
+    ) -> str:
+        """
+        Write every ensemble member's modelled CME flank elongation at each observation to
+         <output_dir>/ens_elongations.nc (overwritten after each observation).
+        Variables (dimensions n_obs x n_ens unless stated):
+            elon_first_stage: elongation (deg) of each prior particle after Liu-West shrinkage, i.e. the
+                first-stage observation operator used to choose which particles are resampled
+            elon_posterior: elongation (deg) of each resampled (posterior) particle
+            parent_index: index of the prior particle each posterior particle was resampled from
+            log_weight: posterior log-weight of each particle after this observation
+            observation (n_obs): observed elongation (deg)
+            assimilated (n_obs): whether the observation was assimilated (False -> elongations are NaN)
+            resampled (n_obs): whether the ensemble was resampled at this observation (see
+                aux_pf.ADAPTIVE_RESAMPLING); if not, elon_first_stage and elon_posterior are both the
+                elongations of the (unchanged) particles and parent_index is 0..N-1
+            ess_updated (n_obs): effective sample size of the weights w * p(y | theta) of the current
+                particles, which decides whether to resample (NaN if not computed)
+        Full elongation profiles (dimensions n_ens x n_profile, on the profile_time grid), written once
+         they have been computed (see calculate_elongation_profiles):
+            prior_profile_elon: elongation (deg) of the prior ensemble, i.e. the ensemble passed to the
+                Aux-PF for the first observation
+            posterior_profile_elon: elongation (deg) of the ensemble after the last observation in the
+                permitted elongation range has been assimilated
+            {prior,posterior}_profile_extrapolated: 1 where the value was extrapolated before the first
+                tracked model point (see EXTRAPOLATE_BEFORE_TRACK), 0 where it comes from the model
+            {prior,posterior}_profile_log_weight (n_ens): normalised log-weight of each member
+        :param output_dir: Run output directory (as used for cme_pars.nc)
+        :param elon_saved: Dictionary of arrays filled in run_data_assimilation
+        :param log_weights: (n_obs, n_ens) posterior log-weights
+        :param profiles: Optional dict with "time" (list of datetimes) and, for "prior" and/or
+            "posterior", sub-dicts with "elon" (n_ens, n_profile), "extrapolated" (n_ens, n_profile)
+            and "log_weight" (n_ens)
+        :return: Path of the written file
+        """
+        n_obs_run = len(self.observations)
+        obs_times = np.array(self.obs_times[:n_obs_run], dtype="datetime64[ns]")
+
+        elon_ds = xr.Dataset(
+            data_vars=dict(
+                elon_first_stage=(["n_obs", "n_ens"], elon_saved["elon_first_stage"]),
+                elon_posterior=(["n_obs", "n_ens"], elon_saved["elon_posterior"]),
+                parent_index=(["n_obs", "n_ens"], elon_saved["parent_index"]),
+                log_weight=(["n_obs", "n_ens"], np.asarray(log_weights, dtype=float)),
+                observation=(["n_obs"], np.asarray(self.observations, dtype=float)),
+                assimilated=(["n_obs"], elon_saved["assimilated"].astype(np.int8)),
+                resampled=(["n_obs"], elon_saved["resampled"].astype(np.int8)),
+                ess_updated=(["n_obs"], elon_saved["ess_updated"]),
+            ),
+            coords=dict(
+                obs_no=("n_obs", np.arange(n_obs_run)),
+                obs_time=("n_obs", obs_times),
+                ens_no=("n_ens", np.arange(self.n_members)),
+            ),
+            attrs=dict(
+                description="Modelled CME flank elongation of each ensemble member at each observation",
+                elongation_units="deg",
+                use_model=self.use_model,
+                craft=str(self.craft),
+            ),
+        )
+
+        # Full 3-day elongation profiles of the prior and posterior ensembles
+        if profiles is not None:
+            elon_ds = elon_ds.assign_coords(
+                profile_time=("n_profile", np.array(profiles["time"], dtype="datetime64[ns]"))
+            )
+            for stage in ["prior", "posterior"]:
+                if profiles.get(stage) is None:
+                    continue
+                elon_ds[f"{stage}_profile_elon"] = (
+                    ["n_ens", "n_profile"], np.asarray(profiles[stage]["elon"], dtype=float)
+                )
+                elon_ds[f"{stage}_profile_extrapolated"] = (
+                    ["n_ens", "n_profile"], np.asarray(profiles[stage]["extrapolated"]).astype(np.int8)
+                )
+                elon_ds[f"{stage}_profile_log_weight"] = (
+                    ["n_ens"], np.asarray(profiles[stage]["log_weight"], dtype=float)
+                )
+
+        out_file = os.path.join(output_dir, "ens_elongations.nc")
+        try:
+            elon_ds.to_netcdf(out_file, mode="w")
+        except (OSError, PermissionError) as err:
+            # e.g. the file is open in another program (Windows locks it). Don't abort a long DA
+            #  run over a diagnostic file: warn, and the next observation will try again.
+            print(f"Warning: could not write {out_file}: {err}")
+
+        return out_file
+
+
+    # Full elongation profiles of the prior and posterior ensembles (written to ens_elongations.nc).
+    #  Each profile costs one extra ensemble of model runs (about half an observation step).
+    compute_elongation_profiles: bool = True
+    profile_duration_days: float = 3.0
+    profile_dt_minutes: float = 30.0
+
+    def get_profile_times(self) -> list[datetime.datetime]:
+        """
+        Times at which to evaluate the full elongation profiles: from the model start time for
+         profile_duration_days (the compressible SURF runs used by the observation operator are 3
+         days long) every profile_dt_minutes.
+        :return: List of profile datetimes
+        """
+        n_times = int(round(self.profile_duration_days * 1440.0 / self.profile_dt_minutes)) + 1
+        return [
+            self.surf_init_time + datetime.timedelta(minutes=k * self.profile_dt_minutes)
+            for k in range(n_times)
+        ]
+
+    def calculate_elongation_profiles(
+            self,
+            cme_par_dict: CmeParEns,
+            obs_index: int = 0,
+    ) -> dict:
+        """
+        Run every ensemble member once and evaluate its modelled CME flank elongation over the full
+         profile time grid, with the same observation operator (imager, tracking, extrapolation
+         before the first tracked point) as used for assimilation.
+        NB for a real craft the observer position is taken at the first profile time (the
+         observation operator locates the craft at its first time); for twin experiments it is the
+         observer position of observation obs_index.
+        :param cme_par_dict: Ensemble of CME parameters to evaluate
+        :param obs_index: Observation whose observer position is used (twin experiments)
+        :return: dict with "elon" and "extrapolated" (n_ens, n_profile) and "log_weight" (n_ens)
+        """
+        profile_times = self.get_profile_times()
+        print(f"Computing elongation profiles at {len(profile_times)} times for {self.n_members} members")
+
+        obs_op_class = ObservationOperator(
+            use_model=self.use_model,
+            cme_par_dict=cme_par_dict,
+            obs_time_in_datetime=profile_times,
+            obs_cov=self.obs_cov,
+            craft=self.craft,
+            obs_radius=self.obs_radius[obs_index],
+            obs_lon=self.obs_lon[obs_index],
+            obs_lat=self.obs_lat[obs_index],
+            surf_init_time=self.surf_init_time,
+            vr_in=self.vr_in,
+            vr_longs=self.vr_longs,
+            vr_lats=self.vr_lats,
+            n_lat_surf=self.n_lat_surf,
+            lon_start=self.lon_start,
+            lon_stop=self.lon_stop,
+            sim_time=self.sim_time,
+            dt_scale=self.dt_scale,
+            r_min=self.r_min,
+            cme_init_rad=self.cme_init_rad,
+            cme_fixed_duration=self.cme_fixed_duration,
+            fixed_duration=self.fixed_duration,
+            plot_surf_output=False,
+            bias_term_bool=self.bias_term_bool,
+            bias_term_5rs=self.bias_term_5rs,
+            bias_term_21rs=self.bias_term_21rs,
+            use_parallel=self.use_parallel,
+            write_diagnostics=False,
+        )
+
+        if self.use_model in ["compress_surf", "compress_surf3d"]:
+            cme_flanks = obs_op_class.get_cme_flanks()
+            elon = np.vstack([np.asarray(f["el"].values, dtype=float) for f in cme_flanks])
+            extrap = np.vstack([
+                np.asarray(f["extrapolated"].values, dtype=bool) if "extrapolated" in f.columns
+                else np.zeros(len(profile_times), dtype=bool)
+                for f in cme_flanks
+            ])
+        else:
+            elon = np.asarray(obs_op_class.make_obs_op(), dtype=float)
+            extrap = np.zeros(elon.shape, dtype=bool)
+
+        return {
+            "elon": elon,
+            "extrapolated": extrap,
+            "log_weight": np.asarray(cme_par_dict["log_weight"], dtype=float),
+        }
+
+    # Observations must be at least this far (deg) above the smallest elongation the model domain
+    #  can show (the inner boundary r_min seen from the observer); see get_min_model_elongation
+    elong_model_margin_deg: float = 1.0
+
+    def get_min_model_elongation(self) -> npt.NDArray[float]:
+        """
+        Smallest elongation (deg) at which the model can produce a CME flank at each observation time:
+        the model's inner boundary r_min seen from the observer, arcsin(r_min / r_observer).
+        Below this the synthetic J-map is masked (no solution inside r_min), so an observation there can
+        only be matched by members whose CME is already further out - i.e. the earliest/fastest
+        launches - and assimilating it biases the ensemble towards early launches (all other members
+        return NaN and are discarded).
+        Observer distance: the spacecraft's ephemeris for real craft, otherwise obs_radius.
+        :return: Array (n_obs) of minimum model elongations in degrees (NaN if unknown)
+        """
+        n_obs_run = len(self.observations)
+        r_min_rs = self.r_min.to(u.solRad).value
+
+        r_obs_rs = None
+        craft = (self.craft or "").lower()
+        if craft not in ["", "twin", "none"]:
+            try:
+                craft_obs = S.Observer(craft.upper(), Time(list(self.obs_times[:n_obs_run])))
+                r_obs_rs = np.asarray(craft_obs.r.to(u.solRad).value, dtype=float)
+            except Exception as err:
+                print(f"get_min_model_elongation: could not get {craft} ephemeris ({err}); using obs_radius")
+
+        if r_obs_rs is None:
+            r_obs_rs = np.array([
+                (r if isinstance(r, Quantity) else r * u.AU).to(u.solRad).value
+                for r in (self.obs_radius if isinstance(self.obs_radius, list)
+                          else [self.obs_radius] * n_obs_run)
+            ][:n_obs_run], dtype=float)
+
+        with np.errstate(invalid="ignore"):
+            elong_min_model = np.rad2deg(np.arcsin(np.clip(r_min_rs / r_obs_rs, 0.0, 1.0)))
+
+        return elong_min_model
+
     def run_data_assimilation(self, run_start=0):
         """
         Function to run the data assimilation routine
         :return: None
         """
+        # Negative run numbers count downwards (run_start, run_start - 1, ...).
+        #  (Previously self.n_runs itself was negated, so the progress message showed a negative
+        #  run count and a second call to this method flipped the sign back and ran the wrong range.)
         if run_start < 0:
-            self.n_runs = -self.n_runs
             step = -1
         else:
             step = 1
 
-        if self.use_parallel:
-            n_runs_req = self.n_runs
-        else:
-            n_runs_req = self.n_runs
+        n_runs_req = step * self.n_runs
 
         for run_no in range(run_start, run_start + n_runs_req, step):
             print(f"run_no = {run_no}")
@@ -567,6 +790,18 @@ class RunDataAssimilationRoutine:
 
             cme_par_dict = self.make_cme_par_dict(rng=rng)
             cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
+
+            # Modelled elongation of every ensemble member at every observation (NaN where the
+            #  observation was not assimilated, or the member's CME was not seen)
+            n_obs_run = len(self.observations)
+            elon_saved = {
+                "elon_first_stage": np.full((n_obs_run, self.n_members), np.nan),
+                "elon_posterior": np.full((n_obs_run, self.n_members), np.nan),
+                "parent_index": np.full((n_obs_run, self.n_members), -1, dtype=int),
+                "assimilated": np.zeros(n_obs_run, dtype=bool),
+                "resampled": np.zeros(n_obs_run, dtype=bool),
+                "ess_updated": np.full(n_obs_run, np.nan),
+            }
 
             # Save prior state
             cme_saved_pars[0, :, 0] = [
@@ -593,15 +828,45 @@ class RunDataAssimilationRoutine:
                 cme_par_dict=cme_par_dict, run_no=run_no
             )
 
+            # Lowest elongation each observation may have to be assimilable by the model
+            elong_min_model = self.get_min_model_elongation()
+            elong_min_usable = np.fmax(elong_min_model + self.elong_model_margin_deg, self.elong_min_obs)
+            print(
+                f"Minimum usable elongation (model inner boundary {self.r_min} + "
+                f"{self.elong_model_margin_deg} deg margin): "
+                f"{np.nanmin(elong_min_usable):.2f}-{np.nanmax(elong_min_usable):.2f} deg"
+            )
+
+            # Full elongation profiles of the prior ensemble (the ensemble passed to the Aux-PF for
+            #  the first assimilated observation: skipped observations do not change it)
+            profiles = None
+            if self.compute_elongation_profiles:
+                profiles = {"time": self.get_profile_times(), "prior": None, "posterior": None}
+                try:
+                    profiles["prior"] = self.calculate_elongation_profiles(cme_par_dict, obs_index=0)
+                except Exception as err:
+                    print(f"Warning: could not compute the prior elongation profiles: {err}")
+
             for yi, obs in enumerate(self.observations):
                 print(f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}")
                 # Initial conditions for running the DA, that the observation time is after
                 #  the first-guess of the CME launch and that the observation is in the
-                #  set [elong_min, elong_max]
+                #  set [elong_min_obs, elong_max_obs]
                 fg_cme_init_cond = self.obs_times[yi] > self.fg_mean_cme_t_init
                 obs_in_elon_range_cond = (
-                    (obs >= self.elong_min) and (obs <= self.elong_max)
+                    (obs >= self.elong_min_obs) and (obs <= self.elong_max_obs)
                 )
+                # ... and above the smallest elongation the model domain can show from this observer
+                obs_above_model_min_cond = bool(
+                    np.isnan(elong_min_usable[yi]) or (obs >= elong_min_usable[yi])
+                )
+                if obs_in_elon_range_cond and not obs_above_model_min_cond:
+                    print(
+                        f"Skipping obs {yi} ({obs:.2f} deg): below the model's minimum visible elongation "
+                        f"{elong_min_model[yi]:.2f} deg + {self.elong_model_margin_deg} deg margin "
+                        f"(inner boundary r_min = {self.r_min})"
+                    )
+                obs_in_elon_range_cond = obs_in_elon_range_cond and obs_above_model_min_cond
 
                 if fg_cme_init_cond and obs_in_elon_range_cond:
                     aux_pf_class = AuxPF(
@@ -638,6 +903,18 @@ class RunDataAssimilationRoutine:
                     )
 
                     cme_par_dict = aux_pf_class.aux_pf()
+
+                    # Record each member's modelled elongation at this observation
+                    elon_saved["elon_first_stage"][yi, :] = aux_pf_class.elon_first_stage
+                    elon_saved["elon_posterior"][yi, :] = aux_pf_class.elon_posterior
+                    elon_saved["parent_index"][yi, :] = aux_pf_class.parent_index
+                    # (False if the Aux-PF left the ensemble unchanged, e.g. because a member's CME
+                    #  produced no elongation; see aux_pf.SKIP_UPDATE_IF_ANY_MEMBER_NAN)
+                    elon_saved["assimilated"][yi] = not getattr(aux_pf_class, "update_skipped", False)
+                    elon_saved["resampled"][yi] = bool(getattr(aux_pf_class, "resampled", True))
+                    elon_saved["ess_updated"][yi] = getattr(aux_pf_class, "ess_updated", np.nan)
+                    if getattr(aux_pf_class, "update_skipped", False):
+                        print(f"Observation {yi} not assimilated: {aux_pf_class.skip_reason}")
                 elif fg_cme_init_cond:
                     # (these two messages were previously swapped)
                     print("Observation is outside the permitted elongation range for the model")
@@ -665,6 +942,38 @@ class RunDataAssimilationRoutine:
                 cme_saved_pars[yi + 1, :, 4] = cme_par_dict["lat"].to(u.deg).value
                 cme_saved_pars[yi + 1, :, 5] = cme_par_dict["thick"].to(u.solRad).value
                 cme_saved_pars[yi + 1, :, 6] = cme_par_dict["log_weight"]
+
+                # Write the elongations after every observation, so a run that stops part-way
+                #  still leaves everything computed so far on disk
+                self.write_elongation_file(
+                    output_dir=output_dir,
+                    elon_saved=elon_saved,
+                    # (observations not yet reached are NaN rather than the array's initial zeros)
+                    log_weights=np.where(
+                        (np.arange(n_obs_run) <= yi)[:, None],
+                        cme_saved_pars[1:n_obs_run + 1, :, 6],
+                        np.nan
+                    ),
+                    profiles=profiles,
+                )
+
+            # Full elongation profiles of the posterior ensemble (after the last observation in the
+            #  permitted elongation range has been assimilated)
+            if profiles is not None:
+                assimilated_ind = np.flatnonzero(elon_saved["assimilated"])
+                last_obs_ind = int(assimilated_ind[-1]) if assimilated_ind.size else 0
+                try:
+                    profiles["posterior"] = self.calculate_elongation_profiles(
+                        cme_par_dict, obs_index=last_obs_ind
+                    )
+                except Exception as err:
+                    print(f"Warning: could not compute the posterior elongation profiles: {err}")
+                self.write_elongation_file(
+                    output_dir=output_dir,
+                    elon_saved=elon_saved,
+                    log_weights=cme_saved_pars[1:n_obs_run + 1, :, 6],
+                    profiles=profiles,
+                )
 
             for par_ind in range(7):
                 if par_ind == 6:
@@ -763,10 +1072,14 @@ def main():
 
     run_start = da_par_dict["run_start"]
 
-    if setup_class.get_use_synthetic_obs():
-        run_da_class.run_data_assimilation(run_start=run_start)
-    else:
-        run_da_class.run_data_assimilation(run_start=-1)
+    try:
+        if setup_class.get_use_synthetic_obs():
+            run_da_class.run_data_assimilation(run_start=run_start)
+        else:
+            run_da_class.run_data_assimilation(run_start=-1)
+    finally:
+        # Close the persistent worker pool used by the observation operator
+        shutdown_worker_pool()
 
     return None
 

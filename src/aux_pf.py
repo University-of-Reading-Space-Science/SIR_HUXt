@@ -28,6 +28,24 @@ warnings.filterwarnings(
     "ignore", message="invalid value encountered in divide"
 )
 
+# If True, an observation is not assimilated (the ensemble and its weights are left unchanged)
+#  when the CME of any ensemble member does not produce an elongation, either for the shrunk
+#  particles used to choose the resampling (first stage) or for the resampled particles (second
+#  stage). If False, only an observation where no member produces an elongation is skipped, and
+#  members without an elongation are given a negligible weight.
+SKIP_UPDATE_IF_ANY_MEMBER_NAN: bool = True
+
+# Adaptive resampling (Liu & Chen 1995; Kong, Liu & Wong 1994). If True, each observation first
+#  updates the weights of the current particles, w_i <- w_i * p(y | theta_i). Only if the effective
+#  sample size of these updated weights falls below RESAMPLE_ESS_FRACTION * N is the full
+#  auxiliary-PF step (Liu-West shrinkage, resampling and jitter) carried out. Resampling at every
+#  observation repeatedly removes particles, so the ensemble's family tree (and its spread) collapses
+#  even when the weights are fairly even. If False, the auxiliary-PF step is done at every observation.
+#  Cost: a step without resampling needs one ensemble of model runs (the current particles); a step
+#  with resampling needs three (current, shrunk and resampled particles).
+ADAPTIVE_RESAMPLING: bool = True
+RESAMPLE_ESS_FRACTION: float = 0.5
+
 class AuxPF:
     """
     Class to perform Auxiliary PF for a single observation
@@ -154,7 +172,10 @@ class AuxPF:
         """
         # Weighted covariance, consistent with the weighted mean used in shrink_par (Liu & West, 2001).
         #  (Previously the unweighted covariance was used.)
-        weights = np.exp(np.asarray(self.log_weights, dtype=float))
+        # Subtract the maximum before exponentiating so the weights cannot all underflow to zero
+        #  (which previously made this silently fall back to the unweighted covariance)
+        log_w = np.asarray(self.log_weights, dtype=float)
+        weights = np.exp(log_w - np.max(log_w))
         if (not np.all(np.isfinite(weights))) or (np.sum(weights) <= 0):
             weights = None
         cov_state: float | npt.NDArray = np.cov(self.state_vector, rowvar=False, aweights=weights)
@@ -203,9 +224,9 @@ class AuxPF:
         else:
             # If weights are provided, calculate weighted mean
             # Transform from log-space and normalise weights
-            weights: npt.NDArray[float] = np.asarray(
-                np.exp(self.log_weights)
-            )
+            # (subtract the maximum first so that very negative log-weights cannot underflow to 0/0)
+            log_w = np.asarray(self.log_weights, dtype=float)
+            weights: npt.NDArray[float] = np.exp(log_w - np.max(log_w))
             weights: npt.NDArray[float] = weights / weights.sum()
 
             # Compute weighted mean parameter
@@ -318,6 +339,7 @@ class AuxPF:
         obs_op_class = ObservationOperator(
             use_model=self.use_model,
             cme_par_dict=state_dict_in,
+            obs=self.obs,
             obs_radius=self.obs_radius,
             obs_lon=self.obs_lon,
             obs_lat=self.obs_lat,
@@ -452,6 +474,10 @@ class AuxPF:
         Function to calculate the Effective Sample Size of Aux-PF with logarithmic weights
         :return: log_ess: Logarithm of Effective Sample Size
         """
+        # np.asarray: with a python list, `2 * log_weight_in` would repeat the list rather than
+        #  double the log-weights, giving a wrong ESS
+        log_weight_in = np.asarray(log_weight_in, dtype=float)
+
         # Calculate the logarithm of the Effective Sample Size
         term1 = 2 * jacobian_log(log_weight_in)
         term2 = jacobian_log(2 * log_weight_in)
@@ -482,27 +508,99 @@ class AuxPF:
         Function to perform the auxillary particle filter routine
         :return: cme_par_dict: Updated cme_par_dict with parameters changed by Auxillary PF
         """
-        # Calculate the effective sample size from the prior weights
+        # Calculate the effective sample size from the prior weights (diagnostic only).
+        #  NB: the weights were previously reset to 1/N here whenever ESS < N/2. Resetting weights
+        #  *without* resampling throws away the information they carry (low-weight particles become
+        #  as likely as high-weight ones). The auxiliary PF already resamples every step using the
+        #  first-stage weights w_{t-1} * p(y | mu), which is what controls degeneracy, so the prior
+        #  weights must be carried through unchanged. (The reset also happened after the shrinkage
+        #  mean and covariance had been computed with the old weights, so the two were inconsistent.)
         ess_prior = self.calc_ess_log_weights(self.log_weights)
-        if ess_prior < (self.n_members / 2.0):
-            self.cme_par_dict["weight"] = [1.0 / self.n_members for _ in range(self.n_members)]
-            self.weights = [1.0 / self.n_members for _ in range(self.n_members)]
+        print(f"ess_prior = {ess_prior}")
 
-            self.cme_par_dict["log_weight"] = [-np.log(self.n_members) for _ in range(self.n_members)]
-            self.log_weights = [-np.log(self.n_members) for _ in range(self.n_members)]
+        # Keep the ensemble as it is now, so the update can be discarded if a resampled member's CME
+        #  does not produce an elongation (see SKIP_UPDATE_IF_ANY_MEMBER_NAN)
+        cme_par_dict_in = copy.deepcopy(self.cme_par_dict)
+        cme_par_array_in = np.copy(self.cme_par_array)
+        self.skip_reason: str | None = None
+        self.resampled: bool = False
+        self.ess_updated: float = np.nan
 
-        ess_prior2 = self.calc_ess_log_weights(self.log_weights)
-        #print(f"ess_prior: {ess_prior}")
-        #print(f"ess_prior2 = {ess_prior2}")
+        if ADAPTIVE_RESAMPLING:
+            # Elongations and likelihoods of the current (unshrunk, unjittered) particles
+            obs_op_current = self.get_observation_operator(self.cme_par_dict)
+            elon_current = np.asarray(obs_op_current, dtype=float)[:, 0].copy()
+            log_likelihood_current = np.array([
+                self.calculate_log_likelihood_single_ens(obs_op_current[i, :])
+                for i in range(self.n_members)
+            ], dtype=float)
+
+            # Skip this observation (as below) if a member produced no elongation, or none did
+            n_no_elon = int(np.sum(~np.all(np.isfinite(np.asarray(obs_op_current, dtype=float)), axis=1)))
+            no_finite_lik = not np.any(np.isfinite(log_likelihood_current))
+            if (SKIP_UPDATE_IF_ANY_MEMBER_NAN and n_no_elon > 0) or no_finite_lik:
+                self.skip_reason = f"{n_no_elon}/{self.n_members} members produced no elongation"
+                warnings.warn(f"Observation at {self.obs_time} not assimilated: {self.skip_reason}.")
+                self.elon_first_stage = elon_current
+                self.elon_posterior = np.full(self.n_members, np.nan)
+                self.parent_index = np.arange(self.n_members, dtype=int)
+                self.update_skipped = True
+                return self.cme_par_dict
+
+            # Updated weights w_i * p(y | theta_i) and their effective sample size
+            log_weights_upd = np.asarray(self.log_weights, dtype=float) + log_likelihood_current
+            log_weights_upd = np.where(np.isfinite(log_weights_upd), log_weights_upd, -1e31)
+            log_weights_upd = log_weights_upd - jacobian_log(log_weights_upd)
+            self.ess_updated = float(self.calc_ess_log_weights(log_weights_upd))
+            print(f"ess_updated = {self.ess_updated:.2f} (resampling threshold "
+                  f"{RESAMPLE_ESS_FRACTION * self.n_members:.1f})")
+
+            if self.ess_updated >= RESAMPLE_ESS_FRACTION * self.n_members:
+                # Enough effective particles: keep the particles, carry the updated weights forward
+                self.cme_par_dict["log_weight"] = list(log_weights_upd)
+                self.cme_par_dict["weight"] = list(np.exp(log_weights_upd))
+                self.elon_first_stage = elon_current
+                self.elon_posterior = elon_current.copy()
+                self.parent_index = np.arange(self.n_members, dtype=int)
+                self.update_skipped = False
+                print("ESS above threshold: weights updated, no resampling")
+                return self.cme_par_dict
+
+            print("ESS below threshold: auxiliary-PF step with resampling")
+        self.resampled = True
 
         # Calculate the observation operator, hx, to calculate the likelihoods for each ensemble member
         obs_op_shrunk = self.get_observation_operator(self.state_vector_shrunk_dict)
+        # Keep the modelled elongations (one value per member at this observation time) so the
+        #  routine can write them out. Indexed by the pre-resampling particle.
+        self.elon_first_stage: npt.NDArray[float] = np.asarray(obs_op_shrunk, dtype=float)[:, 0].copy()
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_shrunk_ens = [
             self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
             for i in range(self.n_members)
         ]
+
+        # Skip the update, returning the ensemble and its weights unchanged, if
+        #  - any member's CME produced no elongation and SKIP_UPDATE_IF_ANY_MEMBER_NAN is set, or
+        #  - no member produced a finite likelihood (e.g. every modelled CME is outside the imager's
+        #    field of view): the observation then carries no information, and resampling with the
+        #    resulting uniform weights would only destroy ensemble diversity.
+        n_no_elon = int(np.sum(~np.all(np.isfinite(np.asarray(obs_op_shrunk, dtype=float)), axis=1)))
+        no_finite_lik = not np.any(np.isfinite(np.asarray(log_likelihood_shrunk_ens, dtype=float)))
+        if (SKIP_UPDATE_IF_ANY_MEMBER_NAN and n_no_elon > 0) or no_finite_lik:
+            self.skip_reason = (
+                f"{n_no_elon}/{self.n_members} (shrunk) members produced no elongation"
+            )
+            warnings.warn(
+                f"Observation at {self.obs_time} not assimilated: {self.skip_reason}."
+            )
+            self.elon_posterior = np.full(self.n_members, np.nan)
+            self.parent_index = np.arange(self.n_members, dtype=int)
+            self.update_skipped = True
+            self.resampled = False
+            return self.cme_par_dict
+        self.update_skipped = False
 
         # Calculate the auxillary probabilities for selecting the new particles
         log_aux_prob = self.get_aux_prob_log_weights(log_likelihood_shrunk_ens)
@@ -523,9 +621,15 @@ class AuxPF:
             [self.resample_pars(ind_req) for ind_req in resample_ind]
         )
 
+        # Each new particle inherits ALL of its parent's parameters. Only the parameters in the state
+        #  vector are overwritten with the jittered draws below; the others (e.g. t_init, lat, thick when
+        #  they are not in the state) must come from the parent particle resample_ind[i], not from row i.
+        #  (Previously row i kept its own non-state parameters, producing mismatched hybrid particles.)
+        parent_cme_par_array: npt.NDArray[float] = np.copy(self.cme_par_array[resample_ind, :])
+
         # Place new resampled pars into the cme_par_dict
         from_state_class: FromStateVector = FromStateVector(
-            cme_par_array=self.cme_par_array,
+            cme_par_array=parent_cme_par_array,
             cme_par_dict=self.cme_par_dict,
             state_ens=resample_pars,
             pars_in_state_vector=self.pars_in_state
@@ -535,6 +639,28 @@ class AuxPF:
 
         # Calculate the observation operator, hx, to calculate the posterior log likelihoods for each ensemble member
         obs_op_post = self.get_observation_operator(self.cme_par_dict)
+        # Elongations of the resampled (posterior) particles, and which prior particle each came from
+        self.elon_posterior: npt.NDArray[float] = np.asarray(obs_op_post, dtype=float)[:, 0].copy()
+        self.parent_index: npt.NDArray[int] = np.asarray(resample_ind, dtype=int)
+
+        # If a resampled member's CME produced no elongation, discard the update: restore the
+        #  ensemble and weights from before this observation (see SKIP_UPDATE_IF_ANY_MEMBER_NAN)
+        n_no_elon_post = int(np.sum(~np.all(np.isfinite(np.asarray(obs_op_post, dtype=float)), axis=1)))
+        if SKIP_UPDATE_IF_ANY_MEMBER_NAN and n_no_elon_post > 0:
+            self.skip_reason = (
+                f"{n_no_elon_post}/{self.n_members} resampled members produced no elongation"
+            )
+            warnings.warn(
+                f"Observation at {self.obs_time} not assimilated: {self.skip_reason}; "
+                f"the update has been discarded."
+            )
+            self.cme_par_dict = cme_par_dict_in
+            self.cme_par_array = cme_par_array_in
+            self.elon_posterior = np.full(self.n_members, np.nan)
+            self.parent_index = np.arange(self.n_members, dtype=int)
+            self.update_skipped = True
+            self.resampled = False
+            return self.cme_par_dict
 
         # Calculate likelihoods for all ensemble members
         log_likelihood_post = [
@@ -544,6 +670,13 @@ class AuxPF:
         log_weights_post = [
             log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
             for i in range(len(resample_ind))
+        ]
+
+        # A member whose posterior likelihood is NaN (model CME not visible) would otherwise keep a
+        #  NaN weight, which is written to the output and breaks the ESS/weighted statistics.
+        #  Give such members a negligible weight explicitly.
+        log_weights_post = [
+            x if np.isfinite(x) else -1e31 for x in log_weights_post
         ]
 
         # Normalise the log_weights
