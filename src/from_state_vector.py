@@ -11,7 +11,7 @@ import astropy.units as u
 from astropy.units import Quantity
 
 from cme_par_ens import CmeParEns
-from cme_par_dict_structure import required_dict_keys, cme_par_get_indices
+from cme_par_dict_structure import required_dict_keys, cme_par_get_indices, state_par_keys
 
 class FromStateVector:
     def __init__(
@@ -64,11 +64,11 @@ class FromStateVector:
         :param par_req List containing the names of all the required parameters from cme_par_dict
         :return cme_par_array Array that contains all CME parameters required
         """
-        assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
+        assert all(p in state_par_keys() for p in self.pars_in_state_vector)
 
         #f"state_ens={self.state_ens}")
         for i, ip in enumerate(self.pars_in_state_vector):
-            if ip in required_dict_keys():
+            if ip in state_par_keys():
                 cme_par_ind_req = cme_par_get_indices(ip)
                 #print(f"i={i}, ip={ip}: cme_par_ind_req={cme_par_ind_req}")
                 self.cme_par_array[:, cme_par_ind_req] = self.state_ens[:, i]
@@ -93,11 +93,11 @@ class FromStateVector:
                 f"Missing zscore values (x_mean and x_std) input into FromStateVector."
                 f" z_ens={self.state_ens}"
             )
-        assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
+        assert all(p in state_par_keys() for p in self.pars_in_state_vector)
 
         # Extract all required parameters, put them in an ensemble matrix, then calculate the zscores for output
         for i, ip in enumerate(self.pars_in_state_vector):
-            if ip in required_dict_keys():
+            if ip in state_par_keys():
                 cme_par_ind_req = cme_par_get_indices(ip)
                 # inverse z-score (previously called sir.inv_zscore, but `sir` was never imported)
                 self.cme_par_array[:, cme_par_ind_req] = (
@@ -243,6 +243,16 @@ class FromStateVector:
 
         return thick_dict
 
+    def convert_bias_array_to_dict(self) -> list[float]:
+        """
+        Function to take the observation-bias coefficients (deg) from cme_par_array for cme_par_dict
+        :return: bias_dict: List of bias coefficients (0 if cme_par_array has no bias column)
+        """
+        ind_req = cme_par_get_indices("bias")
+        if self.cme_par_array.shape[1] <= ind_req:
+            return [0.0] * self.cme_par_array.shape[0]
+        return [float(b) for b in self.cme_par_array[:, ind_req]]
+
     def cme_par_array_to_cme_par_dict(self) -> CmeParEns:
         """
         Extract the relevant cme parameters from the cme parameter array, add the units back
@@ -272,6 +282,7 @@ class FromStateVector:
         self.cme_par_dict["lon"]: list[Quantity[u.deg]] = self.convert_lon_array_to_dict()
         self.cme_par_dict["lat"]: list[Quantity[u.deg]] = self.convert_lat_array_to_dict()
         self.cme_par_dict["thick"]: list[Quantity[u.solRad]] = self.convert_thick_array_to_dict()
+        self.cme_par_dict["bias"]: list[float] = self.convert_bias_array_to_dict()
 
         return self.cme_par_dict
 

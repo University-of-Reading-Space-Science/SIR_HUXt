@@ -299,6 +299,7 @@ def initialise_cme_parameter_ensemble_dict(
         "lon": [0 for _ in range(n_ensemble)] * u.deg,
         "lat": [0 for _ in range(n_ensemble)] * u.deg,
         "thick": [0 for _ in range(n_ensemble)] * u.solRad,
+        "bias": [0.0 for _ in range(n_ensemble)],  # observation-bias coefficient (deg), see obs_bias.py
         "v_transit": [0 for _ in range(n_ensemble)],
         "v_hit": [0 for _ in range(n_ensemble)],
         "likelihood": [0 for _ in range(n_ensemble)],

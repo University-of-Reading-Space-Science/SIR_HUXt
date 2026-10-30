@@ -30,6 +30,10 @@ from cme_par_ens import CmeParEns
 
 from da_surf_setup import Setup
 from sir_observation_operator import shutdown_worker_pool, ObservationOperator
+from obs_bias import resolve_bias_settings
+from state_transform import (StateTransform, resolve_correlation_settings, filter_state_pars,
+                             weighted_corr)
+from to_state_vector import ToStateVector
 import time
 from multiprocessing import Pool
 from typing import Generator
@@ -185,6 +189,20 @@ class RunDataAssimilationRoutine:
         self.delta_aux_pf: float = da_par_dict["delta_aux_pf"]
         self.pars_in_state: list[str] = da_par_dict["pars_in_state"]
         self.time_tolerance: Quantity[u.day] = da_par_dict["time_tolerance"]
+
+        # Observation-bias term (see obs_bias.py and Setup.get_bias_settings)
+        self.bias_settings: dict = resolve_bias_settings(da_par_dict.get("bias_settings"))
+        if self.bias_settings["mode"] == "estimate" and "bias" not in self.pars_in_state:
+            self.pars_in_state = self.pars_in_state + ["bias"]
+
+        # Handling of correlated parameters in the Liu-West step (see state_transform.py and
+        #  Setup.get_correlation_settings). pars_in_state is still used to draw the prior; the
+        #  Aux-PF updates only pars_in_filter (pars_in_state without those carried from the prior).
+        self.correlation_settings: dict = resolve_correlation_settings(da_par_dict.get("correlation_settings"))
+        self.pars_in_filter: list[str] = filter_state_pars(self.pars_in_state, self.correlation_settings)
+        if self.correlation_settings["enabled"]:
+            print(f"Correlation handling on: {self.correlation_settings}; "
+                  f"parameters updated by the filter: {self.pars_in_filter}")
         #self.rng: Generator = np.random.default_rng(da_par_dict["rng_seed"])
 
 
@@ -213,6 +231,47 @@ class RunDataAssimilationRoutine:
             random_seed = int(np.abs((add_const + (mult_const / 2.0)) + (run_no * mult_const)))
 
         return random_seed
+
+
+    def make_state_transform(self, cme_par_dict: CmeParEns) -> StateTransform | None:
+        """
+        Build the StateTransform for this run's Liu-West steps from its prior ensemble
+         (None when correlation handling is off, which leaves the Aux-PF exactly as before)
+        :param cme_par_dict: Prior CME parameter ensemble
+        :return: StateTransform or None
+        """
+        if not self.correlation_settings["enabled"]:
+            return None
+        prior_state = ToStateVector(
+            cme_par_dict, pars_in_state_vector=self.pars_in_filter
+        ).cme_par_dict_to_state_vector()
+        transform = StateTransform(
+            pars=self.pars_in_filter,
+            settings=self.correlation_settings,
+            r_min_rs=float(self.r_min.to(u.solRad).value),
+            cme_init_rad_rs=float(self.cme_init_rad.to(u.solRad).value),
+            prior_state=prior_state,
+            prior_log_weights=cme_par_dict["log_weight"],
+        )
+        print(f"Liu-West working coordinates: {transform.working_labels()}"
+              f"{' (whitened with the prior covariance)' if transform.whiten else ''}")
+        return transform
+
+
+    def state_correlation(self, cme_par_dict: CmeParEns) -> npt.NDArray[float]:
+        """
+        Weighted correlation matrix of the parameters in pars_in_state (v as ln v), for diagnosing how
+         the filter handles parameter correlations
+        :param cme_par_dict: CME parameter ensemble
+        :return: (n_state, n_state) correlation matrix
+        """
+        x = ToStateVector(
+            cme_par_dict, pars_in_state_vector=self.pars_in_state
+        ).cme_par_dict_to_state_vector()
+        if "v" in self.pars_in_state:
+            i_v = self.pars_in_state.index("v")
+            x[:, i_v] = np.log(np.clip(x[:, i_v], 1e-6, None))
+        return weighted_corr(x, cme_par_dict["log_weight"])
 
 
     def make_output_dir(self, cme_par_dict: CmeParEns, run_no: int):
@@ -244,6 +303,28 @@ class RunDataAssimilationRoutine:
             f"_{self.fg_mean_cme_thick:.1f}"
         )
         run_dir = f"run_{run_no:03d}"
+
+        # Separate folders for runs with an observation-bias term (and, in twins, the injected bias)
+        if self.bias_settings["mode"] != "off":
+            bias_tag = (
+                f"obsbias_{self.bias_settings['mode']}_{self.bias_settings['predictor']['type']}"
+                f"_prior{self.bias_settings['prior_mean']:.2f}_{self.bias_settings['prior_sd']:.2f}"
+            )
+            prior_dir = os.path.join(bias_tag, prior_dir)
+        # Separate folders for runs with correlation handling
+        if self.correlation_settings["enabled"]:
+            cs = self.correlation_settings
+            corr_tag = (
+                f"corr_{cs['reparam']}"
+                f"{('_r' + format(cs['t_ref_rs'], 'g')) if cs['reparam'] == 'tref_logv' and cs['t_ref_rs'] is not None else ''}"
+                f"{'_white' if cs['whiten'] else ''}"
+                f"_a{cs['shrinkage_alpha']:.2f}_floor{cs['min_jitter_sd']:.3f}"
+            )
+            if cs["carry_from_prior"]:
+                corr_tag += "_carry-" + "-".join(cs["carry_from_prior"])
+            prior_dir = os.path.join(corr_tag, prior_dir)
+        if self.use_synthetic_obs and float(self.true_cme_par_dict.get("bias", 0.0)) != 0.0:
+            obs_dir = f"{obs_dir}_truebias{float(self.true_cme_par_dict['bias']):.2f}"
 
         if self.bias_term_bool:
             bias_dir = os.path.join(
@@ -471,7 +552,7 @@ class RunDataAssimilationRoutine:
                 start_time=start_time_donki,
                 end_time=end_time_donki,
                 scale_corr=self.scale_corr,
-                vars_req=np.array(self.pars_in_state),
+                vars_req=np.array([p for p in self.pars_in_state if p != "bias"]),
                 sd_t_init=self.prior_sd_t_init,
                 sd_v=self.prior_sd_speed,
                 sd_width=self.prior_sd_width,
@@ -506,7 +587,7 @@ class RunDataAssimilationRoutine:
                 overwrite_cov=False,
                 mo_cone_cov_dir=mo_cone_cov_dir,
                 scale_corr=self.scale_corr,
-                vars_req=np.array(self.pars_in_state),
+                vars_req=np.array([p for p in self.pars_in_state if p != "bias"]),
                 sd_t_init=self.prior_sd_t_init,
                 sd_v=self.prior_sd_speed,
                 sd_width=self.prior_sd_width,
@@ -530,6 +611,17 @@ class RunDataAssimilationRoutine:
         cme_par_dict["lon"] = list(samples[3, :]) * u.deg
         cme_par_dict["lat"] = list(samples[4, :]) * u.deg
         cme_par_dict["thick"] = list(samples[5, :]) * u.solRad
+
+        # Observation-bias coefficient of each member (see obs_bias.bias_units)
+        bias_mode = self.bias_settings["mode"]
+        if bias_mode == "estimate":
+            cme_par_dict["bias"] = list(rng.normal(
+                self.bias_settings["prior_mean"], self.bias_settings["prior_sd"], self.n_members
+            ))
+        elif bias_mode == "fixed":
+            cme_par_dict["bias"] = [float(self.bias_settings["prior_mean"])] * self.n_members
+        else:
+            cme_par_dict["bias"] = [0.0] * self.n_members
 
         return cme_par_dict
 
@@ -790,6 +882,16 @@ class RunDataAssimilationRoutine:
 
             cme_par_dict = self.make_cme_par_dict(rng=rng)
             cme_saved_pars = np.zeros((self.n_obs + 1, self.n_members, 7))
+            # Observation-bias coefficient of each member, prior (row 0) and after each observation
+            bias_saved = np.zeros((self.n_obs + 1, self.n_members))
+            bias_saved[0, :] = np.asarray(cme_par_dict.get("bias", 0.0), dtype=float)
+
+            # Correlation handling: working coordinates fixed from this run's prior ensemble
+            state_transform = self.make_state_transform(cme_par_dict)
+            # Weighted correlation matrix of the state parameters (v as ln v), prior and after each obs
+            n_state = len(self.pars_in_state)
+            corr_saved = np.full((self.n_obs + 1, n_state, n_state), np.nan)
+            corr_saved[0] = self.state_correlation(cme_par_dict)
 
             # Modelled elongation of every ensemble member at every observation (NaN where the
             #  observation was not assimilated, or the member's CME was not seen)
@@ -881,7 +983,7 @@ class RunDataAssimilationRoutine:
                         craft=self.craft,
                         true_cme_par_dict=self.true_cme_par_dict,
                         infl_fact=1,
-                        pars_in_state=self.pars_in_state,
+                        pars_in_state=self.pars_in_filter,
                         vr_in=self.vr_in,
                         vr_longs=self.vr_longs,
                         vr_lats=self.vr_lats,
@@ -899,7 +1001,8 @@ class RunDataAssimilationRoutine:
                         bias_term_5rs=self.bias_term_5rs,
                         bias_term_21rs=self.bias_term_21rs,
                         use_parallel=self.use_parallel,
-                        rng=rng
+                        rng=rng,
+                        state_transform=state_transform
                     )
 
                     cme_par_dict = aux_pf_class.aux_pf()
@@ -942,6 +1045,8 @@ class RunDataAssimilationRoutine:
                 cme_saved_pars[yi + 1, :, 4] = cme_par_dict["lat"].to(u.deg).value
                 cme_saved_pars[yi + 1, :, 5] = cme_par_dict["thick"].to(u.solRad).value
                 cme_saved_pars[yi + 1, :, 6] = cme_par_dict["log_weight"]
+                bias_saved[yi + 1, :] = np.asarray(cme_par_dict.get("bias", 0.0), dtype=float)
+                corr_saved[yi + 1] = self.state_correlation(cme_par_dict)
 
                 # Write the elongations after every observation, so a run that stops part-way
                 #  still leaves everything computed so far on disk
@@ -1054,6 +1159,38 @@ class RunDataAssimilationRoutine:
             else:
                 sys.exit(f"Saving output for use_model = {self.use_model} is not supported")
 
+            # Observation-bias coefficients and settings (see obs_bias.py)
+            cme_par_ds["bias"] = (["n_obs", "n_ens"], bias_saved)
+            cme_par_ds.attrs.update({
+                "bias_mode": self.bias_settings["mode"],
+                "bias_predictor": self.bias_settings["predictor"]["type"],
+                "bias_e_ref_deg": self.bias_settings["predictor"]["e_ref_deg"],
+                "bias_e_scale_deg": self.bias_settings["predictor"]["e_scale_deg"],
+                "bias_prior_mean": float(self.bias_settings["prior_mean"]),
+                "bias_prior_sd": float(self.bias_settings["prior_sd"]),
+                "bias_prior_source": self.bias_settings["prior_source"],
+                "true_bias": float(self.true_cme_par_dict.get("bias", 0.0)) if self.use_synthetic_obs else np.nan,
+            })
+
+            # Parameter correlations (v as ln v) and the correlation-handling settings (state_transform.py)
+            cme_par_ds["state_corr"] = (["n_obs", "state_par", "state_par_2"], corr_saved)
+            cme_par_ds = cme_par_ds.assign_coords(
+                state_par=("state_par", list(self.pars_in_state)),
+                state_par_2=("state_par_2", list(self.pars_in_state)),
+            )
+            cs = self.correlation_settings
+            cme_par_ds.attrs.update({
+                "corr_enabled": int(cs["enabled"]),
+                "corr_reparam": cs["reparam"],
+                "corr_t_ref_rs": float(cs["t_ref_rs"]) if cs["t_ref_rs"] is not None else np.nan,
+                "corr_whiten": int(bool(cs["whiten"])),
+                "corr_prior_cov_shrinkage": float(cs["prior_cov_shrinkage"]),
+                "corr_shrinkage_alpha": float(cs["shrinkage_alpha"]),
+                "corr_min_jitter_sd": float(cs["min_jitter_sd"]),
+                "corr_carry_from_prior": ",".join(cs["carry_from_prior"]),
+                "pars_in_filter": ",".join(self.pars_in_filter),
+            })
+
             print(cme_par_ds)
             outParFile = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode='w')
@@ -1084,4 +1221,4 @@ def main():
     return None
 
 if __name__ == "__main__":
-    main()
+    main()

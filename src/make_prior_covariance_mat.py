@@ -13,7 +13,8 @@ import xarray as xr
 from huxt import huxt_inputs
 from surf import surf_inputs
 
-from cme_par_dict_structure import cme_par_get_indices, required_dict_keys, cme_par_key_to_index, cme_par_get_keys
+from cme_par_dict_structure import cme_par_get_indices, required_dict_keys, cme_par_key_to_index, cme_par_get_keys, \
+    cme_par_keys_ordered as cme_prior_keys
 
 def plot_sample_cov(
         df_cov,
@@ -94,7 +95,7 @@ def uncorrelated_cov_mat(
     uncorr_cov_mat = np.zeros((6, 6))
     sd_vals = [sd_t_init, sd_v, sd_width, sd_lon, sd_lat, sd_thick]
 
-    cme_par_keys_ordered = cme_par_key_to_index().keys()
+    cme_par_keys_ordered = cme_prior_keys()
 
     for iv, var_name in enumerate(cme_par_keys_ordered):
         ind_req = cme_par_get_indices(var_name)
@@ -243,7 +244,8 @@ def make_cov_blair(
         :param plot_cme_cov: Boolean to determine whether to plot CME covariance matrix
         :return: cov_out: Covariance matrix of CME parameters
     """
-    assert all(v in required_dict_keys() for v in vars_req)
+    # Only the CME parameters have a prior covariance here ("bias" etc. are handled elsewhere)
+    vars_req = np.array([v for v in vars_req if v in required_dict_keys()])
 
     ######################################################
     # Open and read in CME list
@@ -255,7 +257,7 @@ def make_cov_blair(
     dfCMEpar.drop(
         columns=[col for col in dfCMEpar if col not in required_dict_keys()], inplace=True
     )
-    cme_par_keys_ordered = cme_par_key_to_index().keys()
+    cme_par_keys_ordered = cme_prior_keys()
     list_req_order = [
         r for r in cme_par_keys_ordered if r in dfCMEpar.columns
     ]
@@ -467,7 +469,7 @@ def make_donki_cov(
         dfCMEpar.loc[i, "lon"] = donki_cone_cme_dict[i]["lon"]
         dfCMEpar.loc[i, "lat"] = donki_cone_cme_dict[i]["lat"]
 
-    cme_par_keys_ordered = cme_par_key_to_index().keys()
+    cme_par_keys_ordered = cme_prior_keys()
     list_req_order = [
         r for r in cme_par_keys_ordered if r in dfCMEpar.columns
     ]
@@ -927,7 +929,7 @@ def make_mo_cone_cme_cov(
 
     make_cov_corr_mat_from_nc_pars = False
 
-    cme_par_keys_ordered = cme_par_key_to_index().keys()
+    cme_par_keys_ordered = cme_prior_keys()
 
     if not par_file_bool:
         overwrite_cov = True
@@ -975,7 +977,7 @@ def make_mo_cone_cme_cov(
                 dfCMEpar.loc[i, "lat"] = mo_cone_dict[i + 1]["lat"]
 
                 # Reorder the parameters so they're in the correct order
-                cme_par_keys_ordered = cme_par_key_to_index().keys()
+                cme_par_keys_ordered = cme_prior_keys()
                 list_req_order = [
                     r for r in cme_par_keys_ordered if r in dfCMEpar.columns
                 ]
@@ -988,7 +990,7 @@ def make_mo_cone_cme_cov(
         mo_cone_cme_df = pd.concat(df_all_list)
         mo_cone_cme_df.drop_duplicates(keep='first', inplace=True, ignore_index=True)
 
-        #cme_par_keys_ordered = cme_par_key_to_index().keys()
+        #cme_par_keys_ordered = cme_prior_keys()
         list_req_order = [
             r for r in cme_par_keys_ordered if r in mo_cone_cme_df.columns
         ]
@@ -1071,6 +1073,11 @@ def make_mo_cone_cme_cov(
 
         mo_cone_cme_cov = mo_cone_cme_cov_ds.to_pandas()
         mo_cone_cme_corr = mo_cone_cme_corr_ds.to_pandas()
+
+    # Keep only the 6 x 6 CME block, in cme_par_array order (matrices cached by a run with the
+    #  observation-bias term in cme_par_key_to_index may contain an extra "bias" row)
+    mo_cone_cme_cov = mo_cone_cme_cov.reindex(index=cme_par_keys_ordered, columns=cme_par_keys_ordered, fill_value=0.0)
+    mo_cone_cme_corr = mo_cone_cme_corr.reindex(index=cme_par_keys_ordered, columns=cme_par_keys_ordered, fill_value=0.0)
 
     # Update covariance matrix if we require it to be a scaled correlation matrix
     if scale_corr:

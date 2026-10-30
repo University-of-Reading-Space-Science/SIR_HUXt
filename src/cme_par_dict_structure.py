@@ -13,6 +13,26 @@ def required_dict_keys() -> set[str]:
     return {"t_init", "v", "width", "lon", "lat", "thick"}
 
 
+def state_par_keys() -> set[str]:
+    """
+    Keys that can be in the particle filter's state vector (pars_in_state): the CME parameters of
+    required_dict_keys plus the optional observation-bias coefficient "bias" (see obs_bias.py).
+    "bias" is not a required key, so dictionaries without it still work (it is then taken as 0).
+    :return: Set of allowed state-vector keys
+    """
+    return set(cme_par_key_to_index().keys())
+
+
+def cme_par_keys_ordered() -> list[str]:
+    """
+    The six CME parameters (required_dict_keys) in cme_par_array column order, WITHOUT the optional
+    observation-bias coefficient. Use this for anything describing the CME itself, e.g. the prior
+    CME-parameter covariance matrices of make_prior_covariance_mat.py (always 6 x 6).
+    :return: List of CME parameter keys
+    """
+    return [k for k in cme_par_key_to_index() if k in required_dict_keys()]
+
+
 def cme_par_key_to_index() -> dict[str, int]:
     """
     Function to define the parameter index in the cme_par_array for the associated
@@ -20,7 +40,7 @@ def cme_par_key_to_index() -> dict[str, int]:
     :return: A dictionary mapping dictionary keys of cme_par_dict to the
      parameter index of cme_par_array
     """
-    return {"t_init": 0, "v": 1, "width": 2, "lon": 3, "lat": 4, "thick": 5}
+    return {"t_init": 0, "v": 1, "width": 2, "lon": 3, "lat": 4, "thick": 5, "bias": 6}
 
 
 def cme_par_get_indices(cme_par_dict_key: str) -> int:
@@ -31,7 +51,7 @@ def cme_par_get_indices(cme_par_dict_key: str) -> int:
         Must be in required_dictionary_fields
     :return indReq: Parameter index of cme_par_array
     """
-    assert cme_par_dict_key in required_dict_keys()
+    assert cme_par_dict_key in cme_par_key_to_index()
 
     cme_par_key_dict: dict[str, int] = cme_par_key_to_index()
 
@@ -40,8 +60,8 @@ def cme_par_get_indices(cme_par_dict_key: str) -> int:
     else:
         raise KeyError("Invalid dictionary key input into cme_par_get_indices.")
 
-    # Assert that there are only 6 possible indices that can be output
-    assert indReq in {0, 1, 2, 3, 4, 5}
+    # Assert that the index is one of the cme_par_array columns
+    assert indReq in set(cme_par_key_to_index().values())
 
     return indReq
 
@@ -51,11 +71,11 @@ def cme_par_get_keys(cme_par_array_index: int) -> str:
     Function to retrieve the appropriate cme_par_dict key based on the parameter
       index of cme_par_array
     :param cme_par_array_index: Parameter index of cme_par_array.
-      Must be integer between 0 and 5 (inclusive).
+      Must be one of the column indices of cme_par_key_to_index (0-6).
     :return keyReq: Key name from cme_par_dict_key corresponding to
       cme_par_array parameter index
     """
-    assert cme_par_array_index in {0, 1, 2, 3, 4, 5}
+    assert cme_par_array_index in set(cme_par_key_to_index().values())
 
     cme_par_key_dict: dict[str, int] = cme_par_key_to_index()
 

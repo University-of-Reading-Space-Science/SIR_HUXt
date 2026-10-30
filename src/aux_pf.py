@@ -22,6 +22,7 @@ import seaborn as sns
 import colorcet as cc
 import pytest
 from cme_par_dict_structure import required_dict_keys
+from state_transform import StateTransform
 
 import warnings
 warnings.filterwarnings(
@@ -82,8 +83,16 @@ class AuxPF:
             bias_term_5rs: float = None,
             bias_term_21rs: float = None,
             use_parallel: bool = False,
-            rng=None
+            rng=None,
+            state_transform: StateTransform | None = None
     ):
+        """
+        Set up the auxiliary PF for one observation (the other parameters are described where they are used)
+        :param state_transform: Optional StateTransform (state_transform.py) giving the coordinates in
+            which the Liu-West shrinkage and jitter are done, and how the jitter covariance is
+            regularised (correlation handling). None (default) = the natural state vector, as before.
+            Its parameter list must equal pars_in_state.
+        """
         self.use_model = use_model
         self.craft = craft
         self.cme_par_dict:CmeParEns = cme_par_dict
@@ -129,6 +138,17 @@ class AuxPF:
         )
         self.cme_par_array = state_vector_class.cme_par_dict_to_cme_par_array()
         self.state_vector = state_vector_class.cme_par_dict_to_state_vector()
+
+        # Working coordinates of the Liu-West step (the natural state vector unless a StateTransform
+        #  with correlation handling is given; see state_transform.py)
+        self.state_transform: StateTransform | None = state_transform
+        if self.state_transform is not None:
+            assert list(self.state_transform.pars) == list(self.pars_in_state), (
+                f"StateTransform parameters {self.state_transform.pars} != pars_in_state {self.pars_in_state}"
+            )
+            self.state_work: npt.NDArray[float] = self.state_transform.forward(self.state_vector)
+        else:
+            self.state_work: npt.NDArray[float] = self.state_vector
 
         # Extract weights of particles
         self.weights: list[float] = self.get_particle_weights()
@@ -178,11 +198,20 @@ class AuxPF:
         weights = np.exp(log_w - np.max(log_w))
         if (not np.all(np.isfinite(weights))) or (np.sum(weights) <= 0):
             weights = None
-        cov_state: float | npt.NDArray = np.cov(self.state_vector, rowvar=False, aweights=weights)
+        # (in the working coordinates: the natural state vector unless a StateTransform is used)
+        cov_state: float | npt.NDArray = np.cov(self.state_work, rowvar=False, aweights=weights)
         if cov_state.ndim == 0:
             cov_state: npt.NDArray[float] = np.array([[cov_state]])
 
+        # Correlation handling: shrink the noisy ensemble covariance towards its diagonal
+        if self.state_transform is not None:
+            cov_state = self.state_transform.regularise_cov(cov_state)
+
         scaled_cov_state = cov_state * self.cov_shrink_fact2
+
+        # Correlation handling: minimum jitter spread on every working axis
+        if self.state_transform is not None:
+            scaled_cov_state = self.state_transform.floor_jitter_cov(scaled_cov_state)
 
         return cov_state, scaled_cov_state
 
@@ -215,12 +244,13 @@ class AuxPF:
 
     def shrink_par(self) -> npt.NDArray[float]:
         """
-        Liu-West shrinkage of the parameters towards the weighted mean
-        :return: shrunk_pars (nEns, nPar) array containing parameters shrunk to mean
+        Liu-West shrinkage of the parameters towards the weighted mean, in the working coordinates
+        (self.state_work; the natural state vector unless a StateTransform is used)
+        :return: shrunk_pars (nEns, nPar) array containing parameters shrunk to mean (working coordinates)
         """
         if self.log_weights is None:
             # If no weights are provided, calculate an arithmetic mean
-            mean_par: npt.NDArray[float] = np.mean(self.state_vector, axis=0)
+            mean_par: npt.NDArray[float] = np.mean(self.state_work, axis=0)
         else:
             # If weights are provided, calculate weighted mean
             # Transform from log-space and normalise weights
@@ -230,11 +260,11 @@ class AuxPF:
             weights: npt.NDArray[float] = weights / weights.sum()
 
             # Compute weighted mean parameter
-            mean_par: npt.NDArray[float] = np.average(self.state_vector, axis=0, weights=weights)
+            mean_par: npt.NDArray[float] = np.average(self.state_work, axis=0, weights=weights)
 
         # Shrink towards the mean
         shrunk_pars = np.array([
-            self.shrink_par_single_ens(self.state_vector[m, :], mean_par)
+            self.shrink_par_single_ens(self.state_work[m, :], mean_par)
             for m in range(self.n_members)
         ])
 
@@ -250,12 +280,23 @@ class AuxPF:
         from_state_class = FromStateVector(
             cme_par_array=self.cme_par_array,
             cme_par_dict=self.cme_par_dict,
-            state_ens=self.shrunk_pars,
+            state_ens=self.to_natural(self.shrunk_pars),
             pars_in_state_vector=self.pars_in_state
         )
         updated_cme_par_array = from_state_class.state_vector_to_cme_par_array()
 
         return updated_cme_par_array
+
+
+    def to_natural(self, state_work: npt.NDArray[float]) -> npt.NDArray[float]:
+        """
+        Convert an ensemble from the working coordinates of the Liu-West step to the natural state vector
+        :param state_work: (nEns, nPar) array in working coordinates
+        :return: (nEns, nPar) array in natural units (as ToStateVector)
+        """
+        if self.state_transform is None:
+            return state_work
+        return self.state_transform.inverse(state_work)
 
 
     def make_state_vector_dictionary(self):
@@ -616,10 +657,11 @@ class AuxPF:
         )
         resample_ind: list[int] = resample_class.systematic_resampling_log_weights()
 
-        # Draw random samples from normal(shrunk_par, h^2 * cov_state)
-        resample_pars: npt.NDArray[float] = np.array(
+        # Draw random samples from normal(shrunk_par, h^2 * cov_state) (in the working coordinates),
+        #  then convert them to the natural state vector
+        resample_pars: npt.NDArray[float] = self.to_natural(np.array(
             [self.resample_pars(ind_req) for ind_req in resample_ind]
-        )
+        ))
 
         # Each new particle inherits ALL of its parent's parameters. Only the parameters in the state
         #  vector are overwritten with the jittered draws below; the others (e.g. t_init, lat, thick when

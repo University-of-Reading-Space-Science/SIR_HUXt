@@ -9,7 +9,7 @@ import astropy.units as u
 from astropy.units import Quantity
 
 from cme_par_ens import CmeParEns
-from cme_par_dict_structure import required_dict_keys, cme_par_get_keys
+from cme_par_dict_structure import required_dict_keys, cme_par_get_keys, cme_par_key_to_index, state_par_keys
 
 class ToStateVector:
     def __init__(
@@ -30,7 +30,7 @@ class ToStateVector:
         self.n_pars: int = len(self.pars_in_state_vector)
 
         if cme_par_array is None:
-            self.cme_par_array: npt.NDArray[float] = np.zeros((self.n_ensemble, 6))
+            self.cme_par_array: npt.NDArray[float] = np.zeros((self.n_ensemble, len(cme_par_key_to_index())))
         else:
             self.cme_par_array: npt.NDArray[float] = cme_par_array
 
@@ -136,6 +136,17 @@ class ToStateVector:
         return thick_arr
 
 
+    def convert_bias_dict_to_array(self) -> npt.NDArray[float]:
+        """
+        Function to put the observation-bias coefficients (deg, no units) in an array. Optional key:
+         a dictionary without "bias" gives zeros, and a single value is used for every member.
+        :return: bias_arr: Array of bias coefficients
+        """
+        if "bias" not in self.cme_par_dict:
+            return np.zeros(self.n_ensemble)
+        bias = np.atleast_1d(np.asarray(self.cme_par_dict["bias"], dtype=float))
+        return np.broadcast_to(bias, (self.n_ensemble,)).copy() if bias.size == 1 else bias
+
     def cme_par_dict_to_cme_par_array(self) -> npt.NDArray[float]:
         """
         Extract the relevant cme parameters from the cme parameter dictionary, remove the units
@@ -149,6 +160,7 @@ class ToStateVector:
                 cme_par_array[:, 3] = cme_par_dict["lon"] in deg (between +/- 180)
                 cme_par_array[:, 4] = cme_par_dict["lat"] in deg
                 cme_par_array[:, 5] = cme_par_dict["thick"] in solar radii
+                cme_par_array[:, 6] = cme_par_dict["bias"] (observation-bias coefficient, deg; 0 if absent)
         """
         # Get the required keys and add the 'surf_init_time' and 'n_members' keys as requirements for this function
         req_keys = required_dict_keys()
@@ -166,7 +178,7 @@ class ToStateVector:
         #   cme_par_array[:, 3]: npt.NDArray[float] = self.convert_lon_dict_to_array()
         #   cme_par_array[:, 4]: npt.NDArray[float] = self.convert_lat_dict_to_array()
         #   cme_par_array[:, 5]: npt.NDArray[float] = self.convert_thick_dict_to_array()
-        for ind in range(6):
+        for ind in range(len(cme_par_key_to_index())):
             # Get the key that corresponds to the current index required
             req_key = cme_par_get_keys(ind)
 
@@ -187,7 +199,7 @@ class ToStateVector:
           ensemble of parameter values specified by self.pars_in_state_vector
 
         """
-        assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
+        assert all(p in state_par_keys() for p in self.pars_in_state_vector)
 
         # Extract all required parameters, and put them in a state ensemble matrix
         # Below if loop is equivalent to
@@ -205,7 +217,7 @@ class ToStateVector:
         #        state_ens[:, i]: npt.NDArray[float] = self.convert_thick_dict_to_array()
 
         for i, ip in enumerate(self.pars_in_state_vector):
-            if ip in required_dict_keys():
+            if ip in state_par_keys():
                 # Get required function for key ip
                 func_name = f"convert_{ip}_dict_to_array"
                 func = getattr(self, func_name)
@@ -226,7 +238,7 @@ class ToStateVector:
         :return x_mean: Mean of required CME parameters
         :return x_std: Standard deviation of required CME parameters
         """
-        assert all(p in required_dict_keys() for p in self.pars_in_state_vector)
+        assert all(p in state_par_keys() for p in self.pars_in_state_vector)
 
         # Extract all required parameters, put them in an ensemble matrix, then calculate the zscores for output
         #  (previously called the undefined remove_infinite_weights, cme_par_dict_keys_to_array and sir.zscore)

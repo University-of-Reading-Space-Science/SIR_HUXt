@@ -58,6 +58,76 @@ class Setup:
         return use_synthetic_obs
 
 
+    def get_bias_settings(self):
+        """
+        Settings for the single observation-bias term h' = h + beta * p(h) (see obs_bias.py).
+        mode:
+            "off"      - no bias term (default; identical to runs without bias handling)
+            "fixed"    - every member uses beta = prior_mean (a fixed offline correction, not estimated)
+            "estimate" - beta is added to the state vector with prior N(prior_mean, prior_sd^2)
+        prior_source:
+            "zero"                  - prior_mean as given below (0 by default)
+            "innovation_statistics" - prior_mean fitted to the bias in innovation_statistics_file
+                                      (output of innovation_statistics.py), using
+                                      innovation_statistics_source ("openloop" recommended)
+        prior_sd: prior standard deviation of beta (deg at 25 deg modelled elongation for the
+            "quadratic"/"linear" predictors; deg at every elongation for "constant")
+        true_bias: bias injected into synthetic (twin) observations (deg); only used when
+            get_use_synthetic_obs() is True
+        :return: Dictionary of bias settings
+        """
+        bias_settings = {
+            "mode": "estimate",
+            "prior_source": "zero",
+            "prior_mean": 0.0,
+            "prior_sd": 2.0,
+            "innovation_statistics_file": None,
+            "innovation_statistics_source": "openloop",
+            "true_bias": 0.0,
+        }
+
+        return bias_settings
+
+
+    def get_correlation_settings(self):
+        """
+        Settings for handling correlated CME parameters in the Liu-West step of the auxiliary PF
+        (see state_transform.py, and the "Correlated parameters" section of the error-propagation notes).
+        enabled: master switch. False (default) leaves the filter exactly as before.
+        reparam:
+            "none"    - Liu-West step in the natural parameters
+            "log_v"   - v -> ln v
+            "tref_logv" - v -> ln v and t_init -> t_ref = t_init + (t_ref_rs - cme_init_rad) / v, the time
+                        the CME reaches t_ref_rs. The elongations constrain the time the CME reaches
+                        the distances where it is observed, so with t_ref_rs near those distances the
+                        posterior ridge in (t_ref, ln v) is nearly straight and weakly correlated
+        t_ref_rs: reference radius (solar radii) for "tref_logv"; None = the inner boundary r_min.
+            ~50-60 Rs suits HI elongations of ~8-30 deg (front distance at the early/middle observations)
+        whiten: do the Liu-West step in z = L^-1 (u - mu), with mu, L L^T the prior ensemble's mean and
+            covariance (fixed for the run)
+        prior_cov_shrinkage: shrinkage of the prior ensemble covariance towards its diagonal before the
+            Cholesky factorisation (the prior has only n_members particles)
+        shrinkage_alpha: Liu-West covariance used for the jitter is (1 - a) Sigma_ens + a diag(Sigma_ens),
+            in the working coordinates (0 = plain weighted ensemble covariance)
+        min_jitter_sd: floor on the jitter sd on each working axis (prior sds when whitened); 0 = off
+        carry_from_prior: parameters of pars_in_state that the filter does not update; each particle
+            keeps its prior value (inherited on resampling), e.g. ["width", "lat"]
+        :return: Dictionary of correlation settings
+        """
+        correlation_settings = {
+            "enabled": False,
+            "reparam": "tref_logv",
+            "t_ref_rs": 50.0,
+            "whiten": True,
+            "prior_cov_shrinkage": 0.1,
+            "shrinkage_alpha": 0.2,
+            "min_jitter_sd": 0.02,
+            "carry_from_prior": [],
+        }
+
+        return correlation_settings
+
+
     def get_ssw_event_craft(self):
         ssw_event = "09A"
 
@@ -304,6 +374,11 @@ class Setup:
         true_cme_par_dict["lon"]: Quantity[u.deg] = true_cme_lon * u.deg
         true_cme_par_dict["lat"]: Quantity[u.deg] = true_cme_lat * u.deg
         true_cme_par_dict["thick"]: Quantity[u.solRad] = true_cme_thick * u.solRad
+
+        # Observation bias injected into synthetic (twin) observations (see get_bias_settings)
+        true_cme_par_dict["bias"]: float = (
+            float(self.get_bias_settings().get("true_bias", 0.0)) if self.get_use_synthetic_obs() else 0.0
+        )
 
         return true_cme_par_dict
 
@@ -1153,13 +1228,20 @@ class Setup:
             pars_in_state_vector: list[str] = ["t_init", "v", "width", "lon", "lat"]
         time_tolerance: Quantity[u.day] = 0.5 * u.day
 
+        # Estimate the observation-bias coefficient with the CME parameters (see get_bias_settings)
+        bias_settings = self.get_bias_settings()
+        if bias_settings.get("mode", "off") == "estimate" and "bias" not in pars_in_state_vector:
+            pars_in_state_vector = pars_in_state_vector + ["bias"]
+
         da_par_dict = {
             "n_members": n_members,
             "run_start": run_start,
             "n_runs": n_runs,
             "delta_aux_pf": delta_aux_pf,
             "pars_in_state": pars_in_state_vector,
-            "time_tolerance": time_tolerance
+            "time_tolerance": time_tolerance,
+            "bias_settings": bias_settings,
+            "correlation_settings": self.get_correlation_settings(),
         }
 
-        return da_par_dict
+        return da_par_dict

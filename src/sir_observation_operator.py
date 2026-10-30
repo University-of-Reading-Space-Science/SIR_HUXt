@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from init_sir import setup_huxt, setup_surf, setup_surf3d, initialise_cme_parameter_ensemble_dict
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
+from obs_bias import apply_bias
 
 import asyncio
 import atexit
@@ -1967,6 +1968,13 @@ class ObservationOperator:
                     )
         else:
             sys.exit(f"make_obs_op: unsupported use_model '{self.use_model}'")
+
+        # Observation-bias term: h' = h + beta * p(h) for each member (see obs_bias.py). beta is 0 unless
+        #  the bias is estimated or fixed (and, in twin experiments, for the synthetic truth it is the
+        #  injected bias), so this leaves the elongations unchanged by default.
+        beta = np.asarray(self.cme_par_dict.get("bias", 0.0), dtype=float)
+        if np.any(beta != 0):
+            obs_op = apply_bias(obs_op, np.broadcast_to(np.atleast_1d(beta), (self.n_members,)))
 
         return obs_op
 
