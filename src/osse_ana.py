@@ -1,56 +1,33 @@
-import glob
 import os
 import sys
 import json
 
-#from EmuHUXt.SURF.surf.notebooks.SURF_examples import cr_lon_init
-# from IPython.core.pylabtools import figsize
-# from SURF.surf.notebooks.SURF_examples import vr_longs
 from astropy.time import Time
 import astropy.units as u
-import h5py
 import matplotlib.pyplot as plt
 import datetime
-import matplotlib as mpl
 import numpy as np
-import numpy.typing as npt
 
 import huxt.huxt as H
 import surf.surf as S
 import xarray as xr
 from sir_observations import Observations
-from output_names import read_path, write_path, check_path_length, path_too_long, resolve_output_path, MAX_PATH
+from output_names import (
+    read_path,
+    write_path,
+    check_path_length,
+    path_too_long,
+    resolve_output_path,
+    PathLimits,
+)
 import scipy.stats as st
 
 import sunpy.coordinates.sun as sn
-import seaborn as sns
 import pandas as pd
-import holoviews as hv
-import colorcet as cc
-import weightedstats as wst
-
-from colorcet.plotting import sine_combs
-from sunpy.coordinates.sun import orientation
 from multiprocessing import Pool
 
-#hv.extension('matplotlib')
+from da_surf_setup import load_environment
 
-from dotenv import load_dotenv
-from pathlib import Path
-
-env_path = Path('.', '.env')
-load_dotenv(dotenv_path=env_path, override=True)
-
-
-def print_environment_variables():
-    print(f"obs_dir = {os.getenv('OBS_DIR')}")
-    print(f"mo_cone_cov_dir = {os.getenv('MO_CONE_COV_DIR')}")
-    print(f"donki_cov_dir = {os.getenv('DONKI_COV_DIR')}")
-    print(f"mo_cme_cone_file_dir = {os.getenv('MO_CME_CONE_FILE_DIR')}")
-    print(f"out_base_dir = {os.getenv('OUT_BASE_DIR')}")
-    print(f"wsa_dir = {os.getenv('WSA_DIR')}")
-
-    return None
 
 def safe_savefig(fig, out_path, **kwargs):
     """
@@ -69,8 +46,10 @@ def safe_savefig(fig, out_path, **kwargs):
     except (OSError, PermissionError) as err:
         stem, ext = os.path.splitext(out_path)
         alt_path = f"{stem}_{datetime.datetime.now():%Y%m%dT%H%M%S}{ext}"
-        print(f"Warning: could not write {out_path} ({err}); it may be open in another program. "
-              f"Saving to {alt_path} instead.")
+        print(
+            f"Warning: could not write {out_path} ({err}); it may be open in another program. "
+            f"Saving to {alt_path} instead."
+        )
         try:
             fig.savefig(alt_path, **kwargs)
             return alt_path
@@ -135,27 +114,25 @@ def weighted_median(values, weights, axis=0):
 
 
 def plot_par_values_over_single_run(
-        ds,
-        xVarName,
-        yVarName,
-        xLabel,
-        fig_title,
-        parNameLegend,
-        yTruth=None,
-        obs_times=None,
-        tick_cadence=None,
-        craft=None,
-        runNo=0,
-        parUnits='',
-        n_obs=24,
-        base_file_path=None
+    ds,
+    xVarName,
+    yVarName,
+    xLabel,
+    fig_title,
+    parNameLegend,
+    yTruth=None,
+    obs_times=None,
+    tick_cadence=None,
+    craft=None,
+    runNo=0,
+    parUnits="",
+    n_obs=24,
+    base_file_path=None,
 ):
     if (obs_times is not None) and (tick_cadence is not None):
         assert tick_cadence > 0
 
-    fig, ax = plt.subplots(
-        figsize=(10, 6), nrows=1, ncols=1, layout="constrained"
-    )
+    fig, ax = plt.subplots(figsize=(10, 6), nrows=1, ncols=1, layout="constrained")
     xPlot = ds[xVarName][:].values
 
     yTrue = yTruth
@@ -189,17 +166,20 @@ def plot_par_values_over_single_run(
     nEns = len(ds["ens_no"].values)
     for ir in range(nEns):
         if ir == 0:
-            ax.plot(xPlot, yPlot[:, ir], color='pink', alpha=0.5, label=f"{parNameLegend}")
+            ax.plot(
+                xPlot, yPlot[:, ir], color="pink", alpha=0.5, label=f"{parNameLegend}"
+            )
         else:
-            ax.plot(xPlot, yPlot[:, ir], color='pink', alpha=0.5)
-    ax.plot(xPlot, y_median, color='red', label=f"Median {parNameLegend}")
-    #ax.plot(xPlot, y_weighted_median, color="red", label=f"Weighted Median {parNameLegend}")
-    ax.plot(xPlot, y_mean, color='blue', label=f"Mean {parNameLegend}")
-    #ax.plot(xPlot, y_weighted_mean, color='blue', label=f"Weighted Mean {parNameLegend}")
+            ax.plot(xPlot, yPlot[:, ir], color="pink", alpha=0.5)
+    ax.plot(xPlot, y_median, color="red", label=f"Median {parNameLegend}")
+    ax.plot(xPlot, y_mean, color="blue", label=f"Mean {parNameLegend}")
     if yTruth is not None:
         ax.plot(
-            [xPlot.min(), xPlot.max()], [yTrue, yTrue],
-            color='k', linestyle='dashed', label=f"True {parNameLegend}"
+            [xPlot.min(), xPlot.max()],
+            [yTrue, yTrue],
+            color="k",
+            linestyle="dashed",
+            label=f"True {parNameLegend}",
         )
     ax.legend(fontsize=16)
 
@@ -207,7 +187,7 @@ def plot_par_values_over_single_run(
     ax.set_xlim(0, n_obs)
     ax.set_xlabel(f"{xLabel}", fontsize=20)
     ax.set_ylabel(f"{parNameLegend} ({parUnits})", fontsize=20)
-    ax.tick_params(axis='both', which='major', labelsize=16)
+    ax.tick_params(axis="both", which="major", labelsize=16)
     if (obs_times is not None) and (tick_cadence is not None):
         ax.set_xticks(ind_req)
         ax.set_xticklabels(x_ticks, rotation=30)
@@ -217,126 +197,76 @@ def plot_par_values_over_single_run(
     else:
         if craft is None:
             filePath = os.path.join(
-                base_file_path, f"run_{runNo:03d}", f"{parNameLegend.replace(' ', '_')}_vs_obs_no.png"
+                base_file_path,
+                f"run_{runNo:03d}",
+                f"{parNameLegend.replace(' ', '_')}_vs_obs_no.png",
             )
         else:
             filePath = os.path.join(
-                base_file_path, f"run_{runNo:03d}",
-                f"{parNameLegend.replace(' ', '_')}_vs_obs_no_{craft}_assim.png"
+                base_file_path,
+                f"run_{runNo:03d}",
+                f"{parNameLegend.replace(' ', '_')}_vs_obs_no_{craft}_assim.png",
             )
         safe_savefig(plt.gcf(), filePath)
 
     return None
 
-def plot_par_values_over_mult_runs(
-    ds, xVarName, yVarName, yTruth, xLabel, parNameLegend, parUnits=''
-):
-    fig, ax = plt.subplots(1, 1)
-    xPlot = ds[xVarName][:].values
-
-    yTrue = yTruth
-    yPlot = np.median(ds[yVarName], axis=2)#.values
-
-    nRuns = len(ds["run"].values)
-    for ir in range(nRuns):
-        if ir == 0:
-            ax.plot(xPlot, yPlot[ir, :], color='pink', alpha=0.5, label=f"{parNameLegend}")
-        else:
-            ax.plot(xPlot, yPlot[ir, :], color='pink', alpha=0.5)
-    ax.plot(xPlot, np.median(yPlot, axis=0), color='red', label=f"Median {parNameLegend} over model runs")
-    ax.plot([xPlot.min(), xPlot.max()], [yTrue, yTrue], color='k', linestyle='dashed', label=f"True {parNameLegend}")
-    ax.legend()
-    ax.set_xlabel(f"{xLabel}")
-    ax.set_ylabel(f"{parNameLegend} ({parUnits})")
-    plt.show()
-
-    return None
 
 def get_prior_post_cme_pars_from_ds(ds, runNo=0):
     """
     Function to retrieve prior and posterior cme parameters: [t_init, v, width, lon, lat, thick]
       from dataset (and the posterior logarithm of the weights)
     :param ds: Dataset containing all CME parameters from data assimilation run
-    :param runNo: Run index to extract if ds contains multiple runs (previously undefined here)
+    :param runNo: Run index to extract if ds contains multiple runs
     :return: prior_dict, Dictionary containing the prior CME parameters extracted
     :return: posterior_dict, Dictionary containing the posterior CME parameters extracted plus the log_weights
     """
     # Get the number of ensemble members from ds
     n_members = len(ds["ens_no"].values)
 
-    # Extract the prior and posterior variables, accounting for scenarios
-    #  where multiple runs are being performed
+    # Prior (first row) and posterior (last row) of each variable; ds may hold several runs
+    #  (run, obs, member), in which case run runNo is taken
+    names = ["t_init", "v", "width", "lon", "lat", "thick"]
     try:
-        prior_t_init_in = ds["t_init"][0, :].values
-        prior_v_in = ds["v"][0, :].values
-        prior_width_in = ds["width"][0, :].values
-        prior_lon_in = ds["lon"][0, :].values
-        prior_lat_in = ds["lat"][0, :].values
-        prior_thick_in = ds["thick"][0, :].values
-
-        post_t_init_in = ds["t_init"][-1, :].values
-        post_v_in = ds["v"][-1, :].values
-        post_width_in = ds["width"][-1, :].values
-        post_lon_in = ds["lon"][-1, :].values
-        post_lat_in = ds["lat"][-1, :].values
-        post_thick_in = ds["thick"][-1, :].values
-
+        prior = {k: ds[k][0, :].values for k in names}
+        post = {k: ds[k][-1, :].values for k in names}
         log_weights_in = ds["log_weight"][-1, :].values
-    except:
-        prior_t_init_in = ds["t_init"][runNo, 0, :].values
-        prior_v_in = ds["v"][runNo, 0, :].values
-        prior_width_in = ds["width"][runNo, 0, :].values
-        prior_lon_in = ds["lon"][runNo, 0, :].values
-        prior_lat_in = ds["lat"][runNo, 0, :].values
-        prior_thick_in = ds["thick"][runNo, 0, :].values
-
-        # Posterior is the final observation index (previously index 0, i.e. the prior)
-        post_t_init_in = ds["t_init"][runNo, -1, :].values
-        post_v_in = ds["v"][runNo, -1, :].values
-        post_width_in = ds["width"][runNo, -1, :].values
-        post_lon_in = ds["lon"][runNo, -1, :].values
-        post_lat_in = ds["lat"][runNo, -1, :].values
-        post_thick_in = ds["thick"][runNo, -1, :].values
-
+    except Exception:
+        prior = {k: ds[k][runNo, 0, :].values for k in names}
+        post = {k: ds[k][runNo, -1, :].values for k in names}
         log_weights_in = ds["log_weight"][runNo, -1, :].values
-    else:
-        prior_t_init_in = ds["t_init"][0, :].values
-        prior_v_in = ds["v"][0, :].values
-        prior_width_in = ds["width"][0, :].values
-        prior_lon_in = ds["lon"][0, :].values
-        prior_lat_in = ds["lat"][0, :].values
-        prior_thick_in = ds["thick"][0, :].values
+    (
+        prior_t_init_in,
+        prior_v_in,
+        prior_width_in,
+        prior_lon_in,
+        prior_lat_in,
+        prior_thick_in,
+    ) = (prior[k] for k in names)
+    (
+        post_t_init_in,
+        post_v_in,
+        post_width_in,
+        post_lon_in,
+        post_lat_in,
+        post_thick_in,
+    ) = (post[k] for k in names)
 
-        post_t_init_in = ds["t_init"][-1, :].values
-        post_v_in = ds["v"][-1, :].values
-        post_width_in = ds["width"][-1, :].values
-        post_lon_in = ds["lon"][-1, :].values
-        post_lat_in = ds["lat"][-1, :].values
-        post_thick_in = ds["thick"][-1, :].values
-
-        log_weights_in = ds["log_weight"][-1, :].values
-
-    sec_to_cme_prior = [
-        float(prior_t_init_in[i]) * u.s for i in range(n_members)
-    ]
+    sec_to_cme_prior = [float(prior_t_init_in[i]) * u.s for i in range(n_members)]
     v_prior = [prior_v_in[i] * u.km / u.s for i in range(n_members)]
     width_prior = [prior_width_in[i] * u.deg for i in range(n_members)]
     lon_prior = [prior_lon_in[i] * u.deg for i in range(n_members)]
     lat_prior = [prior_lat_in[i] * u.deg for i in range(n_members)]
     thick_prior = [prior_thick_in[i] * u.solRad for i in range(n_members)]
 
-    sec_to_cme_post = [
-        float(post_t_init_in[i]) * u.s for i in range(n_members)
-    ]
+    sec_to_cme_post = [float(post_t_init_in[i]) * u.s for i in range(n_members)]
     v_post = [post_v_in[i] * u.km / u.s for i in range(n_members)]
     width_post = [post_width_in[i] * u.deg for i in range(n_members)]
     lon_post = [post_lon_in[i] * u.deg for i in range(n_members)]
     lat_post = [post_lat_in[i] * u.deg for i in range(n_members)]
     thick_post = [post_thick_in[i] * u.solRad for i in range(n_members)]
     log_weights_post = [log_weights_in[i] for i in range(n_members)]
-    weights_post = np.array([
-        np.exp(log_weights_post[i]) for i in range(n_members)
-    ])
+    weights_post = np.array([np.exp(log_weights_post[i]) for i in range(n_members)])
 
     # Make dictionaries for output
     prior_dict_out = {
@@ -420,11 +350,21 @@ def get_arrival_speed_from_front(cme, stats, n_side=2):
         if np.sum(front) < 2:
             continue
         # longitudes relative to the CME nose, in (-pi, pi], so the front is monotonic in lon
-        lon_rel = np.angle(np.exp(1j * (coord["lon"].to(u.rad).value[front] - cme.longitude.to(u.rad).value)))
+        lon_rel = np.angle(
+            np.exp(
+                1j
+                * (coord["lon"].to(u.rad).value[front] - cme.longitude.to(u.rad).value)
+            )
+        )
         target = np.angle(np.exp(1j * (hit_lon - cme.longitude.to(u.rad).value)))
         order = np.argsort(lon_rel)
-        r_at = np.interp(target, lon_rel[order], coord["r"].to(u.km).value[front][order],
-                         left=np.nan, right=np.nan)
+        r_at = np.interp(
+            target,
+            lon_rel[order],
+            coord["r"].to(u.km).value[front][order],
+            left=np.nan,
+            right=np.nan,
+        )
         if np.isfinite(r_at):
             t_list.append(coord["time"].jd * 86400.0)
             r_list.append(r_at)
@@ -451,38 +391,38 @@ def get_arrival_time_and_speed(model, use_model, cme_hit_object):
 
 
 def get_true_cme_arrival_time(
-        ds,
-        use_model,
-        true_cme_t_init,
-        true_cme_speed,
-        true_cme_width,
-        true_cme_lat,
-        true_cme_lon,
-        true_cme_thick,
-        cme_hit_object="EARTH"
+    ds,
+    use_model,
+    true_cme_t_init,
+    true_cme_speed,
+    true_cme_width,
+    true_cme_lat,
+    true_cme_lon,
+    true_cme_thick,
+    cme_hit_object="EARTH",
 ):
     print(ds["model_init_time"].values)
     try:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values * u.solRad
         v_bound_val = ds["ambient_vr"].values * u.km / u.s
     except:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values[0]), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values[0]), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values[0] * u.solRad
         v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
     else:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values * u.solRad
         v_bound_val = ds["ambient_vr"].values * u.km / u.s
 
     print(start_time)
-    start_time_astro = Time(start_time, format='datetime')
+    start_time_astro = Time(start_time, format="datetime")
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
 
     if use_model in ["surf", "compress_surf"]:
@@ -490,7 +430,9 @@ def get_true_cme_arrival_time(
     elif use_model in ["huxt"]:
         ert = H.Observer("EARTH", start_time_astro)
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+        )
 
     lon_start = 300 * u.deg
     lon_end = 420 * u.deg
@@ -505,7 +447,7 @@ def get_true_cme_arrival_time(
 
     if use_model in ["surf"]:
         model: SURF = S.SURF(
-            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
+            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
             latitude=ert.lat.to(u.deg),
@@ -513,13 +455,12 @@ def get_true_cme_arrival_time(
             lon_stop=lon_end.to(u.rad),
             simtime=5 * u.day,
             dt_scale=20,
-            r_min=r_min_value,#ds["r_min"].values * u.solRad,
-            solver='huxt',
-            # accel_limit=accel_limit
+            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
+            solver="huxt",
         )
     elif use_model in ["compress_surf"]:
         model: SURF = S.SURF(
-            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
+            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
             latitude=ert.lat.to(u.deg),
@@ -527,13 +468,12 @@ def get_true_cme_arrival_time(
             lon_stop=lon_end.to(u.rad),
             simtime=5 * u.day,
             dt_scale=20,
-            r_min=r_min_value,#ds["r_min"].values * u.solRad,
-            solver='hydro',
-            # accel_limit=accel_limit
+            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
+            solver="hydro",
         )
     elif use_model in ["huxt"]:
         model: HUXt = H.HUXt(
-            v_boundary=v_bound_val,#ds["ambient_vr"].values * u.km / u.s,
+            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
             latitude=ert.lat.to(u.deg),
@@ -541,11 +481,12 @@ def get_true_cme_arrival_time(
             lon_stop=lon_end.to(u.rad),
             simtime=5 * u.day,
             dt_scale=20,
-            r_min=r_min_value,#ds["r_min"].values * u.solRad,
-            # accel_limit=accel_limit
+            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
         )
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+        )
 
     # Generate CME object
     v_true = float(true_cme_speed) * u.km / u.s
@@ -554,8 +495,8 @@ def get_true_cme_arrival_time(
         (true_cme_t_init - start_time).total_seconds()
     ) * u.s + get_transit_time_to_r_min(ds, v_true)
     width_true = float(true_cme_width) * u.deg
-    lon_true =  float(true_cme_lon) * u.deg
-    lat_true =  float(true_cme_lat) * u.deg
+    lon_true = float(true_cme_lon) * u.deg
+    lat_true = float(true_cme_lat) * u.deg
     thick_true = float(true_cme_thick) * u.solRad
 
     if use_model in ["surf", "compress_surf"]:
@@ -567,7 +508,7 @@ def get_true_cme_arrival_time(
             latitude=lat_true,
             thickness=thick_true,
             cme_fixed_duration=True,
-            fixed_duration=12 * 3600 * u.s
+            fixed_duration=12 * 3600 * u.s,
         )
 
     elif use_model in ["huxt"]:
@@ -579,10 +520,12 @@ def get_true_cme_arrival_time(
             latitude=lat_true,
             thickness=thick_true,
             cme_fixed_duration=True,
-            fixed_duration=12 * 3600 * u.s
+            fixed_duration=12 * 3600 * u.s,
         )
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+        )
 
     # Make true CME arrival time
     model.solve([cme_object])
@@ -616,14 +559,14 @@ def get_cme_stats_prior_post(
     print(f"prior_cme: {prior_cme}")
 
     model.solve([prior_cme])
-    cme_arrival_prior, cme_arr_prior_speed, prior_count_hit, prior_stats = get_arrival_time_and_speed(
-        model, use_model, cme_hit_object
+    cme_arrival_prior, cme_arr_prior_speed, prior_count_hit, prior_stats = (
+        get_arrival_time_and_speed(model, use_model, cme_hit_object)
     )
 
     # Make posterior CME arrival times
     model.solve([post_cme])
-    cme_arrival_post, cme_arr_post_speed, post_count_hit, post_stats = get_arrival_time_and_speed(
-        model, use_model, cme_hit_object
+    cme_arrival_post, cme_arr_post_speed, post_count_hit, post_stats = (
+        get_arrival_time_and_speed(model, use_model, cme_hit_object)
     )
 
     print(
@@ -633,94 +576,48 @@ def get_cme_stats_prior_post(
         f" post_count_hit={post_count_hit},\n post_stats={post_stats}"
     )
     return (
-        cme_arrival_prior, cme_arr_prior_speed, prior_count_hit, prior_stats,
-        cme_arrival_post, cme_arr_post_speed, post_count_hit, post_stats
+        cme_arrival_prior,
+        cme_arr_prior_speed,
+        prior_count_hit,
+        prior_stats,
+        cme_arrival_post,
+        cme_arr_post_speed,
+        post_count_hit,
+        post_stats,
     )
 
 
-def numpy_nan_mean(
-        arr: npt.NDArray | list,
-        axis: int=0
-) -> float:
-    """
-    Helper function to ensure that all-nan slices in nanmean are appropriately accounted for
-    :param arr: array or list to calculate mean for
-    :return: mean_arr: Mean of array or list
-    """
-    if np.isnan(arr).all():
-        mean_arr = np.nan
-    else:
-        mean_arr = np.nanmean(arr, axis=axis)
-
-    return mean_arr
-
-
-def numpy_nan_median(
-        arr: npt.NDArray | list,
-        axis: int=0
-) -> float:
-    """
-    Helper function to ensure that all-nan slices in nanmedian are appropriately accounted for
-    :param arr:
-    :return: median_arr: Median of array or list
-    """
-    if np.isnan(arr).all():
-        median_arr = np.nan
-    else:
-        median_arr = np.nanmedian(arr, axis=axis)
-
-    return median_arr
-
-
-def numpy_nan_std(
-        arr: npt.NDArray | list,
-        axis: int=0
-) -> float:
-    """
-    Helper function to ensure that all-nan slices in nanstd are appropriately accounted for
-    :param arr:
-    :return: std_arr: Standard deviation of array or list
-    """
-    if np.isnan(arr).all():
-        std_arr = np.nan
-    else:
-        std_arr = np.nanstd(arr, axis=axis)
-
-    return std_arr
-
-
 def get_cme_arrival_time(
-        ds,
-        use_model,
-        runNo=0,
-        real_arrival_time=None,
-        cme_hit_object="EARTH",
-        base_file_path=None,
-        parallel_ens=False,
+    ds,
+    use_model,
+    runNo=0,
+    real_arrival_time=None,
+    cme_hit_object="EARTH",
+    base_file_path=None,
+    parallel_ens=False,
 ):
     print(ds["model_init_time"].values)
     try:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values * u.solRad
         v_bound_val = ds["ambient_vr"].values * u.km / u.s
     except:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values[0]), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values[0]), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values[0] * u.solRad
         v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
     else:
         start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000'
+            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
         )
         r_min_value = ds["r_min"].values * u.solRad
         v_bound_val = ds["ambient_vr"].values * u.km / u.s
 
-    #start_time = datetime.datetime.strptime(str(ds["model_init_time"].values), '%Y-%m-%dT%H:%M:%S.000000000')
     print(start_time)
-    start_time_astro = Time(start_time, format='datetime')
+    start_time_astro = Time(start_time, format="datetime")
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
 
     if use_model in ["surf", "compress_surf", "compress_surf3d"]:
@@ -728,7 +625,9 @@ def get_cme_arrival_time(
     elif use_model in ["huxt"]:
         ert = H.Observer("EARTH", start_time_astro)
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+        )
 
     lon_start = 300 * u.deg
     lon_end = 420 * u.deg
@@ -782,8 +681,7 @@ def get_cme_arrival_time(
             simtime=5 * u.day,
             dt_scale=20,
             r_min=r_min_in,
-            solver='huxt',
-            # accel_limit=accel_limit
+            solver="huxt",
         )
     elif use_model in ["compress_surf"]:
         model: SURF = S.SURF(
@@ -796,8 +694,7 @@ def get_cme_arrival_time(
             simtime=3 * u.day,
             dt_scale=20,
             r_min=r_min_in,
-            solver='hydro',
-            # accel_limit=accel_limit
+            solver="hydro",
         )
     elif use_model in ["compress_surf3d"]:
         # TODO: Need to remove hard-coded numbers here
@@ -814,7 +711,7 @@ def get_cme_arrival_time(
             simtime=3 * u.day,
             dt_scale=20,
             r_min=r_min_in,
-            solver='hydro',
+            solver="hydro",
         )
     elif use_model in ["huxt"]:
         model: HUXt = H.HUXt(
@@ -827,13 +724,13 @@ def get_cme_arrival_time(
             simtime=3 * u.day,
             dt_scale=20,
             r_min=r_min_in,
-            # accel_limit=accel_limit
         )
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf', 'compress_surf3d' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf', 'compress_surf3d' or 'huxt'"
+        )
 
     # Generate CME object
-    # print(f"cme_launch_time = {cme_launch_time}")
 
     # Extract the CME parameters from the xr.Dataset
     prior_dict, post_dict = get_prior_post_cme_pars_from_ds(ds, runNo=runNo)
@@ -848,8 +745,7 @@ def get_cme_arrival_time(
 
     # t_init in the DA output is the time the CME is at cme_init_rad, but these models start at r_min,
     #  so (as in ObservationOperator.extract_cme_launch_time_and_speed) launch each CME at
-    #  t_init + (r_min - cme_init_rad) / v. Previously this offset was omitted, so every prior and
-    #  posterior arrival time (and the twin "truth" arrival) was too early by 9.5 Rs / v (~3 h at 600 km/s).
+    #  t_init + (r_min - cme_init_rad) / v (about 3 h at 600 km/s).
     sec_to_cme_prior = sec_to_cme_prior + get_transit_time_to_r_min(ds, v_prior)
     sec_to_cme_post = [
         t + get_transit_time_to_r_min(ds, v)
@@ -884,8 +780,9 @@ def get_cme_arrival_time(
                 latitude=lat_prior[i],
                 thickness=thick_prior[i],
                 cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s
-            ) for i in range(n_members)
+                fixed_duration=12 * 3600 * u.s,
+            )
+            for i in range(n_members)
         ]
 
         post_cme_objects: list[S.ConeCME] = [
@@ -897,8 +794,9 @@ def get_cme_arrival_time(
                 latitude=lat_post[i],
                 thickness=thick_post[i],
                 cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s
-            ) for i in range(n_members)
+                fixed_duration=12 * 3600 * u.s,
+            )
+            for i in range(n_members)
         ]
     elif use_model in ["huxt"]:
         prior_cme_objects: list[H.ConeCME] = [
@@ -910,8 +808,9 @@ def get_cme_arrival_time(
                 latitude=lat_prior[i],
                 thickness=thick_prior[i],
                 cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s
-            ) for i in range(n_members)
+                fixed_duration=12 * 3600 * u.s,
+            )
+            for i in range(n_members)
         ]
 
         post_cme_objects: list[H.ConeCME] = [
@@ -923,11 +822,14 @@ def get_cme_arrival_time(
                 latitude=lat_post[i],
                 thickness=thick_post[i],
                 cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s
-            ) for i in range(n_members)
+                fixed_duration=12 * 3600 * u.s,
+            )
+            for i in range(n_members)
         ]
     else:
-        sys.exit("Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'")
+        sys.exit(
+            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+        )
 
     prior_count_hit_list = np.zeros(n_members)
     post_count_hit_list = np.zeros(n_members)
@@ -935,6 +837,7 @@ def get_cme_arrival_time(
     post_stat_dict = {}
 
     if parallel_ens:
+
         def log_result(result):
             # This is called whenever self.get_cme_flank_single_ens_member(i)
             #  returns a result in parallel computation.
@@ -955,13 +858,13 @@ def get_cme_arrival_time(
             obj_result[i] = pool.apply_async(
                 get_cme_stats_prior_post,
                 kwds={
-                    'ens_no': i,
-                    'n_members': n_members,
-                    'model': model,
-                    'use_model': use_model,
-                    'prior_cme': prior_cme_objects[i],
-                    'post_cme': post_cme_objects[i],
-                    'cme_hit_object': cme_hit_object,
+                    "ens_no": i,
+                    "n_members": n_members,
+                    "model": model,
+                    "use_model": use_model,
+                    "prior_cme": prior_cme_objects[i],
+                    "post_cme": post_cme_objects[i],
+                    "cme_hit_object": cme_hit_object,
                 },
                 callback=log_result,
             )
@@ -981,10 +884,6 @@ def get_cme_arrival_time(
             cme_arr_post_speed[i] = obs_tuple[5]
             post_count_hit_list[i] = obs_tuple[6]
             post_stat_dict[f"{i}"] = obs_tuple[7]
-            """(
-                cme_arrival_prior, cme_arr_prior_speed, prior_count_hit, prior_stats,
-                cme_arrival_post, cme_arr_post_speed, post_count_hit, post_stats
-            )"""
 
         prior_count_hit = np.sum(prior_count_hit_list)
         post_count_hit = np.sum(post_count_hit_list)
@@ -992,9 +891,6 @@ def get_cme_arrival_time(
     else:
         print("Use serial execution on ensemble.")
 
-
-        #prior_count_hit = 0
-        #post_count_hit = 0
         for i in range(n_members):
             obs_tuple = get_cme_stats_prior_post(
                 ens_no=i,
@@ -1016,37 +912,6 @@ def get_cme_arrival_time(
             post_count_hit_list[i] = obs_tuple[6]
             post_stat_dict[f"{i}"] = obs_tuple[7]
 
-        #     # Make prior CME arrival times
-        #     model.solve([prior_cme_objects[i]])
-        #     cme = model.cmes[0]
-        #     prior_stats = cme.compute_arrival_at_body(cme_hit_object)
-        #     #print(f"prior_stats_{i}={prior_stats}")
-        #
-        #     prior_stat_dict[f"{i}"] = prior_stats
-        #
-        #     if prior_stats['hit']:
-        #         cme_arrival_prior.append(prior_stats['t_arrive'].datetime)
-        #         cme_arr_prior_speed.append((prior_stats["v"].to(u.km / u.s)).value)
-        #         prior_count_hit = prior_count_hit + 1
-        #     else:
-        #         cme_arrival_prior.append(np.nan)
-        #         cme_arr_prior_speed.append(np.nan)
-        #
-        #     # Make posterior CME arrival times
-        #     model.solve([post_cme_objects[i]])
-        #     cme = model.cmes[0]
-        #     post_stats = cme.compute_arrival_at_body(cme_hit_object)
-        #     post_stat_dict[f"{i}"] = post_stats
-        #
-        #     #print(f"post_stats_{i} = {stats}")
-        #     if post_stats['hit']:
-        #         cme_arrival_post.append(post_stats['t_arrive'].datetime)
-        #         cme_arr_post_speed.append((post_stats["v"].to(u.km / u.s)).value)
-        #
-        #         post_count_hit = post_count_hit + 1
-        #     else:
-        #         cme_arrival_post.append(np.nan)
-        #         cme_arr_post_speed.append(np.nan)
         prior_count_hit = np.sum(prior_count_hit_list)
         post_count_hit = np.sum(post_count_hit_list)
 
@@ -1059,16 +924,26 @@ def get_cme_arrival_time(
     print(f"cme_arr_post_speed = {cme_arr_post_speed}")
 
     base_time = datetime.datetime(2000, 1, 1, 0, 0, 0)
-    seconds_arrival_prior = np.array([
-        (cme_arrival_prior[i] - base_time).total_seconds()
-        if isinstance(cme_arrival_prior[i], datetime.datetime) else np.nan
-        for i in range(n_members)
-    ])
-    seconds_arrival_post = np.array([
-        (cme_arrival_post[i] - base_time).total_seconds()
-        if isinstance(cme_arrival_post[i], datetime.datetime) else np.nan
-        for i in range(n_members)
-    ])
+    seconds_arrival_prior = np.array(
+        [
+            (
+                (cme_arrival_prior[i] - base_time).total_seconds()
+                if isinstance(cme_arrival_prior[i], datetime.datetime)
+                else np.nan
+            )
+            for i in range(n_members)
+        ]
+    )
+    seconds_arrival_post = np.array(
+        [
+            (
+                (cme_arrival_post[i] - base_time).total_seconds()
+                if isinstance(cme_arrival_post[i], datetime.datetime)
+                else np.nan
+            )
+            for i in range(n_members)
+        ]
+    )
     cme_arr_prior_speed = np.array(cme_arr_prior_speed)
     cme_arr_post_speed = np.array(cme_arr_post_speed)
 
@@ -1083,16 +958,18 @@ def get_cme_arrival_time(
         sd_prior_arr_sec = np.nanstd(seconds_arrival_prior)
         sd_prior_arr_hr = sd_prior_arr_sec / 3600.0
 
-        mean_prior_arrival = base_time + datetime.timedelta(
-            seconds=mean_prior_arr_sec
-        )
+        mean_prior_arrival = base_time + datetime.timedelta(seconds=mean_prior_arr_sec)
         median_prior_arrival = base_time + datetime.timedelta(
             seconds=median_prior_arr_sec
         )
         sd_prior_arr_speed = np.nanstd(cme_arr_prior_speed)
 
-        print(f"\nMean_prior_arrival = {mean_prior_arrival} +/- {sd_prior_arr_hr} hours")
-        print(f"Mean_prior_speed = {mean_prior_arr_speed} +/- {sd_prior_arr_speed} km/s")
+        print(
+            f"\nMean_prior_arrival = {mean_prior_arrival} +/- {sd_prior_arr_hr} hours"
+        )
+        print(
+            f"Mean_prior_speed = {mean_prior_arr_speed} +/- {sd_prior_arr_speed} km/s"
+        )
         print(f"\nMedian_prior_arrival = {median_prior_arrival}")
         print(f"Median_prior_speed = {median_prior_arr_speed} km/s")
     else:
@@ -1116,9 +993,7 @@ def get_cme_arrival_time(
         sd_post_arr_sec = np.nanstd(seconds_arrival_post)
         sd_post_arr_hr = sd_post_arr_sec / 3600.0
 
-        mean_post_arrival = base_time + datetime.timedelta(
-            seconds=mean_post_arr_sec
-        )
+        mean_post_arrival = base_time + datetime.timedelta(seconds=mean_post_arr_sec)
         median_post_arrival = base_time + datetime.timedelta(
             seconds=median_post_arr_sec
         )
@@ -1135,7 +1010,9 @@ def get_cme_arrival_time(
         if np.sum(renorm_weights_post) != 0:
             #################################################################
             # Calculate weighted statistics
-            weighted_mean_post_arr_sec = np.average(seconds_arrival_post[ind_req], weights=renorm_weights_post)
+            weighted_mean_post_arr_sec = np.average(
+                seconds_arrival_post[ind_req], weights=renorm_weights_post
+            )
             weighted_mean_post_arrival = base_time + datetime.timedelta(
                 seconds=weighted_mean_post_arr_sec
             )
@@ -1148,26 +1025,32 @@ def get_cme_arrival_time(
                 seconds=weighted_median_post_arr_sec
             )
 
-            weighted_mean_post_arr_speed = np.average(cme_arr_post_speed[ind_req], weights=renorm_weights_post)
+            weighted_mean_post_arr_speed = np.average(
+                cme_arr_post_speed[ind_req], weights=renorm_weights_post
+            )
             weighted_median_post_arr_speed = weighted_median(
                 cme_arr_post_speed[ind_req], weights=renorm_weights_post
             )
             # Calculate (biased) weighted posterior variance
             weighted_var_post_arr_sec_biased = np.average(
                 (seconds_arrival_post[ind_req] - weighted_mean_post_arr_sec) ** 2,
-                weights=renorm_weights_post
+                weights=renorm_weights_post,
             )
             weighted_var_post_arr_speed_biased = np.average(
                 (cme_arr_post_speed[ind_req] - weighted_mean_post_arr_speed) ** 2,
-                weights=renorm_weights_post
+                weights=renorm_weights_post,
             )
 
             # Transform to unbiased variance estimator. For normalised (reliability) weights the
             #  correction is 1 / (1 - sum(w^2)); n / (n - 1) is only right for equal weights.
-            sum_w2 = np.sum(renorm_weights_post ** 2)
+            sum_w2 = np.sum(renorm_weights_post**2)
             b_factor = 1.0 / (1.0 - sum_w2) if sum_w2 < 1.0 else np.nan
-            weighted_var_post_arr_sec_unbiased = b_factor * weighted_var_post_arr_sec_biased
-            weighted_var_post_arr_speed_unbiased = b_factor * weighted_var_post_arr_speed_biased
+            weighted_var_post_arr_sec_unbiased = (
+                b_factor * weighted_var_post_arr_sec_biased
+            )
+            weighted_var_post_arr_speed_unbiased = (
+                b_factor * weighted_var_post_arr_speed_biased
+            )
 
             # Calculate weighted standard deviation
             weighted_sd_post_arr_sec = np.sqrt(weighted_var_post_arr_sec_unbiased)
@@ -1175,8 +1058,12 @@ def get_cme_arrival_time(
             weighted_sd_post_arr_speed = np.sqrt(weighted_var_post_arr_speed_unbiased)
             ##################################################################
 
-            print(f"\nWeighted_mean_post_arrival = {weighted_mean_post_arrival} +/- {weighted_sd_post_arr_hr} hours")
-            print(f"Weighted_mean_post_speed = {weighted_mean_post_arr_speed} +/- {weighted_sd_post_arr_speed} km/s")
+            print(
+                f"\nWeighted_mean_post_arrival = {weighted_mean_post_arrival} +/- {weighted_sd_post_arr_hr} hours"
+            )
+            print(
+                f"Weighted_mean_post_speed = {weighted_mean_post_arr_speed} +/- {weighted_sd_post_arr_speed} km/s"
+            )
             print(f"\nWeighted_median_arrival_time = {weighted_median_post_arrival}")
             print(f"Weighted_median_post_speed = {weighted_median_post_arr_speed}")
         else:
@@ -1205,15 +1092,16 @@ def get_cme_arrival_time(
 
         renorm_weights_post = np.nan
 
-
     if real_arrival_time is not None:
         prior_arrival_error_hours = [
             ((pri_arr - real_arrival_time).total_seconds()) / 3600.0
-            for pri_arr in cme_arrival_prior if isinstance(pri_arr, datetime.datetime)
+            for pri_arr in cme_arrival_prior
+            if isinstance(pri_arr, datetime.datetime)
         ]
         post_arrival_error_hours = [
             ((post_arr - real_arrival_time).total_seconds()) / 3600.0
-            for post_arr in cme_arrival_post if isinstance(post_arr, datetime.datetime)
+            for post_arr in cme_arrival_post
+            if isinstance(post_arr, datetime.datetime)
         ]
 
         if len(prior_arrival_error_hours) > 0:
@@ -1239,7 +1127,9 @@ def get_cme_arrival_time(
         if len(weights_post_plot) > 0:
             weights_post_plot = weights_post_plot / np.sum(weights_post_plot)
             print(np.max(weights_post_plot))
-            print(f"weights_post_plot - renorm_weights_post = {weights_post_plot-renorm_weights_post}")
+            print(
+                f"weights_post_plot - renorm_weights_post = {weights_post_plot-renorm_weights_post}"
+            )
 
             weighted_mean_post_arrival_error_hours = np.average(
                 post_arrival_error_hours, weights=weights_post_plot
@@ -1252,47 +1142,46 @@ def get_cme_arrival_time(
             weighted_median_post_arrival_error_hours = np.nan
 
         print(f"\n Observed CME arrival time at {cme_hit_object}: {real_arrival_time}")
-        print(f"\nPrior mean_arrival_time_error = {mean_prior_arrival_error_hours} hours")
+        print(
+            f"\nPrior mean_arrival_time_error = {mean_prior_arrival_error_hours} hours"
+        )
         print(f"Post mean_arrival_time_error = {mean_post_arrival_error_hours} hours")
-        print(f"\nPrior Median_arrival_time_error = {median_prior_arrival_error_hours} hours")
-        print(f"Post Median_arrival_time_error = {median_post_arrival_error_hours} hours")
-        print(f"\nWeighted Mean_arrival_time_error = {weighted_mean_post_arrival_error_hours} hours")
-        print(f"Weighted Median_arrival_time_error = {weighted_median_post_arrival_error_hours} hours")
+        print(
+            f"\nPrior Median_arrival_time_error = {median_prior_arrival_error_hours} hours"
+        )
+        print(
+            f"Post Median_arrival_time_error = {median_post_arrival_error_hours} hours"
+        )
+        print(
+            f"\nWeighted Mean_arrival_time_error = {weighted_mean_post_arrival_error_hours} hours"
+        )
+        print(
+            f"Weighted Median_arrival_time_error = {weighted_median_post_arrival_error_hours} hours"
+        )
 
         max_y_axis = 10 * np.ceil(n_members / 40)
-        fig, ax = plt.subplots(figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained")
+        fig, ax = plt.subplots(
+            figsize=(16, 12), nrows=2, ncols=1, sharex=True, layout="constrained"
+        )
         ax[0].hist(prior_arrival_error_hours, bins=np.arange(-10, 20.5, 1))
         ax[0].set_title(f"Prior CME Arrival Error at {cme_hit_object}", fontsize=24)
         ax[0].set_ylim([0, max_y_axis])
-        ax[0].tick_params(axis='both', which='major', labelsize=16)
+        ax[0].tick_params(axis="both", which="major", labelsize=16)
         ax[0].set_ylabel("No. of particles", fontsize=20)
 
         ax[1].hist(post_arrival_error_hours, bins=np.arange(-10, 20.5, 1))
         ax[1].set_title(f"Posterior CME Arrival Error at {cme_hit_object}", fontsize=24)
         ax[1].set_ylim([0, max_y_axis])
         ax[1].set_ylabel("No. of particles", fontsize=20)
-        ax[1].tick_params(axis='both', which='major', labelsize=16)
-        #if len(weights_post_plot) > 0:
-        #    ax[2].hist(post_arrival_error_hours, weights=weights_post_plot)
-        #ax[2].set_title(f"Weighted posterior CME Arrival Error at {cme_hit_object}")
-        #ax[2].set_ylim([0, 1])
+        ax[1].tick_params(axis="both", which="major", labelsize=16)
         ax[-1].set_xlabel("Arrival time error (hours)", fontsize=20)
 
         if base_file_path is None:
             plt.show()
         else:
             out_dir_path = os.path.join(base_file_path, f"run_{runNo:03d}")
-            filePath = os.path.join(
-                out_dir_path, "histogram_arrival_time_error.png"
-            )
+            filePath = os.path.join(out_dir_path, "histogram_arrival_time_error.png")
             safe_savefig(plt.gcf(), filePath)
-
-            # if np.isnan(weighted_median_post_arr_sec):
-            #     weight_med_prior = np.nan
-            #     weight_med_post = np.nan
-            # else:
-            #     weight_med_prior = float(weighted_median_post_arr_sec)
-            #     weight_med_post = float(weighted_median_post_arr_sec)
 
             out_dict = {
                 "prior_cme_arrival_s_from_20000101": list(seconds_arrival_prior),
@@ -1324,24 +1213,16 @@ def get_cme_arrival_time(
             with open(json_file_path, "w") as f:
                 json.dump(out_dict, f)
 
-            # json_file_path = os.path.join(out_dir_path, f"prior_stats.json")
-            # with open(json_file_path, "w") as f:
-            #     json.dump(prior_stat_dict, f)
-            #
-            # json_file_path = os.path.join(out_dir_path, f"post_stats.json")
-            # with open(json_file_path, "w") as f:
-            #     json.dump(post_stat_dict, f)
-
     return None
 
 
 def plot_elongation_profiles(
-        base_file_path,
-        runNo=0,
-        obs_sd=None,
-        fig_title=None,
-        craft=None,
-        save_fig=True,
+    base_file_path,
+    runNo=0,
+    obs_sd=None,
+    fig_title=None,
+    craft=None,
+    save_fig=True,
 ):
     """
     Plot the modelled CME flank elongation of every ensemble member for the prior and posterior,
@@ -1369,7 +1250,9 @@ def plot_elongation_profiles(
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
     if not os.path.isfile(elon_file):
-        print(f"plot_elongation_profiles: {elon_file} not found (run predates elongation output?)")
+        print(
+            f"plot_elongation_profiles: {elon_file} not found (run predates elongation output?)"
+        )
         return None, None
 
     with xr.load_dataset(elon_file) as elon_ds:
@@ -1405,41 +1288,93 @@ def plot_elongation_profiles(
     col_grid = "#d9d8d2"
 
     fig, ax = plt.subplots(
-        figsize=(12, 8), nrows=2, ncols=1, sharex=True, sharey=True, layout="constrained"
+        figsize=(12, 8),
+        nrows=2,
+        ncols=1,
+        sharex=True,
+        sharey=True,
+        layout="constrained",
     )
 
     panels = [
-        (ax[0], elon_prior, prior_median, col_prior, "Prior", "Prior member", "Prior median"),
-        (ax[1], elon_post, post_wmedian, col_post, "Posterior", "Posterior member", "Posterior weighted median"),
+        (
+            ax[0],
+            elon_prior,
+            prior_median,
+            col_prior,
+            "Prior",
+            "Prior member",
+            "Prior median",
+        ),
+        (
+            ax[1],
+            elon_post,
+            post_wmedian,
+            col_post,
+            "Posterior",
+            "Posterior member",
+            "Posterior weighted median",
+        ),
     ]
     for axi, elon, summary, col, panel_name, member_label, summary_label in panels:
         # Individual members: thin, translucent lines (one legend entry for all of them)
         for m in range(n_ens):
             axi.plot(
-                obs_time, elon[:, m], color=col, linewidth=0.8, alpha=0.25,
-                label=member_label if m == 0 else None, zorder=1
+                obs_time,
+                elon[:, m],
+                color=col,
+                linewidth=0.8,
+                alpha=0.25,
+                label=member_label if m == 0 else None,
+                zorder=1,
             )
         # Ensemble summary: 2 px line with markers
         axi.plot(
-            obs_time, summary, color=col, linewidth=2.0, marker="o", markersize=4,
-            label=summary_label, zorder=2
+            obs_time,
+            summary,
+            color=col,
+            linewidth=2.0,
+            marker="o",
+            markersize=4,
+            label=summary_label,
+            zorder=2,
         )
         # Observations: dark markers (hollow where the observation was not assimilated)
         if obs_sd is not None:
             axi.errorbar(
-                obs_time[assimilated], observation[assimilated], yerr=obs_sd,
-                fmt="none", ecolor=col_obs, elinewidth=1.0, capsize=2, zorder=3
+                obs_time[assimilated],
+                observation[assimilated],
+                yerr=obs_sd,
+                fmt="none",
+                ecolor=col_obs,
+                elinewidth=1.0,
+                capsize=2,
+                zorder=3,
             )
         axi.plot(
-            obs_time[assimilated], observation[assimilated], linestyle="none", marker="o",
-            markersize=7, markerfacecolor=col_obs, markeredgecolor="white", markeredgewidth=1.0,
-            label="Observation (assimilated)", zorder=4
+            obs_time[assimilated],
+            observation[assimilated],
+            linestyle="none",
+            marker="o",
+            markersize=7,
+            markerfacecolor=col_obs,
+            markeredgecolor="white",
+            markeredgewidth=1.0,
+            label="Observation (assimilated)",
+            zorder=4,
         )
         if np.any(~assimilated):
             axi.plot(
-                obs_time[~assimilated], observation[~assimilated], linestyle="none", marker="o",
-                markersize=7, markerfacecolor="none", markeredgecolor=col_obs, markeredgewidth=1.0,
-                label="Observation (not assimilated)", zorder=4
+                obs_time[~assimilated],
+                observation[~assimilated],
+                linestyle="none",
+                marker="o",
+                markersize=7,
+                markerfacecolor="none",
+                markeredgecolor=col_obs,
+                markeredgewidth=1.0,
+                label="Observation (not assimilated)",
+                zorder=4,
             )
 
         axi.set_title(panel_name, fontsize=18, loc="left")
@@ -1502,12 +1437,12 @@ def weighted_quantiles(values, weights, quantiles):
 
 
 def plot_bias_evolution(
-        base_file_path,
-        runNo=-1,
-        fig_title=None,
-        craft=None,
-        band_quantiles=(0.05, 0.95),
-        save_fig=True,
+    base_file_path,
+    runNo=-1,
+    fig_title=None,
+    craft=None,
+    band_quantiles=(0.05, 0.95),
+    save_fig=True,
 ):
     """
     How the observation-bias coefficient beta (obs_bias.py) evolves through the assimilation window.
@@ -1546,21 +1481,35 @@ def plot_bias_evolution(
 
     with xr.load_dataset(par_file) as p_ds:
         if "bias" not in p_ds:
-            print(f"plot_bias_evolution: {par_file} has no bias variable (run without a bias term)")
+            print(
+                f"plot_bias_evolution: {par_file} has no bias variable (run without a bias term)"
+            )
             return None, None
-        beta_all = p_ds["bias"].values.astype(float)            # (n_obs + 1, n_ens): prior, after obs k
+        beta_all = p_ds["bias"].values.astype(
+            float
+        )  # (n_obs + 1, n_ens): prior, after obs k
         lw_all = p_ds["log_weight"].values.astype(float)
         attrs = dict(p_ds.attrs)
     with xr.load_dataset(elon_file) as e_ds:
         obs_time = pd.to_datetime(e_ds["obs_time"].values)
         obs = e_ds["observation"].values.astype(float)
         assimilated = e_ds["assimilated"].values.astype(bool)
-        resampled = e_ds["resampled"].values.astype(bool) if "resampled" in e_ds else np.zeros_like(assimilated)
-        ess_upd = e_ds["ess_updated"].values.astype(float) if "ess_updated" in e_ds else np.full(len(obs), np.nan)
+        resampled = (
+            e_ds["resampled"].values.astype(bool)
+            if "resampled" in e_ds
+            else np.zeros_like(assimilated)
+        )
+        ess_upd = (
+            e_ds["ess_updated"].values.astype(float)
+            if "ess_updated" in e_ds
+            else np.full(len(obs), np.nan)
+        )
 
     mode = str(attrs.get("bias_mode", "estimate"))
     if mode != "estimate":
-        print(f"plot_bias_evolution: bias mode is '{mode}', so beta is not estimated; nothing to plot")
+        print(
+            f"plot_bias_evolution: bias mode is '{mode}', so beta is not estimated; nothing to plot"
+        )
         return None, None
     predictor = str(attrs.get("bias_predictor", "constant"))
     e_ref = attrs.get("bias_e_ref_deg", np.nan)
@@ -1583,24 +1532,42 @@ def plot_bias_evolution(
     # Stages shown: prior (row 0), then the ensemble after each assimilated observation k (row k + 1),
     #  the prior placed one observation spacing before the first assimilated observation
     t_assim = obs_time[k_assim]
-    dt = (np.median(np.diff(t_assim.values)) if k_assim.size > 1 else np.timedelta64(1, "h"))
+    dt = (
+        np.median(np.diff(t_assim.values))
+        if k_assim.size > 1
+        else np.timedelta64(1, "h")
+    )
     x_t = np.concatenate([[t_assim.values[0] - dt], t_assim.values])
     rows = np.concatenate([[0], k_assim + 1])
     beta = beta_all[rows, :]
     lw = lw_all[rows, :]
-    w = np.exp(lw - np.nanmax(np.where(np.isfinite(lw), lw, -np.inf), axis=1, keepdims=True))
+    w = np.exp(
+        lw - np.nanmax(np.where(np.isfinite(lw), lw, -np.inf), axis=1, keepdims=True)
+    )
     w = np.where(np.isfinite(w), w, 0.0)
     w = w / np.sum(w, axis=1, keepdims=True)
 
-    q = np.array([weighted_quantiles(beta[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]])
-                  for i in range(len(rows))])
+    q = np.array(
+        [
+            weighted_quantiles(
+                beta[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]]
+            )
+            for i in range(len(rows))
+        ]
+    )
     mean = np.sum(w * beta, axis=1)
     sd = np.sqrt(np.sum(w * (beta - mean[:, None]) ** 2, axis=1))
 
     show_corr = predictor != "constant"
     n_panels = 3 if show_corr else 2
-    fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3.4 * n_panels + 1.0), sharex=True,
-                             layout="constrained", height_ratios=[1.3] + [1.0] * (n_panels - 1))
+    fig, axes = plt.subplots(
+        n_panels,
+        1,
+        figsize=(11, 3.4 * n_panels + 1.0),
+        sharex=True,
+        layout="constrained",
+        height_ratios=[1.3] + [1.0] * (n_panels - 1),
+    )
     col_ens, col_med, col_prior, col_true = "#2a78d6", "#1f2430", "#9ca3af", "#c2410c"
 
     def decorate(ax):
@@ -1616,59 +1583,155 @@ def plot_bias_evolution(
     ax = axes[0]
     decorate(ax)
     if np.isfinite(prior_mean) and np.isfinite(prior_sd):
-        ax.axhspan(prior_mean - prior_sd, prior_mean + prior_sd, color=col_prior, alpha=0.18, lw=0,
-                   label=f"prior mean ± sd ({prior_mean:g} ± {prior_sd:g})")
+        ax.axhspan(
+            prior_mean - prior_sd,
+            prior_mean + prior_sd,
+            color=col_prior,
+            alpha=0.18,
+            lw=0,
+            label=f"prior mean ± sd ({prior_mean:g} ± {prior_sd:g})",
+        )
         ax.axhline(prior_mean, color=col_prior, lw=1.0)
     for i in range(len(rows)):
-        ax.scatter(np.repeat(x_t[i], n_ens), beta[i], s=8 + 220 * w[i], color=col_ens, alpha=0.35,
-                   lw=0, label="members (area ∝ weight)" if i == 0 else None)
-    ax.fill_between(x_t, q[:, 0], q[:, 2], color=col_ens, alpha=0.15, lw=0,
-                    label=f"weighted {int(band_quantiles[0] * 100)}–{int(band_quantiles[1] * 100)}% band")
-    ax.plot(x_t, q[:, 1], color=col_med, lw=2, marker="o", ms=3.5, label="weighted median")
+        ax.scatter(
+            np.repeat(x_t[i], n_ens),
+            beta[i],
+            s=8 + 220 * w[i],
+            color=col_ens,
+            alpha=0.35,
+            lw=0,
+            label="members (area ∝ weight)" if i == 0 else None,
+        )
+    ax.fill_between(
+        x_t,
+        q[:, 0],
+        q[:, 2],
+        color=col_ens,
+        alpha=0.15,
+        lw=0,
+        label=f"weighted {int(band_quantiles[0] * 100)}–{int(band_quantiles[1] * 100)}% band",
+    )
+    ax.plot(
+        x_t, q[:, 1], color=col_med, lw=2, marker="o", ms=3.5, label="weighted median"
+    )
     if np.isfinite(true_bias):
-        ax.axhline(true_bias, color=col_true, lw=1.6, ls="--", label=f"injected bias ({true_bias:g})")
+        ax.axhline(
+            true_bias,
+            color=col_true,
+            lw=1.6,
+            ls="--",
+            label=f"injected bias ({true_bias:g})",
+        )
     ax.axhline(0, color="0.3", lw=0.6)
     ax.set_ylabel(f"β ({units})", fontsize=12)
-    ax.set_title(f"(a) Bias coefficient β, {predictor} predictor", loc="left", fontsize=12)
+    ax.set_title(
+        f"(a) Bias coefficient β, {predictor} predictor", loc="left", fontsize=12
+    )
     ax.legend(fontsize=9, frameon=False, loc="best", ncol=2)
-    ax.annotate("prior", (x_t[0], q[0, 1]), xytext=(0, 10), textcoords="offset points", ha="center",
-                fontsize=9, color="0.35")
+    ax.annotate(
+        "prior",
+        (x_t[0], q[0, 1]),
+        xytext=(0, 10),
+        textcoords="offset points",
+        ha="center",
+        fontsize=9,
+        color="0.35",
+    )
 
     # (b) correction at each observed elongation
     if show_corr:
         ax = axes[1]
         decorate(ax)
-        y_at = np.concatenate([[obs[k_assim[0]]], obs[k_assim]])   # prior: at the first observation
+        y_at = np.concatenate(
+            [[obs[k_assim[0]]], obs[k_assim]]
+        )  # prior: at the first observation
         p_at = bias_predictor(y_at, **pred_kw)
         corr = beta * p_at[:, None]
-        qc = np.array([weighted_quantiles(corr[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]])
-                       for i in range(len(rows))])
-        ax.fill_between(x_t, qc[:, 0], qc[:, 2], color=col_ens, alpha=0.15, lw=0, label="weighted band")
-        ax.plot(x_t, qc[:, 1], color=col_med, lw=2, marker="o", ms=3.5, label="weighted median")
+        qc = np.array(
+            [
+                weighted_quantiles(
+                    corr[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]]
+                )
+                for i in range(len(rows))
+            ]
+        )
+        ax.fill_between(
+            x_t,
+            qc[:, 0],
+            qc[:, 2],
+            color=col_ens,
+            alpha=0.15,
+            lw=0,
+            label="weighted band",
+        )
+        ax.plot(
+            x_t,
+            qc[:, 1],
+            color=col_med,
+            lw=2,
+            marker="o",
+            ms=3.5,
+            label="weighted median",
+        )
         if np.isfinite(prior_mean) and np.isfinite(prior_sd):
-            ax.fill_between(x_t, (prior_mean - prior_sd) * p_at, (prior_mean + prior_sd) * p_at,
-                            color=col_prior, alpha=0.18, lw=0, label="prior mean ± sd")
+            ax.fill_between(
+                x_t,
+                (prior_mean - prior_sd) * p_at,
+                (prior_mean + prior_sd) * p_at,
+                color=col_prior,
+                alpha=0.18,
+                lw=0,
+                label="prior mean ± sd",
+            )
         if np.isfinite(true_bias):
-            ax.plot(x_t, true_bias * p_at, color=col_true, lw=1.6, ls="--", label="injected bias")
+            ax.plot(
+                x_t,
+                true_bias * p_at,
+                color=col_true,
+                lw=1.6,
+                ls="--",
+                label="injected bias",
+            )
         ax.axhline(0, color="0.3", lw=0.6)
         ax.set_ylabel("β·p(y) (deg)", fontsize=12)
-        ax.set_title("(b) Correction the bias term makes at each observed elongation y", loc="left", fontsize=12)
+        ax.set_title(
+            "(b) Correction the bias term makes at each observed elongation y",
+            loc="left",
+            fontsize=12,
+        )
         ax.legend(fontsize=9, frameon=False, loc="best")
 
     # (c) spread and ESS
     ax = axes[-1]
     decorate(ax)
     if np.isfinite(prior_sd) and prior_sd > 0:
-        ax.plot(x_t, sd / prior_sd, color=col_med, lw=2, marker="o", ms=3.5, label="weighted sd of β / prior sd")
+        ax.plot(
+            x_t,
+            sd / prior_sd,
+            color=col_med,
+            lw=2,
+            marker="o",
+            ms=3.5,
+            label="weighted sd of β / prior sd",
+        )
         ax.axhline(1, color=col_prior, lw=1.0)
         ax.set_ylabel("sd / prior sd", fontsize=12)
     else:
-        ax.plot(x_t, sd, color=col_med, lw=2, marker="o", ms=3.5, label="weighted sd of β")
+        ax.plot(
+            x_t, sd, color=col_med, lw=2, marker="o", ms=3.5, label="weighted sd of β"
+        )
         ax.set_ylabel(f"sd ({units})", fontsize=12)
     ax.set_ylim(bottom=0)
     ax2 = ax.twinx()
-    ax2.plot(t_assim.values, ess_upd[k_assim] / n_ens, color="#eb6834", lw=1.4, marker="s", ms=3,
-             label="ESS / N of the updated weights")
+    ax2.plot(
+        t_assim.values,
+        ess_upd[k_assim] / n_ens,
+        color="#eb6834",
+        lw=1.4,
+        marker="s",
+        ms=3,
+        label="ESS / N of the updated weights",
+    )
     ax2.set_ylim(0, 1.05)
     ax2.set_ylabel("ESS / N", color="#eb6834", fontsize=12)
     ax2.spines["top"].set_visible(False)
@@ -1677,11 +1740,17 @@ def plot_bias_evolution(
     ax.plot([], [], color="0.55", lw=0.8, ls=":", label="resampling step")
     h1, l1 = ax.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=9, frameon=False, loc="lower left")
-    ax.set_title(f"({'c' if show_corr else 'b'}) Spread of β and effective sample size", loc="left", fontsize=12)
+    ax.set_title(
+        f"({'c' if show_corr else 'b'}) Spread of β and effective sample size",
+        loc="left",
+        fontsize=12,
+    )
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
     ax.set_xlabel("Observation time (UT); shaded: assimilation window", fontsize=12)
 
-    fig.suptitle(fig_title if fig_title else f"Observation-bias term, run {runNo}", fontsize=15)
+    fig.suptitle(
+        fig_title if fig_title else f"Observation-bias term, run {runNo}", fontsize=15
+    )
     if save_fig:
         name = "bias_evolution" + (f"_{craft}_assim" if craft is not None else "")
         out_path = safe_savefig(fig, os.path.join(run_dir, name + ".png"), dpi=150)
@@ -1692,23 +1761,84 @@ def plot_bias_evolution(
     return fig, axes
 
 
+def load_profile_bias(run_dir):
+    """
+    The observation-bias term of a run, for adding to modelled elongation profiles.
+
+    The filter compares the observations with the bias-corrected elongation h' = h + beta * p(h)
+    (obs_bias.py), applied in ObservationOperator.make_obs_op. The full elongation profiles
+    (calculate_elongation_profiles, compute_elongation_profiles_per_obs) come straight from the tracked
+    CME flank and do not include it, so it is added when they are plotted (no model reruns needed).
+    :param run_dir: Run folder containing cme_pars.nc
+    :return: (beta, predictor kwargs): beta (n_obs + 1, n_ens), row 0 = prior and row k + 1 = after
+        observation k; or (None, None) if the run has no bias term or beta is zero for every member
+    """
+    from obs_bias import (
+        bias_predictor,
+    )  # noqa: F401  (checked here so a missing module fails early)
+
+    par_file = os.path.join(run_dir, "cme_pars.nc")
+    if not os.path.isfile(par_file):
+        return None, None
+    with xr.load_dataset(par_file) as p_ds:
+        if "bias" not in p_ds:
+            return None, None
+        beta = p_ds["bias"].values.astype(float)
+        attrs = dict(p_ds.attrs)
+    if str(attrs.get("bias_mode", "off")) == "off" or not np.any(
+        np.nan_to_num(beta) != 0
+    ):
+        return None, None
+    predictor = str(attrs.get("bias_predictor", "constant"))
+    pred_kw = dict(predictor=predictor)
+    if predictor != "constant":
+        pred_kw.update(
+            e_ref=float(attrs.get("bias_e_ref_deg")),
+            e_scale=float(attrs.get("bias_e_scale_deg")),
+        )
+    return beta, pred_kw
+
+
+def apply_profile_bias(elon, beta_row, pred_kw):
+    """
+    Add each member's bias term to its elongation profile: h' = h + beta * p(h), for h > 0 only
+    (profiles are 0 before the CME is launched, and NaN where it is not seen; both are left alone).
+    :param elon: (n_ens, n_profile) modelled elongations (deg)
+    :param beta_row: (n_ens) bias coefficients of the same ensemble
+    :param pred_kw: Predictor settings from load_profile_bias
+    :return: (n_ens, n_profile) bias-corrected elongations
+    """
+    from obs_bias import bias_predictor
+
+    elon = np.asarray(elon, dtype=float)
+    beta_row = np.nan_to_num(np.asarray(beta_row, dtype=float))[:, None]
+    with np.errstate(invalid="ignore"):
+        corr = beta_row * bias_predictor(elon, **pred_kw)
+        return np.where(np.isfinite(elon) & (elon > 0), elon + corr, elon)
+
+
 def plot_full_elongation_profiles(
-        base_file_path,
-        runNo=0,
-        obs_sd=None,
-        fig_title=None,
-        craft=None,
-        save_fig=True,
-        include_extrapolated=False,
-        min_weight_fraction=0.5,
-        band_quantiles=(0.05, 0.95),
-        focus_on_window=True,
-        window_pad_hours=3.0,
-        shade_window=False,
+    base_file_path,
+    runNo=0,
+    obs_sd=None,
+    fig_title=None,
+    craft=None,
+    save_fig=True,
+    include_extrapolated=False,
+    min_weight_fraction=0.5,
+    band_quantiles=(0.05, 0.95),
+    focus_on_window=True,
+    window_pad_hours=3.0,
+    shade_window=False,
+    apply_bias=True,
+    show_raw=True,
 ):
     """
     Plot the full (3-day) modelled CME flank elongation profiles of the prior and posterior
     ensembles against the observations.
+    With apply_bias (default), the observation-bias term of each member is added, so the profiles
+    are what the filter compared with the observations (see load_profile_bias); with show_raw the
+    weighted median without it is also drawn (dashed). Runs without a bias term are unchanged.
 
     Reads prior_profile_* and posterior_profile_* from <base_file_path>/run_<runNo>/ens_elongations.nc
     (written by RunDataAssimilationRoutine.calculate_elongation_profiles). Prior = the ensemble passed
@@ -1739,6 +1869,8 @@ def plot_full_elongation_profiles(
         within that time range. If False (or nothing was assimilated) show the full 3-day profiles.
     :param window_pad_hours: Padding (hours) either side of the assimilation window when focusing
     :param shade_window: If True, shade the assimilation window (first to last assimilated observation)
+    :param apply_bias: Add the members' observation-bias term to the profiles (if the run has one)
+    :param show_raw: Also draw the weighted median without the bias term (only when it was added)
     :return: (fig, ax), or (None, None) if the file or the profiles do not exist
     """
     import matplotlib.dates as mdates
@@ -1748,11 +1880,14 @@ def plot_full_elongation_profiles(
     if not os.path.isfile(elon_file):
         print(f"plot_full_elongation_profiles: {elon_file} not found")
         return None, None
+    beta_all, bias_kw = load_profile_bias(run_dir) if apply_bias else (None, None)
 
     with xr.load_dataset(elon_file) as elon_ds:
         if "profile_time" not in elon_ds.coords:
-            print(f"plot_full_elongation_profiles: no elongation profiles in {elon_file} "
-                  f"(run predates profile output or compute_elongation_profiles was off)")
+            print(
+                f"plot_full_elongation_profiles: no elongation profiles in {elon_file} "
+                f"(run predates profile output or compute_elongation_profiles was off)"
+            )
             return None, None
         profile_time = pd.to_datetime(elon_ds["profile_time"].values)
         obs_time = pd.to_datetime(elon_ds["obs_time"].values)
@@ -1762,14 +1897,30 @@ def plot_full_elongation_profiles(
         for stage in ["prior", "posterior"]:
             if f"{stage}_profile_elon" in elon_ds:
                 stages[stage] = dict(
-                    elon=elon_ds[f"{stage}_profile_elon"].values.astype(float),  # (n_ens, n_profile)
+                    elon=elon_ds[f"{stage}_profile_elon"].values.astype(
+                        float
+                    ),  # (n_ens, n_profile)
                     extrap=elon_ds[f"{stage}_profile_extrapolated"].values.astype(bool),
-                    log_weight=elon_ds[f"{stage}_profile_log_weight"].values.astype(float),
+                    log_weight=elon_ds[f"{stage}_profile_log_weight"].values.astype(
+                        float
+                    ),
                 )
 
     if not stages:
-        print(f"plot_full_elongation_profiles: no prior/posterior profiles in {elon_file}")
+        print(
+            f"plot_full_elongation_profiles: no prior/posterior profiles in {elon_file}"
+        )
         return None, None
+
+    # Observation-bias term: the prior profile is of the prior ensemble (cme_pars.nc row 0) and the
+    #  posterior profile of the final ensemble (last row)
+    if beta_all is not None:
+        for stage, row in [("prior", 0), ("posterior", -1)]:
+            if stage in stages:
+                stages[stage]["elon_raw"] = stages[stage]["elon"].copy()
+                stages[stage]["elon"] = apply_profile_bias(
+                    stages[stage]["elon"], beta_all[row], bias_kw
+                )
 
     # Colours as in plot_elongation_profiles: prior blue, posterior orange, observations dark ink
     col_prior = "#2a78d6"
@@ -1785,8 +1936,13 @@ def plot_full_elongation_profiles(
     panel_info = [p for p in panel_info if p[0] in stages]
 
     fig, ax = plt.subplots(
-        figsize=(12, 4.5 * len(panel_info)), nrows=len(panel_info), ncols=1,
-        sharex=True, sharey=True, layout="constrained", squeeze=False
+        figsize=(12, 4.5 * len(panel_info)),
+        nrows=len(panel_info),
+        ncols=1,
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+        squeeze=False,
     )
     ax = ax[:, 0]
 
@@ -1795,12 +1951,7 @@ def plot_full_elongation_profiles(
         elon = stages[stage]["elon"].copy()
         extrap = stages[stage]["extrap"]
         log_w = stages[stage]["log_weight"]
-        n_ens, n_prof = elon.shape
-
-        # Normalised linear weights (non-finite log-weights -> zero weight)
-        lw = np.where(np.isfinite(log_w), log_w, -np.inf)
-        w = np.exp(lw - np.max(lw)) if np.any(np.isfinite(lw)) else np.ones(n_ens)
-        w = w / np.sum(w)
+        n_ens = elon.shape[0]
 
         if not include_extrapolated:
             elon[extrap] = np.nan
@@ -1810,62 +1961,120 @@ def plot_full_elongation_profiles(
         # Assimilation window
         if shade_window and np.any(assimilated):
             axi.axvspan(
-                obs_time[assimilated].min(), obs_time[assimilated].max(),
-                color=col_window, zorder=0, label="Assimilation window"
+                obs_time[assimilated].min(),
+                obs_time[assimilated].max(),
+                color=col_window,
+                zorder=0,
+                label="Assimilation window",
             )
 
         # Members: model-tracked solid, extrapolated dashed (one legend entry each)
         for m in range(n_ens):
-            axi.plot(profile_time, elon_model[m, :], color=col, linewidth=0.8, alpha=0.25,
-                     label=f"{stage.capitalize()} member" if m == 0 else None, zorder=1)
+            axi.plot(
+                profile_time,
+                elon_model[m, :],
+                color=col,
+                linewidth=0.8,
+                alpha=0.25,
+                label=f"{stage.capitalize()} member" if m == 0 else None,
+                zorder=1,
+            )
             if include_extrapolated and np.any(np.isfinite(elon_extrap[m, :])):
-                axi.plot(profile_time, elon_extrap[m, :], color=col, linewidth=0.8, alpha=0.25,
-                         linestyle=(0, (3, 2)),
-                         label="Extrapolated (before tracked)" if m == 0 else None, zorder=1)
-
-        # Summary statistics with censoring: before a member's first plotted value it has not yet
-        #  entered the field of view (or been tracked) -> below (-inf); after its last value it has
-        #  left the field of view -> above (+inf). Gaps between values stay unknown (NaN).
-        #  (Previously members without a value were simply dropped, so the median jumped down
-        #  whenever the fastest members left the field of view.)
-        elon_cens = elon.copy()
-        for m in range(n_ens):
-            idx = np.flatnonzero(np.isfinite(elon[m, :]))
-            if idx.size:
-                elon_cens[m, :idx[0]] = -np.inf
-                elon_cens[m, idx[-1] + 1:] = np.inf
-
-        med = np.full(n_prof, np.nan)
-        band_lo = np.full(n_prof, np.nan)
-        band_hi = np.full(n_prof, np.nan)
-        for k in range(n_prof):
-            known = ~np.isnan(elon_cens[:, k])
-            if np.sum(w[known]) >= min_weight_fraction:
-                band_lo[k], med[k], band_hi[k] = weighted_quantiles(
-                    elon_cens[:, k], w, [lo_q, 0.5, hi_q]
+                axi.plot(
+                    profile_time,
+                    elon_extrap[m, :],
+                    color=col,
+                    linewidth=0.8,
+                    alpha=0.25,
+                    linestyle=(0, (3, 2)),
+                    label="Extrapolated (before tracked)" if m == 0 else None,
+                    zorder=1,
                 )
-        axi.fill_between(
-            profile_time, band_lo, band_hi, color=col, alpha=0.18, linewidth=0,
-            label=f"Weighted {int(round(100 * lo_q))}-{int(round(100 * hi_q))}% range", zorder=2
+
+        # Weighted median and band, counting members not yet in / already out of the field of view as
+        #  below / above it (see _weighted_profile_summary)
+        band_lo, med, band_hi, _ = _weighted_profile_summary(
+            elon,
+            log_w,
+            min_weight_fraction=min_weight_fraction,
+            band_quantiles=band_quantiles,
         )
-        axi.plot(profile_time, med, color=col, linewidth=2.0, label="Weighted median", zorder=3)
+        axi.fill_between(
+            profile_time,
+            band_lo,
+            band_hi,
+            color=col,
+            alpha=0.18,
+            linewidth=0,
+            label=f"Weighted {int(round(100 * lo_q))}-{int(round(100 * hi_q))}% range",
+            zorder=2,
+        )
+        axi.plot(
+            profile_time,
+            med,
+            color=col,
+            linewidth=2.0,
+            label="Weighted median"
+            + (" (model + bias term)" if beta_all is not None else ""),
+            zorder=3,
+        )
+        if (beta_all is not None) and show_raw:
+            raw = stages[stage]["elon_raw"].copy()
+            if not include_extrapolated:
+                raw[extrap] = np.nan
+            _, med_raw, _, _ = _weighted_profile_summary(
+                raw,
+                log_w,
+                min_weight_fraction=min_weight_fraction,
+                band_quantiles=band_quantiles,
+            )
+            axi.plot(
+                profile_time,
+                med_raw,
+                color=col,
+                linewidth=1.4,
+                linestyle=(0, (4, 2)),
+                alpha=0.8,
+                label="Weighted median without bias term",
+                zorder=3,
+            )
 
         # Observations
         if obs_sd is not None:
             axi.errorbar(
-                obs_time, observation, yerr=obs_sd,
-                fmt="none", ecolor=col_obs, elinewidth=1.0, capsize=2, zorder=4
+                obs_time,
+                observation,
+                yerr=obs_sd,
+                fmt="none",
+                ecolor=col_obs,
+                elinewidth=1.0,
+                capsize=2,
+                zorder=4,
             )
         axi.plot(
-            obs_time[assimilated], observation[assimilated], linestyle="none", marker="o",
-            markersize=6, markerfacecolor=col_obs, markeredgecolor="white", markeredgewidth=1.0,
-            label="Observation (assimilated)", zorder=5
+            obs_time[assimilated],
+            observation[assimilated],
+            linestyle="none",
+            marker="o",
+            markersize=6,
+            markerfacecolor=col_obs,
+            markeredgecolor="white",
+            markeredgewidth=1.0,
+            label="Observation (assimilated)",
+            zorder=5,
         )
         if np.any(~assimilated):
             axi.plot(
-                obs_time[~assimilated], observation[~assimilated], linestyle="none", marker="o",
-                markersize=6, markerfacecolor="none", markeredgecolor=col_obs, markeredgewidth=1.0,
-                label="Observation (not assimilated)", zorder=5
+                obs_time[~assimilated],
+                observation[~assimilated],
+                linestyle="none",
+                marker="o",
+                markersize=6,
+                markerfacecolor="none",
+                markeredgecolor=col_obs,
+                markeredgewidth=1.0,
+                label="Observation (not assimilated)",
+                zorder=5,
             )
 
         axi.set_title(panel_name, fontsize=18, loc="left")
@@ -1890,7 +2099,10 @@ def plot_full_elongation_profiles(
     #  0 deg pre-launch values
     in_prof = (profile_time >= t_lo) & (profile_time <= t_hi)
     in_obs = (obs_time >= t_lo) & (obs_time <= t_hi) & np.isfinite(observation)
-    vals = [observation[in_obs] + (obs_sd or 0.0), observation[in_obs] - (obs_sd or 0.0)]
+    vals = [
+        observation[in_obs] + (obs_sd or 0.0),
+        observation[in_obs] - (obs_sd or 0.0),
+    ]
     for st in stages.values():
         e = st["elon"][:, in_prof]
         if not include_extrapolated:
@@ -1914,7 +2126,9 @@ def plot_full_elongation_profiles(
         if craft is None:
             out_path = os.path.join(run_dir, "elongation_profiles_full.png")
         else:
-            out_path = os.path.join(run_dir, f"elongation_profiles_full_{craft}_assim.png")
+            out_path = os.path.join(
+                run_dir, f"elongation_profiles_full_{craft}_assim.png"
+            )
         out_path = safe_savefig(fig, out_path, dpi=150)
         print(f"Saved full elongation profile plot to {out_path}")
         plt.close(fig)
@@ -1925,10 +2139,10 @@ def plot_full_elongation_profiles(
 
 
 def compute_elongation_profiles_per_obs(
-        base_file_path,
-        runNo=-1,
-        stages="assimilated",
-        overwrite=False,
+    base_file_path,
+    runNo=-1,
+    stages="assimilated",
+    overwrite=False,
 ):
     """
     Compute the full (3-day) modelled CME flank elongation profile of every ensemble member for the
@@ -1961,7 +2175,6 @@ def compute_elongation_profiles_per_obs(
     """
     from data_assimilation_routine import RunDataAssimilationRoutine
     from init_sir import initialise_cme_parameter_ensemble_dict
-    from sir_observation_operator import shutdown_worker_pool
 
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     par_file = os.path.join(run_dir, "cme_pars.nc")
@@ -1992,15 +2205,21 @@ def compute_elongation_profiles_per_obs(
             f"da_surf_setup.py has n_members = {run_da.n_members} but the run has {n_ens} members; "
             f"set da_surf_setup.py to the run's settings before computing its profiles."
         )
-    model_init_time = pd.to_datetime(np.ravel(par_ds["model_init_time"].values)[0]).to_pydatetime()
+    model_init_time = pd.to_datetime(
+        np.ravel(par_ds["model_init_time"].values)[0]
+    ).to_pydatetime()
     if abs((model_init_time - run_da.surf_init_time).total_seconds()) > 1.0:
-        print(f"Warning: run model start {model_init_time} differs from da_surf_setup.py "
-              f"({run_da.surf_init_time}); profiles use the setup's model start.")
+        print(
+            f"Warning: run model start {model_init_time} differs from da_surf_setup.py "
+            f"({run_da.surf_init_time}); profiles use the setup's model start."
+        )
 
     if stages == "all":
         stage_list = list(range(n_stage))
     else:
-        stage_list = [0] + [k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]]
+        stage_list = [0] + [
+            k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]
+        ]
 
     profile_times = run_da.get_profile_times()
     n_prof = len(profile_times)
@@ -2014,14 +2233,18 @@ def compute_elongation_profiles_per_obs(
     cache = {}
     try:
         for st in stage_list:
-            pars = np.array([np.asarray(par_ds[p].values[st], dtype=float) for p in par_names])
+            pars = np.array(
+                [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
+            )
             key = np.round(pars, 6).tobytes()
             if key in cache:
                 src = cache[key]
                 elon[st], extrap[st] = elon[src], extrap[src]
                 reused_from[st] = src
                 computed[st] = 1
-                print(f"Stage {st}: particles unchanged since stage {src}, reusing its profiles")
+                print(
+                    f"Stage {st}: particles unchanged since stage {src}, reusing its profiles"
+                )
                 continue
 
             cme_par_dict = initialise_cme_parameter_ensemble_dict(
@@ -2035,24 +2258,37 @@ def compute_elongation_profiles_per_obs(
             cme_par_dict["lon"] = list(pars[3]) * u.deg
             cme_par_dict["lat"] = list(pars[4]) * u.deg
             cme_par_dict["thick"] = list(pars[5]) * u.solRad
+            # Observation-bias coefficients of this ensemble. The profiles are the tracked CME flank
+            #  (get_cme_flanks), which does not include the bias term, so they do not depend on beta and
+            #  the cache key above rightly ignores it; the bias is added when plotting (load_profile_bias).
+            if "bias" in par_ds:
+                cme_par_dict["bias"] = [
+                    float(b) for b in np.asarray(par_ds["bias"].values[st], dtype=float)
+                ]
             lw = log_weight[st]
             lw = np.where(np.isfinite(lw), lw, -1e31)
             cme_par_dict["log_weight"] = list(lw)
             cme_par_dict["weight"] = list(np.exp(lw - np.max(lw)))
 
-            label = "prior" if st == 0 else f"after observation {st - 1} ({obs_time[st - 1]})"
+            label = (
+                "prior"
+                if st == 0
+                else f"after observation {st - 1} ({obs_time[st - 1]})"
+            )
             print(f"Stage {st}: computing elongation profiles for the ensemble {label}")
-            prof = run_da.calculate_elongation_profiles(cme_par_dict, obs_index=max(st - 1, 0))
+            prof = run_da.calculate_elongation_profiles(
+                cme_par_dict, obs_index=max(st - 1, 0)
+            )
             elon[st] = prof["elon"]
             extrap[st] = np.asarray(prof["extrapolated"]).astype(np.int8)
             computed[st] = 1
             cache[key] = st
     finally:
-        shutdown_worker_pool()
+        run_da.worker_pool.shutdown()
 
     stage_obs_time = np.array(
-        [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[:n_stage - 1]],
-        dtype="datetime64[ns]"
+        [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[: n_stage - 1]],
+        dtype="datetime64[ns]",
     )
     out_ds = xr.Dataset(
         data_vars=dict(
@@ -2071,17 +2307,21 @@ def compute_elongation_profiles_per_obs(
         ),
         attrs=dict(
             description="Full elongation profiles of the ensemble at each observation; stage 0 = prior, "
-                        "stage k+1 = ensemble after observation k",
+            "stage k+1 = ensemble after observation k",
             elongation_units="deg",
         ),
     )
     out_ds.to_netcdf(out_file, mode="w")
-    print(f"Saved per-observation elongation profiles to {out_file} "
-          f"({int(computed.sum())} stages, {len(cache)} ensembles run)")
+    print(
+        f"Saved per-observation elongation profiles to {out_file} "
+        f"({int(computed.sum())} stages, {len(cache)} ensembles run)"
+    )
     return out_file
 
 
-def _weighted_profile_summary(elon, log_w, min_weight_fraction=0.5, band_quantiles=(0.05, 0.95)):
+def _weighted_profile_summary(
+    elon, log_w, min_weight_fraction=0.5, band_quantiles=(0.05, 0.95)
+):
     """
     Weighted median and band of an ensemble of elongation profiles, treating a member as below the
     field of view before its first value and above it after its last (see plot_full_elongation_profiles)
@@ -2097,29 +2337,33 @@ def _weighted_profile_summary(elon, log_w, min_weight_fraction=0.5, band_quantil
     for m in range(n_ens):
         idx = np.flatnonzero(np.isfinite(elon[m, :]))
         if idx.size:
-            elon_cens[m, :idx[0]] = -np.inf
-            elon_cens[m, idx[-1] + 1:] = np.inf
+            elon_cens[m, : idx[0]] = -np.inf
+            elon_cens[m, idx[-1] + 1 :] = np.inf
     lo_q, hi_q = band_quantiles
     med, b_lo, b_hi = (np.full(n_prof, np.nan) for _ in range(3))
     for k in range(n_prof):
         known = ~np.isnan(elon_cens[:, k])
         if np.sum(w[known]) >= min_weight_fraction:
-            b_lo[k], med[k], b_hi[k] = weighted_quantiles(elon_cens[:, k], w, [lo_q, 0.5, hi_q])
+            b_lo[k], med[k], b_hi[k] = weighted_quantiles(
+                elon_cens[:, k], w, [lo_q, 0.5, hi_q]
+            )
     return b_lo, med, b_hi, w
 
 
 def plot_elongation_profiles_per_obs(
-        base_file_path,
-        runNo=-1,
-        obs_sd=None,
-        fig_title=None,
-        craft=None,
-        include_extrapolated=False,
-        focus_on_window=True,
-        window_pad_hours=3.0,
-        min_weight_fraction=0.5,
-        band_quantiles=(0.05, 0.95),
-        weight_member_lines=True,
+    base_file_path,
+    runNo=-1,
+    obs_sd=None,
+    fig_title=None,
+    craft=None,
+    include_extrapolated=False,
+    focus_on_window=True,
+    window_pad_hours=3.0,
+    min_weight_fraction=0.5,
+    band_quantiles=(0.05, 0.95),
+    weight_member_lines=True,
+    apply_bias=True,
+    show_raw=True,
 ):
     """
     Plot, for the prior and for the ensemble after each observation, every member's full elongation
@@ -2139,6 +2383,10 @@ def plot_elongation_profiles_per_obs(
     :param min_weight_fraction: Minimum weight fraction with a known position to draw median/band
     :param band_quantiles: Weighted quantiles of the shaded band
     :param weight_member_lines: If True, member line opacity scales with its weight
+    :param apply_bias: Add each member's observation-bias term to its profile (if the run has one), so
+        the profiles are what the filter compared with the observations (see load_profile_bias). The
+        profile file itself holds the model elongations without it.
+    :param show_raw: Also draw the weighted median without the bias term (only when it was added)
     :return: List of saved file paths
     """
     import matplotlib.dates as mdates
@@ -2147,8 +2395,10 @@ def plot_elongation_profiles_per_obs(
     prof_file = read_path(run_dir, "profiles_per_obs")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
     if not (os.path.isfile(prof_file) and os.path.isfile(elon_file)):
-        print(f"plot_elongation_profiles_per_obs: {prof_file} or {elon_file} not found "
-              f"(run compute_elongation_profiles_per_obs first)")
+        print(
+            f"plot_elongation_profiles_per_obs: {prof_file} or {elon_file} not found "
+            f"(run compute_elongation_profiles_per_obs first)"
+        )
         return []
 
     with xr.load_dataset(prof_file) as p_ds:
@@ -2161,7 +2411,17 @@ def plot_elongation_profiles_per_obs(
         obs_time = pd.to_datetime(e_ds["obs_time"].values)
         observation = e_ds["observation"].values.astype(float)
         assimilated = e_ds["assimilated"].values.astype(bool)
-        resampled = e_ds["resampled"].values.astype(bool) if "resampled" in e_ds else None
+        resampled = (
+            e_ds["resampled"].values.astype(bool) if "resampled" in e_ds else None
+        )
+
+    # Observation-bias term: stage st of the profile file is the ensemble of cme_pars.nc row st
+    beta_all, bias_kw = load_profile_bias(run_dir) if apply_bias else (None, None)
+    elon_raw_all = elon_all.copy()
+    if beta_all is not None:
+        for st in np.flatnonzero(computed):
+            if st < beta_all.shape[0]:
+                elon_all[st] = apply_profile_bias(elon_all[st], beta_all[st], bias_kw)
 
     col_ens = "#2a78d6"
     col_obs = "#1a1a19"
@@ -2171,21 +2431,34 @@ def plot_elongation_profiles_per_obs(
     # Common axes for all stages
     if focus_on_window and np.any(assimilated):
         pad = pd.Timedelta(hours=window_pad_hours)
-        t_lo, t_hi = obs_time[assimilated].min() - pad, obs_time[assimilated].max() + pad
+        t_lo, t_hi = (
+            obs_time[assimilated].min() - pad,
+            obs_time[assimilated].max() + pad,
+        )
     else:
         t_lo, t_hi = profile_time.min(), profile_time.max()
     in_prof = (profile_time >= t_lo) & (profile_time <= t_hi)
     in_obs = (obs_time >= t_lo) & (obs_time <= t_hi) & np.isfinite(observation)
     vals = [observation[in_obs]]
     for st in np.flatnonzero(computed):
-        e = np.where(extrap_all[st] & ~include_extrapolated, np.nan, elon_all[st])[:, in_prof]
+        e = np.where(extrap_all[st] & ~include_extrapolated, np.nan, elon_all[st])[
+            :, in_prof
+        ]
         vals.append(e[np.isfinite(e) & (e > 0)])
     all_vals = np.concatenate(vals) if vals else np.array([])
-    pad_e = (obs_sd or 0.0) + 0.05 * max(np.ptp(all_vals) if all_vals.size else 1.0, 1.0)
-    y_lim = (max(0.0, np.min(all_vals) - pad_e), np.max(all_vals) + pad_e) if all_vals.size else (0, 35)
+    pad_e = (obs_sd or 0.0) + 0.05 * max(
+        np.ptp(all_vals) if all_vals.size else 1.0, 1.0
+    )
+    y_lim = (
+        (max(0.0, np.min(all_vals) - pad_e), np.max(all_vals) + pad_e)
+        if all_vals.size
+        else (0, 35)
+    )
 
     out_dir = write_path(run_dir, "profiles_per_obs_dir")
-    check_path_length(out_dir, what="per-observation profile plot folder", allowance=32, error=False)
+    check_path_length(
+        out_dir, what="per-observation profile plot folder", allowance=32, error=False
+    )
     os.makedirs(out_dir, exist_ok=True)
     saved = []
     for st in np.flatnonzero(computed):
@@ -2194,44 +2467,133 @@ def plot_elongation_profiles_per_obs(
         if not include_extrapolated:
             elon[extrap_all[st]] = np.nan
         b_lo, med, b_hi, w = _weighted_profile_summary(
-            elon, lw_all[st], min_weight_fraction=min_weight_fraction, band_quantiles=band_quantiles
+            elon,
+            lw_all[st],
+            min_weight_fraction=min_weight_fraction,
+            band_quantiles=band_quantiles,
         )
 
         fig, ax = plt.subplots(figsize=(12, 6), layout="constrained")
         w_rel = w / np.max(w)
         for m in range(elon.shape[0]):
             alpha = 0.08 + 0.5 * w_rel[m] if weight_member_lines else 0.25
-            ax.plot(profile_time, elon[m], color=col_ens, lw=0.8, alpha=alpha,
-                    label="Member (opacity = weight)" if (m == 0 and weight_member_lines) else
-                    ("Member" if m == 0 else None), zorder=1)
-        ax.fill_between(profile_time, b_lo, b_hi, color=col_ens, alpha=0.18, lw=0,
-                        label=f"Weighted {int(round(100 * band_quantiles[0]))}-"
-                              f"{int(round(100 * band_quantiles[1]))}% range", zorder=2)
-        ax.plot(profile_time, med, color=col_ens, lw=2.0, label="Weighted median", zorder=3)
+            ax.plot(
+                profile_time,
+                elon[m],
+                color=col_ens,
+                lw=0.8,
+                alpha=alpha,
+                label=(
+                    "Member (opacity = weight)"
+                    if (m == 0 and weight_member_lines)
+                    else ("Member" if m == 0 else None)
+                ),
+                zorder=1,
+            )
+        ax.fill_between(
+            profile_time,
+            b_lo,
+            b_hi,
+            color=col_ens,
+            alpha=0.18,
+            lw=0,
+            label=f"Weighted {int(round(100 * band_quantiles[0]))}-"
+            f"{int(round(100 * band_quantiles[1]))}% range",
+            zorder=2,
+        )
+        ax.plot(
+            profile_time,
+            med,
+            color=col_ens,
+            lw=2.0,
+            label="Weighted median"
+            + (" (model + bias term)" if beta_all is not None else ""),
+            zorder=3,
+        )
+        if (beta_all is not None) and show_raw:
+            raw = elon_raw_all[st].copy()
+            if not include_extrapolated:
+                raw[extrap_all[st]] = np.nan
+            _, med_raw, _, _ = _weighted_profile_summary(
+                raw,
+                lw_all[st],
+                min_weight_fraction=min_weight_fraction,
+                band_quantiles=band_quantiles,
+            )
+            ax.plot(
+                profile_time,
+                med_raw,
+                color=col_ens,
+                lw=1.4,
+                ls=(0, (4, 2)),
+                alpha=0.8,
+                label="Weighted median without bias term",
+                zorder=3,
+            )
 
         done = assimilated & (np.arange(len(observation)) <= k_now)
         later = ~done & np.isfinite(observation)
         if obs_sd is not None:
-            ax.errorbar(obs_time[done], observation[done], yerr=obs_sd, fmt="none", ecolor=col_obs,
-                        elinewidth=1.0, capsize=2, zorder=4)
-        ax.plot(obs_time[done], observation[done], ls="none", marker="o", ms=6, mfc=col_obs,
-                mec="white", mew=1.0, label="Observation (assimilated so far)", zorder=5)
-        ax.plot(obs_time[later], observation[later], ls="none", marker="o", ms=6, mfc="none",
-                mec="#8c8b85", mew=1.0, label="Observation (later / not assimilated)", zorder=5)
+            ax.errorbar(
+                obs_time[done],
+                observation[done],
+                yerr=obs_sd,
+                fmt="none",
+                ecolor=col_obs,
+                elinewidth=1.0,
+                capsize=2,
+                zorder=4,
+            )
+        ax.plot(
+            obs_time[done],
+            observation[done],
+            ls="none",
+            marker="o",
+            ms=6,
+            mfc=col_obs,
+            mec="white",
+            mew=1.0,
+            label="Observation (assimilated so far)",
+            zorder=5,
+        )
+        ax.plot(
+            obs_time[later],
+            observation[later],
+            ls="none",
+            marker="o",
+            ms=6,
+            mfc="none",
+            mec="#8c8b85",
+            mew=1.0,
+            label="Observation (later / not assimilated)",
+            zorder=5,
+        )
         if k_now >= 0:
             ax.axvline(obs_time[k_now], color=col_now, lw=1.2, ls=(0, (4, 2)), zorder=0)
-            ax.plot(obs_time[k_now], observation[k_now], ls="none", marker="o", ms=13, mfc="none",
-                    mec=col_now, mew=2.0, label="Observation just assimilated", zorder=6)
+            ax.plot(
+                obs_time[k_now],
+                observation[k_now],
+                ls="none",
+                marker="o",
+                ms=13,
+                mfc="none",
+                mec=col_now,
+                mew=2.0,
+                label="Observation just assimilated",
+                zorder=6,
+            )
 
-        ess = 1.0 / np.sum(w ** 2)
+        ess = 1.0 / np.sum(w**2)
         if k_now < 0:
             title = "Prior ensemble"
         else:
             how = ""
             if resampled is not None:
                 how = ", resampled" if resampled[k_now] else ", weights updated only"
-            title = (f"After observation {k_now} ({obs_time[k_now]:%d %b %H:%M}, "
-                     f"{observation[k_now]:.2f}°{how})")
+            title = (
+                f"After observation {k_now} ({obs_time[k_now]:%d %b %H:%M}, "
+                f"{observation[k_now]:.2f}°{how})"
+            )
         ax.set_title(f"{title}   ESS = {ess:.1f}/{len(w)}", loc="left", fontsize=14)
         if fig_title:
             fig.suptitle(fig_title, fontsize=16)
@@ -2269,7 +2631,9 @@ def make_arrival_model(ds, use_model, sim_time=4.0 * u.day, dt_scale=20):
     :param dt_scale: Model output time step scale
     :return: (model, model start datetime)
     """
-    start_time = pd.to_datetime(np.ravel(ds["model_init_time"].values)[0]).to_pydatetime()
+    start_time = pd.to_datetime(
+        np.ravel(ds["model_init_time"].values)[0]
+    ).to_pydatetime()
     start_time_astro = Time(start_time, format="datetime")
     cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
     r_min_in = float(np.ravel(ds["r_min"].values)[0]) * u.solRad
@@ -2286,24 +2650,44 @@ def make_arrival_model(ds, use_model, sim_time=4.0 * u.day, dt_scale=20):
 
     if use_model in ["surf", "compress_surf"]:
         model = S.SURF(
-            v_boundary=v_bound_in, cr_num=cr_num, cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg), lon_start=lon_start.to(u.rad), lon_stop=lon_end.to(u.rad),
-            simtime=sim_time, dt_scale=dt_scale, r_min=r_min_in,
+            v_boundary=v_bound_in,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=sim_time,
+            dt_scale=dt_scale,
+            r_min=r_min_in,
             solver="huxt" if use_model == "surf" else "hydro",
         )
     elif use_model in ["compress_surf3d"]:
         model = S.SURF3d(
-            v_map=v_bound_in, v_map_long=ds["vr_longs"].values * u.deg,
-            v_map_lat=ds["vr_lats"].values * u.deg, cr_num=cr_num, cr_lon_init=ert.lon_c.to(u.deg),
-            latitude_min=-15 * u.deg, latitude_max=15 * u.deg,
-            lon_start=lon_start.to(u.rad), lon_stop=lon_end.to(u.rad),
-            simtime=sim_time, dt_scale=dt_scale, r_min=r_min_in, solver="hydro",
+            v_map=v_bound_in,
+            v_map_long=ds["vr_longs"].values * u.deg,
+            v_map_lat=ds["vr_lats"].values * u.deg,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude_min=-15 * u.deg,
+            latitude_max=15 * u.deg,
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=sim_time,
+            dt_scale=dt_scale,
+            r_min=r_min_in,
+            solver="hydro",
         )
     else:
         model = H.HUXt(
-            v_boundary=v_bound_in, cr_num=cr_num, cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg), lon_start=lon_start.to(u.rad), lon_stop=lon_end.to(u.rad),
-            simtime=sim_time, dt_scale=dt_scale, r_min=r_min_in,
+            v_boundary=v_bound_in,
+            cr_num=cr_num,
+            cr_lon_init=ert.lon_c.to(u.deg),
+            latitude=ert.lat.to(u.deg),
+            lon_start=lon_start.to(u.rad),
+            lon_stop=lon_end.to(u.rad),
+            simtime=sim_time,
+            dt_scale=dt_scale,
+            r_min=r_min_in,
         )
     return model, start_time
 
@@ -2315,21 +2699,23 @@ def _arrival_for_cme(model, use_model, cme, cme_hit_object="EARTH"):
     :return: (arrival datetime or None, arrival speed in km/s or NaN)
     """
     model.solve([cme])
-    arr_time, arr_speed, hit, _ = get_arrival_time_and_speed(model, use_model, cme_hit_object)
+    arr_time, arr_speed, hit, _ = get_arrival_time_and_speed(
+        model, use_model, cme_hit_object
+    )
     if not hit:
         return None, np.nan
     return arr_time, float(arr_speed)
 
 
 def compute_arrival_times_per_obs(
-        base_file_path,
-        runNo=-1,
-        use_model="compress_surf3d",
-        stages="assimilated",
-        cme_hit_object="EARTH",
-        sim_time_days=4.0,
-        parallel=True,
-        overwrite=False,
+    base_file_path,
+    runNo=-1,
+    use_model="compress_surf3d",
+    stages="assimilated",
+    cme_hit_object="EARTH",
+    sim_time_days=4.0,
+    parallel=True,
+    overwrite=False,
 ):
     """
     Compute every ensemble member's CME arrival time and speed at cme_hit_object for the ensemble at
@@ -2386,9 +2772,13 @@ def compute_arrival_times_per_obs(
     if stages == "all":
         stage_list = list(range(n_stage))
     else:
-        stage_list = [0] + [k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]]
+        stage_list = [0] + [
+            k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]
+        ]
 
-    model, start_time = make_arrival_model(par_ds, use_model, sim_time=sim_time_days * u.day)
+    model, start_time = make_arrival_model(
+        par_ds, use_model, sim_time=sim_time_days * u.day
+    )
 
     arr_sec = np.full((n_stage, n_ens), np.nan)  # seconds after model start
     arr_speed = np.full((n_stage, n_ens), np.nan)
@@ -2404,14 +2794,18 @@ def compute_arrival_times_per_obs(
         pool = Pool(processes=n_proc)
     try:
         for st in stage_list:
-            pars = np.array([np.asarray(par_ds[p].values[st], dtype=float) for p in par_names])
+            pars = np.array(
+                [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
+            )
             key = np.round(pars, 6).tobytes()
             if key in cache:
                 src = cache[key]
                 arr_sec[st], arr_speed[st] = arr_sec[src], arr_speed[src]
                 reused_from[st] = src
                 computed[st] = 1
-                print(f"Stage {st}: particles unchanged since stage {src}, reusing its arrival times")
+                print(
+                    f"Stage {st}: particles unchanged since stage {src}, reusing its arrival times"
+                )
                 continue
 
             v = pars[1] * u.km / u.s
@@ -2419,19 +2813,31 @@ def compute_arrival_times_per_obs(
             cme_cls = H.ConeCME if use_model in ["huxt"] else S.ConeCME
             cmes = [
                 cme_cls(
-                    t_launch=t_launch[i], v=v[i], width=pars[2][i] * u.deg,
-                    longitude=pars[3][i] * u.deg, latitude=pars[4][i] * u.deg,
+                    t_launch=t_launch[i],
+                    v=v[i],
+                    width=pars[2][i] * u.deg,
+                    longitude=pars[3][i] * u.deg,
+                    latitude=pars[4][i] * u.deg,
                     thickness=pars[5][i] * u.solRad,
-                    cme_fixed_duration=True, fixed_duration=12 * 3600 * u.s,
-                ) for i in range(n_ens)
+                    cme_fixed_duration=True,
+                    fixed_duration=12 * 3600 * u.s,
+                )
+                for i in range(n_ens)
             ]
             label = "prior" if st == 0 else f"after observation {st - 1}"
             print(f"Stage {st}: computing arrival times for the ensemble {label}")
             if pool is not None:
-                jobs = [pool.apply_async(_arrival_for_cme, (model, use_model, c, cme_hit_object)) for c in cmes]
+                jobs = [
+                    pool.apply_async(
+                        _arrival_for_cme, (model, use_model, c, cme_hit_object)
+                    )
+                    for c in cmes
+                ]
                 results = [j.get() for j in jobs]
             else:
-                results = [_arrival_for_cme(model, use_model, c, cme_hit_object) for c in cmes]
+                results = [
+                    _arrival_for_cme(model, use_model, c, cme_hit_object) for c in cmes
+                ]
             for i, (t_arr, v_arr) in enumerate(results):
                 if t_arr is not None:
                     arr_sec[st, i] = (t_arr - start_time).total_seconds()
@@ -2443,13 +2849,23 @@ def compute_arrival_times_per_obs(
             pool.close()
             pool.join()
 
-    arrival_time = np.array([
-        [np.datetime64(start_time + datetime.timedelta(seconds=s)) if np.isfinite(s) else np.datetime64("NaT")
-         for s in row] for row in arr_sec
-    ], dtype="datetime64[ns]")
+    arrival_time = np.array(
+        [
+            [
+                (
+                    np.datetime64(start_time + datetime.timedelta(seconds=s))
+                    if np.isfinite(s)
+                    else np.datetime64("NaT")
+                )
+                for s in row
+            ]
+            for row in arr_sec
+        ],
+        dtype="datetime64[ns]",
+    )
     stage_obs_time = np.array(
-        [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[:n_stage - 1]],
-        dtype="datetime64[ns]"
+        [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[: n_stage - 1]],
+        dtype="datetime64[ns]",
     )
     out_ds = xr.Dataset(
         data_vars=dict(
@@ -2467,28 +2883,30 @@ def compute_arrival_times_per_obs(
         ),
         attrs=dict(
             description="CME arrival time and speed of each member for the ensemble at each observation; "
-                        "stage 0 = prior, stage k+1 = ensemble after observation k",
+            "stage 0 = prior, stage k+1 = ensemble after observation k",
             cme_hit_object=cme_hit_object,
             sim_time_days=sim_time_days,
             model_init_time=str(start_time),
         ),
     )
     out_ds.to_netcdf(out_file, mode="w")
-    print(f"Saved per-observation arrival times to {out_file} "
-          f"({int(computed.sum())} stages, {len(cache)} ensembles run)")
+    print(
+        f"Saved per-observation arrival times to {out_file} "
+        f"({int(computed.sum())} stages, {len(cache)} ensembles run)"
+    )
     return out_file
 
 
 def plot_arrival_time_histograms_per_obs(
-        base_file_path,
-        runNo=-1,
-        real_arrival_time=None,
-        fig_title=None,
-        craft=None,
-        bin_hours=3.0,
-        band_quantiles=(0.05, 0.95),
-        n_overlay=4,
-        save_fig=True,
+    base_file_path,
+    runNo=-1,
+    real_arrival_time=None,
+    fig_title=None,
+    craft=None,
+    bin_hours=3.0,
+    band_quantiles=(0.05, 0.95),
+    n_overlay=4,
+    save_fig=True,
 ):
     """
     Collate the weighted arrival-time distributions of the ensemble at every observation (from
@@ -2515,8 +2933,10 @@ def plot_arrival_time_histograms_per_obs(
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     in_file = read_path(run_dir, "arrivals_per_obs")
     if not os.path.isfile(in_file):
-        print(f"plot_arrival_time_histograms_per_obs: {in_file} not found "
-              f"(run compute_arrival_times_per_obs first)")
+        print(
+            f"plot_arrival_time_histograms_per_obs: {in_file} not found "
+            f"(run compute_arrival_times_per_obs first)"
+        )
         return None, None
     with xr.load_dataset(in_file) as a_ds:
         arr = np.asarray(a_ds["arrival_time"].values, dtype="datetime64[ns]")
@@ -2537,9 +2957,12 @@ def plot_arrival_time_histograms_per_obs(
     h_min = np.floor(np.nanmin(hours[stages]) / bin_hours) * bin_hours - bin_hours
     h_max = np.ceil(np.nanmax(hours[stages]) / bin_hours) * bin_hours + bin_hours
     real_h = None
-    if isinstance(real_arrival_time, (datetime.datetime, np.datetime64, pd.Timestamp)) \
-            and not pd.isna(real_arrival_time):
-        real_h = (pd.Timestamp(real_arrival_time) - pd.Timestamp(t_ref)).total_seconds() / 3600.0
+    if isinstance(
+        real_arrival_time, (datetime.datetime, np.datetime64, pd.Timestamp)
+    ) and not pd.isna(real_arrival_time):
+        real_h = (
+            pd.Timestamp(real_arrival_time) - pd.Timestamp(t_ref)
+        ).total_seconds() / 3600.0
         h_min = min(h_min, np.floor(real_h / bin_hours) * bin_hours - bin_hours)
         h_max = max(h_max, np.ceil(real_h / bin_hours) * bin_hours + bin_hours)
     edges = np.arange(h_min, h_max + bin_hours / 2, bin_hours)
@@ -2553,8 +2976,13 @@ def plot_arrival_time_histograms_per_obs(
         frac_arrive = float(np.sum(w[ok]))
         hist = np.histogram(hours[st][ok], bins=edges, weights=w[ok])[0]
         hist = hist / hist.sum() if hist.sum() > 0 else hist
-        q = weighted_quantiles(hours[st][ok], w[ok], [band_quantiles[0], 0.5, band_quantiles[1]]) \
-            if np.any(ok) else np.full(3, np.nan)
+        q = (
+            weighted_quantiles(
+                hours[st][ok], w[ok], [band_quantiles[0], 0.5, band_quantiles[1]]
+            )
+            if np.any(ok)
+            else np.full(3, np.nan)
+        )
         return hist, q, frac_arrive
 
     hists, quants, fracs = {}, {}, {}
@@ -2562,15 +2990,22 @@ def plot_arrival_time_histograms_per_obs(
         hists[st], quants[st], fracs[st] = stage_hist(st)
         label = "prior" if st == 0 else f"after obs {st - 1}"
         med = to_time(quants[st][1]) if np.isfinite(quants[st][1]) else "none arrive"
-        print(f"Stage {st:3d} ({label}): weighted median arrival {med}, "
-              f"arriving weight {100 * fracs[st]:.0f}%")
+        print(
+            f"Stage {st:3d} ({label}): weighted median arrival {med}, "
+            f"arriving weight {100 * fracs[st]:.0f}%"
+        )
 
     col_prior = "#8c8b85"
     col_post = "#eb6834"
     col_real = "#1a1a19"
     centres = 0.5 * (edges[:-1] + edges[1:])
-    fig, ax = plt.subplots(2, 1, figsize=(13, 11), layout="constrained",
-                           gridspec_kw=dict(height_ratios=[1, 1.3]))
+    fig, ax = plt.subplots(
+        2,
+        1,
+        figsize=(13, 11),
+        layout="constrained",
+        gridspec_kw=dict(height_ratios=[1, 1.3]),
+    )
 
     # Top: overlaid histograms
     axt = ax[0]
@@ -2581,15 +3016,43 @@ def plot_arrival_time_histograms_per_obs(
     cmap = plt.get_cmap("Blues")
     for j, st in enumerate(mids):
         c = cmap(0.35 + 0.6 * j / max(1, mids.size - 1))
-        when = "" if pd.isna(stage_obs_time[st]) else f" ({stage_obs_time[st]:%d %b %H:%M})"
-        axt.step(to_time(centres), hists[st], where="mid", color=c, lw=1.4,
-                 label=f"After obs {st - 1}{when}")
-    axt.fill_between(to_time(centres), hists[s_first], step="mid", color=col_prior, alpha=0.35,
-                     label="Prior" if s_first == 0 else f"Stage {s_first}")
-    axt.fill_between(to_time(centres), hists[s_last], step="mid", color=col_post, alpha=0.45,
-                     label=f"Final (after obs {s_last - 1})" if s_last > 0 else "Final")
+        when = (
+            ""
+            if pd.isna(stage_obs_time[st])
+            else f" ({stage_obs_time[st]:%d %b %H:%M})"
+        )
+        axt.step(
+            to_time(centres),
+            hists[st],
+            where="mid",
+            color=c,
+            lw=1.4,
+            label=f"After obs {st - 1}{when}",
+        )
+    axt.fill_between(
+        to_time(centres),
+        hists[s_first],
+        step="mid",
+        color=col_prior,
+        alpha=0.35,
+        label="Prior" if s_first == 0 else f"Stage {s_first}",
+    )
+    axt.fill_between(
+        to_time(centres),
+        hists[s_last],
+        step="mid",
+        color=col_post,
+        alpha=0.45,
+        label=f"Final (after obs {s_last - 1})" if s_last > 0 else "Final",
+    )
     if real_h is not None:
-        axt.axvline(to_time(real_h), color=col_real, lw=2, ls=(0, (4, 2)), label="Observed arrival")
+        axt.axvline(
+            to_time(real_h),
+            color=col_real,
+            lw=2,
+            ls=(0, (4, 2)),
+            label="Observed arrival",
+        )
     axt.set_ylabel(f"Probability per {bin_hours:g} h bin", fontsize=13)
     axt.set_title("Weighted arrival-time distributions", loc="left", fontsize=14)
     axt.legend(fontsize=9.5, frameon=False, loc="upper left", ncol=2)
@@ -2602,41 +3065,96 @@ def plot_arrival_time_histograms_per_obs(
         mat[:, j] = np.where(hists[st] > 0, hists[st], np.nan)
     x_edges = np.arange(stages.size + 1) - 0.5
     y_edges = to_time(edges)
-    pcm = axb.pcolormesh(x_edges, y_edges, mat, cmap="Blues", shading="flat",
-                         vmin=0, vmax=np.nanmax(mat))
+    pcm = axb.pcolormesh(
+        x_edges, y_edges, mat, cmap="Blues", shading="flat", vmin=0, vmax=np.nanmax(mat)
+    )
     fig.colorbar(pcm, ax=axb, label=f"Probability per {bin_hours:g} h bin", pad=0.01)
     xs = np.arange(stages.size)
     q = np.array([quants[st] for st in stages])
-    axb.plot(xs, to_time(q[:, 1]), color=col_post, lw=2, marker="o", ms=3, label="Weighted median")
-    axb.plot(xs, to_time(q[:, 0]), color=col_post, lw=1, ls=(0, (3, 2)),
-             label=f"Weighted {int(round(100 * band_quantiles[0]))}-{int(round(100 * band_quantiles[1]))}%")
+    axb.plot(
+        xs,
+        to_time(q[:, 1]),
+        color=col_post,
+        lw=2,
+        marker="o",
+        ms=3,
+        label="Weighted median",
+    )
+    axb.plot(
+        xs,
+        to_time(q[:, 0]),
+        color=col_post,
+        lw=1,
+        ls=(0, (3, 2)),
+        label=f"Weighted {int(round(100 * band_quantiles[0]))}-{int(round(100 * band_quantiles[1]))}%",
+    )
     axb.plot(xs, to_time(q[:, 2]), color=col_post, lw=1, ls=(0, (3, 2)))
     if real_h is not None:
-        axb.axhline(to_time(real_h), color=col_real, lw=2, ls=(0, (4, 2)), label="Observed arrival")
-    labels = ["Prior" if st == 0 else
-              (f"{st - 1}\n{stage_obs_time[st]:%H:%M}" if not pd.isna(stage_obs_time[st]) else f"{st - 1}")
-              for st in stages]
+        axb.axhline(
+            to_time(real_h),
+            color=col_real,
+            lw=2,
+            ls=(0, (4, 2)),
+            label="Observed arrival",
+        )
+    labels = [
+        (
+            "Prior"
+            if st == 0
+            else (
+                f"{st - 1}\n{stage_obs_time[st]:%H:%M}"
+                if not pd.isna(stage_obs_time[st])
+                else f"{st - 1}"
+            )
+        )
+        for st in stages
+    ]
     step = max(1, int(np.ceil(stages.size / 25)))
     axb.set_xticks(xs[::step])
     axb.set_xticklabels(labels[::step], fontsize=8.5)
     axb.set_xlabel("Ensemble after observation (number, time UT)", fontsize=13)
     axb.set_ylabel("Arrival time (UT)", fontsize=13)
     axb.yaxis.set_major_formatter(mdates.DateFormatter("%d %b %H:%M"))
-    axb.set_title("Arrival-time distribution of the ensemble at every observation", loc="right", fontsize=14)
+    axb.set_title(
+        "Arrival-time distribution of the ensemble at every observation",
+        loc="right",
+        fontsize=14,
+    )
     axb.legend(fontsize=10, frameon=False, loc="upper right")
+
     # Fraction of weight that arrives within the run, where some does not
     if any(fracs[st] < 0.999 for st in stages):
         trans = axb.get_xaxis_transform()
         for j, st in enumerate(stages):
             if fracs[st] < 0.999:
-                axb.text(xs[j], 0.985, f"{100 * fracs[st]:.0f}%", transform=trans, fontsize=7,
-                         ha="center", va="top", color="#b03030")
-        axb.text(0.0, 1.0, "red %: weight of members arriving within the model run",
-                 transform=axb.transAxes, fontsize=8, color="#b03030", ha="left", va="bottom")
+                axb.text(
+                    xs[j],
+                    0.985,
+                    f"{100 * fracs[st]:.0f}%",
+                    transform=trans,
+                    fontsize=7,
+                    ha="center",
+                    va="top",
+                    color="#b03030",
+                )
+        axb.text(
+            0.0,
+            1.0,
+            "red %: weight of members arriving within the model run",
+            transform=axb.transAxes,
+            fontsize=8,
+            color="#b03030",
+            ha="left",
+            va="bottom",
+        )
 
-    fig.suptitle(fig_title if fig_title else f"CME arrival times, run {runNo}", fontsize=16)
+    fig.suptitle(
+        fig_title if fig_title else f"CME arrival times, run {runNo}", fontsize=16
+    )
     if save_fig:
-        name = write_path(run_dir, "arrival_hist_per_obs") + (f"_{craft}_assim" if craft is not None else "")
+        name = write_path(run_dir, "arrival_hist_per_obs") + (
+            f"_{craft}_assim" if craft is not None else ""
+        )
         out_path = name + ".png"
         out_path = safe_savefig(fig, out_path, dpi=150)
         print(f"Saved arrival-time histograms to {out_path}")
@@ -2647,10 +3165,10 @@ def plot_arrival_time_histograms_per_obs(
 
 
 def compute_rank_pit(
-        base_file_path,
-        run_nos,
-        obs_sd=np.sqrt(0.5),
-        include_obs_error=True,
+    base_file_path,
+    run_nos,
+    obs_sd=np.sqrt(0.5),
+    include_obs_error=True,
 ):
     """
     Rank statistics of the observations within the forecast ensemble, for every observation and run.
@@ -2677,7 +3195,9 @@ def compute_rank_pit(
         elon_file = os.path.join(run_dir, "ens_elongations.nc")
         par_file = os.path.join(run_dir, "cme_pars.nc")
         if not (os.path.isfile(elon_file) and os.path.isfile(par_file)):
-            print(f"compute_rank_pit: run {run_no} skipped ({elon_file} or {par_file} not found)")
+            print(
+                f"compute_rank_pit: run {run_no} skipped ({elon_file} or {par_file} not found)"
+            )
             continue
         with xr.load_dataset(elon_file) as e_ds:
             h = e_ds["elon_first_stage"].values.astype(float)  # (n_obs, n_ens)
@@ -2717,8 +3237,15 @@ def compute_rank_pit(
                 pit[j, k] = float(np.sum(w * st.norm.cdf((y[k] - h[k]) / obs_sd)))
             else:
                 pit[j, k] = float(np.sum(w * ((h[k] < y[k]) + 0.5 * (h[k] == y[k]))))
-    return dict(pit=pit, observation=obs_all, obs_time=obs_time, assimilated=assim_all,
-                n_members=n_ens, run_nos=[r[0] for r in records], n_skipped=n_skipped)
+    return dict(
+        pit=pit,
+        observation=obs_all,
+        obs_time=obs_time,
+        assimilated=assim_all,
+        n_members=n_ens,
+        run_nos=[r[0] for r in records],
+        n_skipped=n_skipped,
+    )
 
 
 def pit_to_rank(pit, n_members):
@@ -2739,13 +3266,13 @@ def pit_to_rank(pit, n_members):
 
 
 def plot_rank_histograms_per_obs(
-        base_file_path,
-        run_nos,
-        obs_sd=np.sqrt(0.5),
-        include_obs_error=True,
-        fig_title=None,
-        craft=None,
-        n_cols=6,
+    base_file_path,
+    run_nos,
+    obs_sd=np.sqrt(0.5),
+    include_obs_error=True,
+    fig_title=None,
+    craft=None,
+    n_cols=6,
 ):
     """
     Rank (Talagrand) histograms of the observations within the forecast ensemble: normalised count
@@ -2773,9 +3300,13 @@ def plot_rank_histograms_per_obs(
     import matplotlib.dates as mdates
     from matplotlib.ticker import MaxNLocator
 
-    res = compute_rank_pit(base_file_path, run_nos, obs_sd=obs_sd, include_obs_error=include_obs_error)
+    res = compute_rank_pit(
+        base_file_path, run_nos, obs_sd=obs_sd, include_obs_error=include_obs_error
+    )
     if res is None:
-        print("plot_rank_histograms_per_obs: no runs with ens_elongations.nc and cme_pars.nc")
+        print(
+            "plot_rank_histograms_per_obs: no runs with ens_elongations.nc and cme_pars.nc"
+        )
         return None
     n_mem = res["n_members"]
     pit, obs_time = res["pit"], res["obs_time"]
@@ -2787,11 +3318,15 @@ def plot_rank_histograms_per_obs(
         print("plot_rank_histograms_per_obs: no observation could be ranked")
         return res
 
-    out_dir = (os.path.join(base_file_path, f"run_{res['run_nos'][0]:03d}") if len(res["run_nos"]) == 1
-               else base_file_path)
+    out_dir = (
+        os.path.join(base_file_path, f"run_{res['run_nos'][0]:03d}")
+        if len(res["run_nos"]) == 1
+        else base_file_path
+    )
     suffix = f"_{craft}_assim" if craft is not None else ""
-    rank_label = (f"Rank (members below observation, 0-{n_mem})"
-                  + (", with obs. error" if include_obs_error else ""))
+    rank_label = f"Rank (members below observation, 0-{n_mem})" + (
+        ", with obs. error" if include_obs_error else ""
+    )
     col_bar = "#2a78d6"
     col_exp = "#1a1a19"
     col_grid = "#d9d8d2"
@@ -2799,21 +3334,41 @@ def plot_rank_histograms_per_obs(
     expected = 1.0 / (n_mem + 1)
 
     def norm_counts(vals):
-        counts = np.bincount(vals.astype(int), minlength=n_mem + 1)[:n_mem + 1].astype(float)
+        counts = np.bincount(vals.astype(int), minlength=n_mem + 1)[: n_mem + 1].astype(
+            float
+        )
         return counts / counts.sum() if counts.sum() > 0 else counts
 
     # Ranks to a csv for reference
     rows = []
     for j, run_no in enumerate(res["run_nos"]):
         for k in range(n_obs):
-            rows.append(dict(run=run_no, obs_no=k, obs_time=obs_time[k], observation=res["observation"][j, k],
-                             assimilated=bool(res["assimilated"][j, k]), pit=pit[j, k], rank=rank[j, k]))
-    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "rank_pit_per_obs.csv"), index=False)
+            rows.append(
+                dict(
+                    run=run_no,
+                    obs_no=k,
+                    obs_time=obs_time[k],
+                    observation=res["observation"][j, k],
+                    assimilated=bool(res["assimilated"][j, k]),
+                    pit=pit[j, k],
+                    rank=rank[j, k],
+                )
+            )
+    pd.DataFrame(rows).to_csv(
+        os.path.join(out_dir, "rank_pit_per_obs.csv"), index=False
+    )
 
     # 1. One rank histogram per observation time
     n_rows = int(np.ceil(ranked.size / n_cols))
-    fig, axs = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.2 * n_rows + 1.2),
-                            sharex=True, sharey=True, layout="constrained", squeeze=False)
+    fig, axs = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.6 * n_cols, 2.2 * n_rows + 1.2),
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+        squeeze=False,
+    )
     for i, k in enumerate(ranked):
         ax = axs.flat[i]
         vals = rank[:, k][np.isfinite(rank[:, k])]
@@ -2821,10 +3376,12 @@ def plot_rank_histograms_per_obs(
         ax.axhline(expected, color=col_exp, lw=1, ls=(0, (4, 2)))
         when = "" if pd.isna(obs_time[k]) else f" {obs_time[k]:%d %b %H:%M}"
         y_txt = np.nanmean(res["observation"][:, k])
-        ax.set_title(f"obs {k}{when}\n{y_txt:.2f}°, n={vals.size}", fontsize=9, loc="left")
+        ax.set_title(
+            f"obs {k}{when}\n{y_txt:.2f}°, n={vals.size}", fontsize=9, loc="left"
+        )
         ax.grid(True, axis="y", color=col_grid, lw=0.5)
         ax.set_axisbelow(True)
-    for ax in axs.flat[ranked.size:]:
+    for ax in axs.flat[ranked.size :]:
         ax.set_visible(False)
     for ax in axs[-1, :]:
         ax.set_xlabel("Rank", fontsize=9)
@@ -2833,198 +3390,111 @@ def plot_rank_histograms_per_obs(
     for ax in axs[:, 0]:
         ax.set_ylabel("Normalised count", fontsize=9)
     runs_txt = f"{len(res['run_nos'])} run" + ("s" if len(res["run_nos"]) > 1 else "")
-    fig.suptitle((fig_title + ": " if fig_title else "") +
-                 f"rank histogram at each observation time ({runs_txt}, {n_mem} members; "
-                 f"dashed = reliable, 1/{n_mem + 1})", fontsize=13)
-    safe_savefig(fig, os.path.join(out_dir, f"rank_histograms_per_obs{suffix}.png"), dpi=130)
+    fig.suptitle(
+        (fig_title + ": " if fig_title else "")
+        + f"rank histogram at each observation time ({runs_txt}, {n_mem} members; "
+        f"dashed = reliable, 1/{n_mem + 1})",
+        fontsize=13,
+    )
+    safe_savefig(
+        fig, os.path.join(out_dir, f"rank_histograms_per_obs{suffix}.png"), dpi=130
+    )
     plt.close(fig)
 
     # 2. Pooled rank histogram, and rank against observation time
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5), layout="constrained", gridspec_kw=dict(width_ratios=[1, 1.6]))
+    fig, ax = plt.subplots(
+        1,
+        2,
+        figsize=(14, 5),
+        layout="constrained",
+        gridspec_kw=dict(width_ratios=[1, 1.6]),
+    )
     vals = rank[np.isfinite(rank)]
     ax[0].bar(ranks_axis, norm_counts(vals), width=0.9, color=col_bar)
-    ax[0].axhline(expected, color=col_exp, lw=1.2, ls=(0, (4, 2)), label=f"Reliable ensemble (1/{n_mem + 1})")
+    ax[0].axhline(
+        expected,
+        color=col_exp,
+        lw=1.2,
+        ls=(0, (4, 2)),
+        label=f"Reliable ensemble (1/{n_mem + 1})",
+    )
     ax[0].set_xlabel(rank_label, fontsize=11)
     ax[0].set_ylabel("Normalised count", fontsize=11)
     ax[0].set_xlim(-0.6, n_mem + 0.6)
     ax[0].xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax[0].set_title(f"Pooled over {np.isfinite(rank).any(axis=0).sum()} observations, {runs_txt} "
-                    f"(n = {vals.size})", loc="left", fontsize=11)
+    ax[0].set_title(
+        f"Pooled over {np.isfinite(rank).any(axis=0).sum()} observations, {runs_txt} "
+        f"(n = {vals.size})",
+        loc="left",
+        fontsize=11,
+    )
     ax[0].legend(frameon=False, fontsize=9)
     ax[0].grid(True, axis="y", color=col_grid, lw=0.5)
     ax[0].set_axisbelow(True)
 
     t_ok = not obs_time[ranked].isna().any()
     x_all = obs_time if t_ok else np.arange(n_obs)
-    ax[1].axhspan(0.05 * (n_mem + 1) - 0.5, 0.95 * (n_mem + 1) - 0.5, color="#ecebe6", zorder=0,
-                  label="Central 90% of a reliable ensemble")
+    ax[1].axhspan(
+        0.05 * (n_mem + 1) - 0.5,
+        0.95 * (n_mem + 1) - 0.5,
+        color="#ecebe6",
+        zorder=0,
+        label="Central 90% of a reliable ensemble",
+    )
     ax[1].axhline(n_mem / 2, color=col_grid, lw=1, zorder=0)
     cmap = plt.get_cmap("tab10")
     for j, run_no in enumerate(res["run_nos"]):
         ok = np.isfinite(rank[j])
-        ax[1].plot(np.asarray(x_all)[ok], rank[j, ok], marker="o", ms=4, lw=0.8,
-                   color=col_bar if n_runs == 1 else cmap(j % 10), alpha=0.9 if n_runs <= 10 else 0.4,
-                   label=f"run {run_no}" if n_runs <= 10 else None)
+        ax[1].plot(
+            np.asarray(x_all)[ok],
+            rank[j, ok],
+            marker="o",
+            ms=4,
+            lw=0.8,
+            color=col_bar if n_runs == 1 else cmap(j % 10),
+            alpha=0.9 if n_runs <= 10 else 0.4,
+            label=f"run {run_no}" if n_runs <= 10 else None,
+        )
     ax[1].set_ylim(-0.5, n_mem + 0.5)
     ax[1].yaxis.set_major_locator(MaxNLocator(integer=True))
     ax[1].set_ylabel(rank_label, fontsize=11)
-    ax[1].set_xlabel("Observation time (UT)" if t_ok else "Observation number", fontsize=11)
+    ax[1].set_xlabel(
+        "Observation time (UT)" if t_ok else "Observation number", fontsize=11
+    )
     if t_ok:
         ax[1].xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
-    ax[1].set_title(f"Rank of each observation (0: below all members, {n_mem}: above all members)",
-                    loc="left", fontsize=11)
+    ax[1].set_title(
+        f"Rank of each observation (0: below all members, {n_mem}: above all members)",
+        loc="left",
+        fontsize=11,
+    )
     ax[1].legend(frameon=False, fontsize=9, loc="best")
     ax[1].grid(True, color=col_grid, lw=0.5)
     ax[1].set_axisbelow(True)
     if res["n_skipped"]:
-        ax[1].text(0.0, -0.18, f"{res['n_skipped']} observation(s) not ranked: some members had no elongation",
-                   transform=ax[1].transAxes, fontsize=8, color="#b03030")
-    fig.suptitle((fig_title + ": " if fig_title else "") + "rank histogram of the forecast ensemble", fontsize=13)
-    safe_savefig(fig, os.path.join(out_dir, f"rank_histogram_summary{suffix}.png"), dpi=140)
+        ax[1].text(
+            0.0,
+            -0.18,
+            f"{res['n_skipped']} observation(s) not ranked: some members had no elongation",
+            transform=ax[1].transAxes,
+            fontsize=8,
+            color="#b03030",
+        )
+    fig.suptitle(
+        (fig_title + ": " if fig_title else "")
+        + "rank histogram of the forecast ensemble",
+        fontsize=13,
+    )
+    safe_savefig(
+        fig, os.path.join(out_dir, f"rank_histogram_summary{suffix}.png"), dpi=140
+    )
     plt.close(fig)
     print(f"Saved rank histograms to {out_dir}")
     return res
 
 
-def plot_par_histograms_over_mult_runs(
-    ds, ax, xVarName, yVarName, xTruth, yTruth, xLabel, yLabel,
-        plotPrior=False, cmap=cc.m_gouldian, grid_size=10,
-        xMin=np.nan, xMax=np.nan, yMin=np.nan, yMax=np.nan, cbarMin=np.nan, cbarMax=np.nan
-):
-    ax.set_facecolor(cmap(0))
-    # Extract the relevant values to plot
-    if plotPrior:
-        xValues = ds[xVarName][:, 0, :].values
-        yValues = ds[yVarName][:, 0, :].values
-    else:
-        xValues = ds[xVarName][:, -1, :].values
-        yValues = ds[yVarName][:, -1, :].values
-
-    # Add constraints on colorbar if provided
-    axMinMaxCond = np.isnan(xMin) or np.isnan(xMax) or np.isnan(yMin) or np.isnan(yMax)
-    if np.isnan(cbarMin + cbarMax):
-        if axMinMaxCond:
-            im = ax.hexbin(
-                xValues, yValues,
-                gridsize=grid_size,
-                cmap=cmap
-            )
-        else:
-            im = ax.hexbin(
-                xValues, yValues,
-                gridsize=grid_size, extent=(xMin, xMax, yMin, yMax),
-                cmap=cmap
-            )
-    else:
-        if axMinMaxCond:
-            im = ax.hexbin(
-                xValues, yValues,
-                gridsize=grid_size,
-                cmap=cmap, vmin=cbarMin, vmax=cbarMax
-            )
-        else:
-            im = ax.hexbin(
-                xValues, yValues,
-                gridsize=grid_size, extent=(xMin, xMax, yMin, yMax),
-                cmap=cmap, vmin=cbarMin, vmax=cbarMax
-            )
-
-    if not axMinMaxCond:
-        ax.plot(
-            [xMin, xMax], [yTruth, yTruth],
-            color='r', linestyle='dashed', label=f"True {yVarName}"
-        )
-        ax.plot(
-            [xTruth, xTruth], [yMin, yMax],
-            color='r', linestyle='dashed', label=f"True {yVarName}"
-        )
-    #plt.colorbar(im, label='count', ax=ax, orientation='vertical')
-
-    # Set limits if provided
-    if not np.isnan(xMin + xMax):
-        ax.set_xlim(xMin, xMax)
-
-    if not np.isnan(yMin + yMax):
-        ax.set_ylim(yMin, yMax)
-
-    ax.set_xlabel(f"{xLabel}", fontsize=28)
-    ax.set_ylabel(f"{yLabel}",fontsize=28)
-    ax.tick_params(axis='both', which='major', labelsize=22)
-    if plotPrior:
-        ax.set_title(f'Prior {xVarName} against {yVarName}', fontsize=32)
-    else:
-        ax.set_title(f'Posterior {xVarName} against {yVarName}', fontsize=32)
-
-    return im
-
-
-def plot_sample_cov(
-        ds, run_no, obs_no, vars_req=["v", "lon", "width"]
-):
-    # Get number of ensemble members
-    n_runs = len(ds["run"][:])
-    n_ens = len(ds["ens_no"][:])
-    n_var_req = len(vars_req)
-
-    if run_no == "all":
-        # Initialise an array to hold ensemble at run_no and obs_no specified
-        var_array = np.zeros((n_ens * n_runs, n_var_req))
-
-        # Get relevant run and obs_no required
-        for iv, v_name in enumerate(vars_req):
-            try:
-                var_array[:, iv] = ds[v_name][:, obs_no, :].values.flatten()
-            except:
-                var_array[:, iv] = ds[v_name][obs_no, :].values
-            else:
-                var_array[:, iv] = ds[v_name][:, obs_no, :].values.flatten()
-        df = pd.DataFrame(data=var_array, columns=vars_req, index=range(n_ens * n_runs))
-    else:
-        # Initialise an array to hold ensemble at run_no and obs_no specified
-        var_array = np.zeros((n_ens, n_var_req))
-
-        # Get relevant run and obs_no required
-        for iv, v_name in enumerate(vars_req):
-            try:
-                var_array[:, iv] = ds[v_name][run_no, obs_no, :].values
-            except:
-                var_array[:, iv] = ds[v_name][obs_no, :].values
-            else:
-                var_array[:, iv] = ds[v_name][run_no, obs_no, :].values
-
-        df = pd.DataFrame(data=var_array, columns=vars_req, index=range(n_ens))
-
-    # Calculate covariance
-    #print(df)
-    # Basic correlogram
-    # sns.pairplot(df)
-    # plt.show()
-
-    tick_labels = [
-        i for i in df.columns
-    ]
-    # if use_log_v:
-    #     tick_labels[cme_par_get_indices("v")] = "log(v)"
-
-    fig, ax = plt.subplots(1, 1)
-    sns.heatmap(
-        df.corr(), annot=True, cmap=plt.cm.RdBu_r,
-        vmin=-1, vmax=1, ax=ax,
-        xticklabels=tick_labels, yticklabels=tick_labels
-    )
-    ax.set_title(f"Correlation matrix for obs_no = {obs_no}, run_no = {run_no}")
-    plt.show()
-
-    # sns.heatmap(df.cov(), annot=True, cmap=plt.cm.RdBu_r, vmin=-1600, vmax=1600)
-    # plt.show()
-    #cov_var_array = np.cov(var_array, rowvar=False)
-
-    #print(cov_var_array)
-
-    return None
-
-
 def main():
+    load_environment()
     nRuns = 1
     start_run = -1
     t_initTruth = None
@@ -3033,18 +3503,12 @@ def main():
     lonTruth = None
     latTruth = None
 
-    obs_dir = os.getenv('OBS_DIR')
-    #indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
+    obs_dir = os.getenv("OBS_DIR")
+    # indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
-    # baseFilePath = os.path.join(
-    #     "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output2",
-    #     "mo_cone",# "New folder",
-    #     "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
-    # )
-    # event_list = ["ssw_008"]#, "ssw_009", "ssw_012"]#["ssw_007", "ssw_008", "ssw_009", "ssw_012"]
     event_list = ["13B"]
-    craft_list = ["sta"]#, "stb"]
-    img_list = ["diff"] # ["norm", "diff"]
+    craft_list = ["sta"]  # , "stb"]
+    img_list = ["diff"]  # ["norm", "diff"]
     par_type = "donki"
     use_model = "compress_surf3d"
     # Compute and plot the ensemble's full elongation profiles at every observation (one extra
@@ -3066,13 +3530,10 @@ def main():
     all_comb_list = [
         (x, y, z) for x in event_list for y in craft_list for z in img_list
     ]
-    assert (use_model in ["surf", "compress_surf", "compress_surf3d", "huxt"])
+    assert use_model in ["surf", "compress_surf", "compress_surf3d", "huxt"]
 
-    for (event, craft, img) in all_comb_list:
+    for event, craft, img in all_comb_list:
         print(f"\nevent: {event}, craft: {craft}, img: {img}")
-        #event = "ssw_007"
-        #craft = "stb"
-        #img = "diff"
 
         if craft == "sta":
             craft_name = "STEREO-A"
@@ -3090,33 +3551,57 @@ def main():
             fig_title = f"CME-1: {craft_name} data assimilated"
             if craft == "sta":
                 obs_times = [
-                    datetime.datetime(2012, 9, 1, 0, 9, 1), datetime.datetime(2012, 9, 1, 0, 49, 1),
-                    datetime.datetime(2012, 9, 1, 1, 29, 1), datetime.datetime(2012, 9, 1, 2, 9, 1),
-                    datetime.datetime(2012, 9, 1, 2, 49, 1), datetime.datetime(2012, 9, 1, 3, 29, 1),
-                    datetime.datetime(2012, 9, 1, 4, 9, 1), datetime.datetime(2012, 9, 1, 4, 49, 1),
-                    datetime.datetime(2012, 9, 1, 5, 29, 1), datetime.datetime(2012, 9, 1, 6, 9, 1),
-                    datetime.datetime(2012, 9, 1, 6, 49, 1), datetime.datetime(2012, 9, 1, 7, 29, 1),
-                    datetime.datetime(2012, 9, 1, 8, 9, 1), datetime.datetime(2012, 9, 1, 8, 49, 1),
-                    datetime.datetime(2012, 9, 1, 9, 29, 1), datetime.datetime(2012, 9, 1, 10, 9, 1),
-                    datetime.datetime(2012, 9, 1, 10, 49, 1), datetime.datetime(2012, 9, 1, 11, 29, 1),
-                    datetime.datetime(2012, 9, 1, 12, 9, 1), datetime.datetime(2012, 9, 1, 12, 49, 1),
-                    datetime.datetime(2012, 9, 1, 13, 29, 1), datetime.datetime(2012, 9, 1, 14, 9, 1),
-                    datetime.datetime(2012, 9, 1, 14, 49, 1), datetime.datetime(2012, 9, 1, 15, 29, 1),
-                    datetime.datetime(2012, 9, 1, 16, 9, 1), datetime.datetime(2012, 9, 1, 16, 49, 1),
-                    datetime.datetime(2012, 9, 1, 17, 29, 1), datetime.datetime(2012, 9, 1, 18, 9, 1),
-                    datetime.datetime(2012, 9, 1, 18, 49, 1), datetime.datetime(2012, 9, 1, 19, 29, 1)
+                    datetime.datetime(2012, 9, 1, 0, 9, 1),
+                    datetime.datetime(2012, 9, 1, 0, 49, 1),
+                    datetime.datetime(2012, 9, 1, 1, 29, 1),
+                    datetime.datetime(2012, 9, 1, 2, 9, 1),
+                    datetime.datetime(2012, 9, 1, 2, 49, 1),
+                    datetime.datetime(2012, 9, 1, 3, 29, 1),
+                    datetime.datetime(2012, 9, 1, 4, 9, 1),
+                    datetime.datetime(2012, 9, 1, 4, 49, 1),
+                    datetime.datetime(2012, 9, 1, 5, 29, 1),
+                    datetime.datetime(2012, 9, 1, 6, 9, 1),
+                    datetime.datetime(2012, 9, 1, 6, 49, 1),
+                    datetime.datetime(2012, 9, 1, 7, 29, 1),
+                    datetime.datetime(2012, 9, 1, 8, 9, 1),
+                    datetime.datetime(2012, 9, 1, 8, 49, 1),
+                    datetime.datetime(2012, 9, 1, 9, 29, 1),
+                    datetime.datetime(2012, 9, 1, 10, 9, 1),
+                    datetime.datetime(2012, 9, 1, 10, 49, 1),
+                    datetime.datetime(2012, 9, 1, 11, 29, 1),
+                    datetime.datetime(2012, 9, 1, 12, 9, 1),
+                    datetime.datetime(2012, 9, 1, 12, 49, 1),
+                    datetime.datetime(2012, 9, 1, 13, 29, 1),
+                    datetime.datetime(2012, 9, 1, 14, 9, 1),
+                    datetime.datetime(2012, 9, 1, 14, 49, 1),
+                    datetime.datetime(2012, 9, 1, 15, 29, 1),
+                    datetime.datetime(2012, 9, 1, 16, 9, 1),
+                    datetime.datetime(2012, 9, 1, 16, 49, 1),
+                    datetime.datetime(2012, 9, 1, 17, 29, 1),
+                    datetime.datetime(2012, 9, 1, 18, 9, 1),
+                    datetime.datetime(2012, 9, 1, 18, 49, 1),
+                    datetime.datetime(2012, 9, 1, 19, 29, 1),
                 ]
             elif craft == "stb":
                 obs_times = [
-                    datetime.datetime(2012, 8, 31, 23, 29, 1), datetime.datetime(2012, 9, 1, 0, 9, 1),
-                    datetime.datetime(2012, 9, 1, 0, 49, 1), datetime.datetime(2012, 9, 1, 1, 29, 1),
-                    datetime.datetime(2012, 9, 1, 2, 9, 1), datetime.datetime(2012, 9, 1, 2, 49, 1),
-                    datetime.datetime(2012, 9, 1, 3, 29, 1), datetime.datetime(2012, 9, 1, 4, 9, 1),
-                    datetime.datetime(2012, 9, 1, 4, 49, 1), datetime.datetime(2012, 9, 1, 5, 29, 1),
-                    datetime.datetime(2012, 9, 1, 6, 9, 1), datetime.datetime(2012, 9, 1, 6, 49, 1),
-                    datetime.datetime(2012, 9, 1, 7, 29, 1), datetime.datetime(2012, 9, 1, 8, 9, 1),
-                    datetime.datetime(2012, 9, 1, 8, 49, 1), datetime.datetime(2012, 9, 1, 9, 29, 1),
-                    datetime.datetime(2012, 9, 1, 10, 9, 1), datetime.datetime(2012, 9, 1, 10, 49, 1)
+                    datetime.datetime(2012, 8, 31, 23, 29, 1),
+                    datetime.datetime(2012, 9, 1, 0, 9, 1),
+                    datetime.datetime(2012, 9, 1, 0, 49, 1),
+                    datetime.datetime(2012, 9, 1, 1, 29, 1),
+                    datetime.datetime(2012, 9, 1, 2, 9, 1),
+                    datetime.datetime(2012, 9, 1, 2, 49, 1),
+                    datetime.datetime(2012, 9, 1, 3, 29, 1),
+                    datetime.datetime(2012, 9, 1, 4, 9, 1),
+                    datetime.datetime(2012, 9, 1, 4, 49, 1),
+                    datetime.datetime(2012, 9, 1, 5, 29, 1),
+                    datetime.datetime(2012, 9, 1, 6, 9, 1),
+                    datetime.datetime(2012, 9, 1, 6, 49, 1),
+                    datetime.datetime(2012, 9, 1, 7, 29, 1),
+                    datetime.datetime(2012, 9, 1, 8, 9, 1),
+                    datetime.datetime(2012, 9, 1, 8, 49, 1),
+                    datetime.datetime(2012, 9, 1, 9, 29, 1),
+                    datetime.datetime(2012, 9, 1, 10, 9, 1),
+                    datetime.datetime(2012, 9, 1, 10, 49, 1),
                 ]
 
         elif event == "ssw_008":
@@ -3129,41 +3614,62 @@ def main():
             fig_title = f"CME-2: {craft_name} data assimilated"
             if craft == "sta":
                 obs_times = [
-                    datetime.datetime(2012, 9, 28, 3, 29, 1), datetime.datetime(2012, 9, 28, 4, 9, 1),
-                    datetime.datetime(2012, 9, 28, 4, 49, 1), datetime.datetime(2012, 9, 28, 5, 29, 1),
-                    datetime.datetime(2012, 9, 28, 6, 9, 1), datetime.datetime(2012, 9, 28, 6, 49, 1),
-                    datetime.datetime(2012, 9, 28, 7, 29, 1), datetime.datetime(2012, 9, 28, 8, 9, 1),
-                    datetime.datetime(2012, 9, 28, 8, 49, 1), datetime.datetime(2012, 9, 28, 9, 29, 1),
-                    datetime.datetime(2012, 9, 28, 10, 9, 1), datetime.datetime(2012, 9, 28, 10, 49, 1),
-                    datetime.datetime(2012, 9, 28, 11, 29, 1), datetime.datetime(2012, 9, 28, 12, 9, 1),
-                    datetime.datetime(2012, 9, 28, 12, 49, 1), datetime.datetime(2012, 9, 28, 13, 29, 1),
-                    datetime.datetime(2012, 9, 28, 14, 9, 1), datetime.datetime(2012, 9, 28, 14, 49, 1),
-                    datetime.datetime(2012, 9, 28, 15, 29, 1), datetime.datetime(2012, 9, 28, 16, 9, 1),
-                    datetime.datetime(2012, 9, 28, 16, 49, 1)
+                    datetime.datetime(2012, 9, 28, 3, 29, 1),
+                    datetime.datetime(2012, 9, 28, 4, 9, 1),
+                    datetime.datetime(2012, 9, 28, 4, 49, 1),
+                    datetime.datetime(2012, 9, 28, 5, 29, 1),
+                    datetime.datetime(2012, 9, 28, 6, 9, 1),
+                    datetime.datetime(2012, 9, 28, 6, 49, 1),
+                    datetime.datetime(2012, 9, 28, 7, 29, 1),
+                    datetime.datetime(2012, 9, 28, 8, 9, 1),
+                    datetime.datetime(2012, 9, 28, 8, 49, 1),
+                    datetime.datetime(2012, 9, 28, 9, 29, 1),
+                    datetime.datetime(2012, 9, 28, 10, 9, 1),
+                    datetime.datetime(2012, 9, 28, 10, 49, 1),
+                    datetime.datetime(2012, 9, 28, 11, 29, 1),
+                    datetime.datetime(2012, 9, 28, 12, 9, 1),
+                    datetime.datetime(2012, 9, 28, 12, 49, 1),
+                    datetime.datetime(2012, 9, 28, 13, 29, 1),
+                    datetime.datetime(2012, 9, 28, 14, 9, 1),
+                    datetime.datetime(2012, 9, 28, 14, 49, 1),
+                    datetime.datetime(2012, 9, 28, 15, 29, 1),
+                    datetime.datetime(2012, 9, 28, 16, 9, 1),
+                    datetime.datetime(2012, 9, 28, 16, 49, 1),
                 ]
             elif craft == "stb":
                 obs_times = [
-                    datetime.datetime(2012, 9, 28, 8, 9, 1), datetime.datetime(2012, 9, 28, 8, 49, 1),
-                    datetime.datetime(2012, 9, 28, 9, 29, 1), datetime.datetime(2012, 9, 28, 10, 9, 1),
-                    datetime.datetime(2012, 9, 28, 10, 49, 1), datetime.datetime(2012, 9, 28, 11, 29, 1),
-                    datetime.datetime(2012, 9, 28, 12, 9, 1), datetime.datetime(2012, 9, 28, 12, 49, 1),
-                    datetime.datetime(2012, 9, 28, 13, 29, 1), datetime.datetime(2012, 9, 28, 14, 9, 1),
-                    datetime.datetime(2012, 9, 28, 14, 49, 1), datetime.datetime(2012, 9, 28, 15, 29, 1),
-                    datetime.datetime(2012, 9, 28, 16, 9, 1), datetime.datetime(2012, 9, 28, 16, 49, 1),
-                    datetime.datetime(2012, 9, 28, 17, 29, 1), datetime.datetime(2012, 9, 28, 18, 9, 1),
-                    datetime.datetime(2012, 9, 28, 18, 49, 1), datetime.datetime(2012, 9, 28, 19, 29, 1),
-                    datetime.datetime(2012, 9, 28, 20, 9, 1), datetime.datetime(2012, 9, 28, 20, 49, 1),
-                    datetime.datetime(2012, 9, 28, 21, 29, 1), datetime.datetime(2012, 9, 28, 22, 9, 1),
-                    datetime.datetime(2012, 9, 28, 22, 49, 1), datetime.datetime(2012, 9, 28, 23, 29, 1),
-                    datetime.datetime(2012, 9, 29, 0, 9, 1), datetime.datetime(2012, 9, 29, 0, 49, 1),
-                    datetime.datetime(2012, 9, 29, 1, 29, 1)
+                    datetime.datetime(2012, 9, 28, 8, 9, 1),
+                    datetime.datetime(2012, 9, 28, 8, 49, 1),
+                    datetime.datetime(2012, 9, 28, 9, 29, 1),
+                    datetime.datetime(2012, 9, 28, 10, 9, 1),
+                    datetime.datetime(2012, 9, 28, 10, 49, 1),
+                    datetime.datetime(2012, 9, 28, 11, 29, 1),
+                    datetime.datetime(2012, 9, 28, 12, 9, 1),
+                    datetime.datetime(2012, 9, 28, 12, 49, 1),
+                    datetime.datetime(2012, 9, 28, 13, 29, 1),
+                    datetime.datetime(2012, 9, 28, 14, 9, 1),
+                    datetime.datetime(2012, 9, 28, 14, 49, 1),
+                    datetime.datetime(2012, 9, 28, 15, 29, 1),
+                    datetime.datetime(2012, 9, 28, 16, 9, 1),
+                    datetime.datetime(2012, 9, 28, 16, 49, 1),
+                    datetime.datetime(2012, 9, 28, 17, 29, 1),
+                    datetime.datetime(2012, 9, 28, 18, 9, 1),
+                    datetime.datetime(2012, 9, 28, 18, 49, 1),
+                    datetime.datetime(2012, 9, 28, 19, 29, 1),
+                    datetime.datetime(2012, 9, 28, 20, 9, 1),
+                    datetime.datetime(2012, 9, 28, 20, 49, 1),
+                    datetime.datetime(2012, 9, 28, 21, 29, 1),
+                    datetime.datetime(2012, 9, 28, 22, 9, 1),
+                    datetime.datetime(2012, 9, 28, 22, 49, 1),
+                    datetime.datetime(2012, 9, 28, 23, 29, 1),
+                    datetime.datetime(2012, 9, 29, 0, 9, 1),
+                    datetime.datetime(2012, 9, 29, 0, 49, 1),
+                    datetime.datetime(2012, 9, 29, 1, 29, 1),
                 ]
 
-
-
         elif event == "ssw_009":
-            if par_type=="donki":
-                prior_dir= "prior_650_94_10_-28_0"
+            if par_type == "donki":
+                prior_dir = "prior_650_94_10_-28_0"
             else:
                 prior_dir = "prior_698_84_9_-24_0"
             real_arrival_time = datetime.datetime(2012, 10, 8, 4, 31, 0)
@@ -3171,40 +3677,66 @@ def main():
             fig_title = f"CME-3: {craft_name} data assimilated"
             if craft == "sta":
                 obs_times = [
-                    datetime.datetime(2012, 10, 5, 9, 29, 1), datetime.datetime(2012, 10, 5, 10, 9, 1),
-                    datetime.datetime(2012, 10, 5, 10, 49, 1), datetime.datetime(2012, 10, 5, 11, 29, 1),
-                    datetime.datetime(2012, 10, 5, 12, 9, 1), datetime.datetime(2012, 10, 5, 12, 49, 1),
-                    datetime.datetime(2012, 10, 5, 13, 29, 1), datetime.datetime(2012, 10, 5, 14, 9, 1),
-                    datetime.datetime(2012, 10, 5, 14, 49, 1), datetime.datetime(2012, 10, 5, 15, 29, 1),
-                    datetime.datetime(2012, 10, 5, 16, 9, 1), datetime.datetime(2012, 10, 5, 16, 49, 1),
-                    datetime.datetime(2012, 10, 5, 17, 29, 1), datetime.datetime(2012, 10, 5, 18, 9, 1),
-                    datetime.datetime(2012, 10, 5, 18, 49, 1), datetime.datetime(2012, 10, 5, 19, 29, 1),
-                    datetime.datetime(2012, 10, 5, 20, 9, 1), datetime.datetime(2012, 10, 5, 20, 49, 1),
-                    datetime.datetime(2012, 10, 5, 21, 29, 1), datetime.datetime(2012, 10, 5, 22, 9, 1),
-                    datetime.datetime(2012, 10, 5, 22, 49, 1), datetime.datetime(2012, 10, 5, 23, 29, 1),
-                    datetime.datetime(2012, 10, 6, 0, 9, 1), datetime.datetime(2012, 10, 6, 0, 49, 1),
-                    datetime.datetime(2012, 10, 6, 1, 29, 1), datetime.datetime(2012, 10, 6, 2, 9, 1),
-                    datetime.datetime(2012, 10, 6, 2, 49, 1)
+                    datetime.datetime(2012, 10, 5, 9, 29, 1),
+                    datetime.datetime(2012, 10, 5, 10, 9, 1),
+                    datetime.datetime(2012, 10, 5, 10, 49, 1),
+                    datetime.datetime(2012, 10, 5, 11, 29, 1),
+                    datetime.datetime(2012, 10, 5, 12, 9, 1),
+                    datetime.datetime(2012, 10, 5, 12, 49, 1),
+                    datetime.datetime(2012, 10, 5, 13, 29, 1),
+                    datetime.datetime(2012, 10, 5, 14, 9, 1),
+                    datetime.datetime(2012, 10, 5, 14, 49, 1),
+                    datetime.datetime(2012, 10, 5, 15, 29, 1),
+                    datetime.datetime(2012, 10, 5, 16, 9, 1),
+                    datetime.datetime(2012, 10, 5, 16, 49, 1),
+                    datetime.datetime(2012, 10, 5, 17, 29, 1),
+                    datetime.datetime(2012, 10, 5, 18, 9, 1),
+                    datetime.datetime(2012, 10, 5, 18, 49, 1),
+                    datetime.datetime(2012, 10, 5, 19, 29, 1),
+                    datetime.datetime(2012, 10, 5, 20, 9, 1),
+                    datetime.datetime(2012, 10, 5, 20, 49, 1),
+                    datetime.datetime(2012, 10, 5, 21, 29, 1),
+                    datetime.datetime(2012, 10, 5, 22, 9, 1),
+                    datetime.datetime(2012, 10, 5, 22, 49, 1),
+                    datetime.datetime(2012, 10, 5, 23, 29, 1),
+                    datetime.datetime(2012, 10, 6, 0, 9, 1),
+                    datetime.datetime(2012, 10, 6, 0, 49, 1),
+                    datetime.datetime(2012, 10, 6, 1, 29, 1),
+                    datetime.datetime(2012, 10, 6, 2, 9, 1),
+                    datetime.datetime(2012, 10, 6, 2, 49, 1),
                 ]
             elif craft == "stb":
                 obs_times = [
-                    datetime.datetime(2012, 10, 5, 10, 49, 1), datetime.datetime(2012, 10, 5, 11, 29, 1),
-                    datetime.datetime(2012, 10, 5, 12, 9, 1), datetime.datetime(2012, 10, 5, 12, 49, 1),
-                    datetime.datetime(2012, 10, 5, 13, 29, 1), datetime.datetime(2012, 10, 5, 14, 9, 1),
-                    datetime.datetime(2012, 10, 5, 14, 49, 1), datetime.datetime(2012, 10, 5, 15, 29, 1),
-                    datetime.datetime(2012, 10, 5, 16, 9, 1), datetime.datetime(2012, 10, 5, 16, 49, 1),
-                    datetime.datetime(2012, 10, 5, 17, 29, 1), datetime.datetime(2012, 10, 5, 18, 9, 1),
-                    datetime.datetime(2012, 10, 5, 18, 49, 1), datetime.datetime(2012, 10, 5, 19, 29, 1),
-                    datetime.datetime(2012, 10, 5, 20, 9, 1), datetime.datetime(2012, 10, 5, 20, 49, 1),
-                    datetime.datetime(2012, 10, 5, 21, 29, 1), datetime.datetime(2012, 10, 5, 22, 9, 1),
-                    datetime.datetime(2012, 10, 5, 22, 49, 1), datetime.datetime(2012, 10, 5, 23, 29, 1),
-                    datetime.datetime(2012, 10, 6, 0, 9, 1), datetime.datetime(2012, 10, 6, 0, 49, 1),
-                    datetime.datetime(2012, 10, 6, 1, 29, 1), datetime.datetime(2012, 10, 6, 2, 9, 1),
-                    datetime.datetime(2012, 10, 6, 3, 29, 1), datetime.datetime(2012, 10, 6, 4, 9, 1)
+                    datetime.datetime(2012, 10, 5, 10, 49, 1),
+                    datetime.datetime(2012, 10, 5, 11, 29, 1),
+                    datetime.datetime(2012, 10, 5, 12, 9, 1),
+                    datetime.datetime(2012, 10, 5, 12, 49, 1),
+                    datetime.datetime(2012, 10, 5, 13, 29, 1),
+                    datetime.datetime(2012, 10, 5, 14, 9, 1),
+                    datetime.datetime(2012, 10, 5, 14, 49, 1),
+                    datetime.datetime(2012, 10, 5, 15, 29, 1),
+                    datetime.datetime(2012, 10, 5, 16, 9, 1),
+                    datetime.datetime(2012, 10, 5, 16, 49, 1),
+                    datetime.datetime(2012, 10, 5, 17, 29, 1),
+                    datetime.datetime(2012, 10, 5, 18, 9, 1),
+                    datetime.datetime(2012, 10, 5, 18, 49, 1),
+                    datetime.datetime(2012, 10, 5, 19, 29, 1),
+                    datetime.datetime(2012, 10, 5, 20, 9, 1),
+                    datetime.datetime(2012, 10, 5, 20, 49, 1),
+                    datetime.datetime(2012, 10, 5, 21, 29, 1),
+                    datetime.datetime(2012, 10, 5, 22, 9, 1),
+                    datetime.datetime(2012, 10, 5, 22, 49, 1),
+                    datetime.datetime(2012, 10, 5, 23, 29, 1),
+                    datetime.datetime(2012, 10, 6, 0, 9, 1),
+                    datetime.datetime(2012, 10, 6, 0, 49, 1),
+                    datetime.datetime(2012, 10, 6, 1, 29, 1),
+                    datetime.datetime(2012, 10, 6, 2, 9, 1),
+                    datetime.datetime(2012, 10, 6, 3, 29, 1),
+                    datetime.datetime(2012, 10, 6, 4, 9, 1),
                 ]
 
         elif event == "ssw_012":
-            if par_type=="donki":
+            if par_type == "donki":
                 prior_dir = "prior_725_60_90_5_0"
                 cme_hit_object = "EARTH"
             else:
@@ -3215,38 +3747,65 @@ def main():
 
             if craft == "sta":
                 obs_times = [
-                    datetime.datetime(2012, 11, 20, 16, 49, 1), datetime.datetime(2012, 11, 20, 17, 29, 1),
-                    datetime.datetime(2012, 11, 20, 18, 9, 1), datetime.datetime(2012, 11, 20, 18, 49, 1),
-                    datetime.datetime(2012, 11, 20, 19, 29, 1), datetime.datetime(2012, 11, 20, 20, 9, 1),
-                    datetime.datetime(2012, 11, 20, 20, 49, 1), datetime.datetime(2012, 11, 20, 21, 29, 1),
-                    datetime.datetime(2012, 11, 20, 22, 9, 1), datetime.datetime(2012, 11, 20, 22, 49, 1),
-                    datetime.datetime(2012, 11, 20, 23, 29, 1), datetime.datetime(2012, 11, 21, 0, 9, 1),
-                    datetime.datetime(2012, 11, 21, 0, 49, 1), datetime.datetime(2012, 11, 21, 1, 29, 1),
-                    datetime.datetime(2012, 11, 21, 2, 9, 1), datetime.datetime(2012, 11, 21, 2, 49, 1),
-                    datetime.datetime(2012, 11, 21, 3, 29, 1), datetime.datetime(2012, 11, 21, 4, 9, 1),
-                    datetime.datetime(2012, 11, 21, 4, 49, 1), datetime.datetime(2012, 11, 21, 5, 29, 1),
-                    datetime.datetime(2012, 11, 21, 6, 9, 1), datetime.datetime(2012, 11, 21, 6, 49, 1),
-                    datetime.datetime(2012, 11, 21, 7, 29, 1), datetime.datetime(2012, 11, 21, 8, 9, 1),
-                    datetime.datetime(2012, 11, 21, 8, 49, 1), datetime.datetime(2012, 11, 21, 9, 29, 1),
-                    datetime.datetime(2012, 11, 21, 10, 9, 1)
+                    datetime.datetime(2012, 11, 20, 16, 49, 1),
+                    datetime.datetime(2012, 11, 20, 17, 29, 1),
+                    datetime.datetime(2012, 11, 20, 18, 9, 1),
+                    datetime.datetime(2012, 11, 20, 18, 49, 1),
+                    datetime.datetime(2012, 11, 20, 19, 29, 1),
+                    datetime.datetime(2012, 11, 20, 20, 9, 1),
+                    datetime.datetime(2012, 11, 20, 20, 49, 1),
+                    datetime.datetime(2012, 11, 20, 21, 29, 1),
+                    datetime.datetime(2012, 11, 20, 22, 9, 1),
+                    datetime.datetime(2012, 11, 20, 22, 49, 1),
+                    datetime.datetime(2012, 11, 20, 23, 29, 1),
+                    datetime.datetime(2012, 11, 21, 0, 9, 1),
+                    datetime.datetime(2012, 11, 21, 0, 49, 1),
+                    datetime.datetime(2012, 11, 21, 1, 29, 1),
+                    datetime.datetime(2012, 11, 21, 2, 9, 1),
+                    datetime.datetime(2012, 11, 21, 2, 49, 1),
+                    datetime.datetime(2012, 11, 21, 3, 29, 1),
+                    datetime.datetime(2012, 11, 21, 4, 9, 1),
+                    datetime.datetime(2012, 11, 21, 4, 49, 1),
+                    datetime.datetime(2012, 11, 21, 5, 29, 1),
+                    datetime.datetime(2012, 11, 21, 6, 9, 1),
+                    datetime.datetime(2012, 11, 21, 6, 49, 1),
+                    datetime.datetime(2012, 11, 21, 7, 29, 1),
+                    datetime.datetime(2012, 11, 21, 8, 9, 1),
+                    datetime.datetime(2012, 11, 21, 8, 49, 1),
+                    datetime.datetime(2012, 11, 21, 9, 29, 1),
+                    datetime.datetime(2012, 11, 21, 10, 9, 1),
                 ]
             elif craft == "stb":
                 obs_times = [
-                    datetime.datetime(2012, 11, 20, 19, 29, 1), datetime.datetime(2012, 11, 20, 20, 9, 1),
-                    datetime.datetime(2012, 11, 20, 20, 49, 1), datetime.datetime(2012, 11, 20, 21, 29, 1),
-                    datetime.datetime(2012, 11, 20, 22, 9, 1), datetime.datetime(2012, 11, 20, 22, 49, 1),
-                    datetime.datetime(2012, 11, 21, 0, 49, 1), datetime.datetime(2012, 11, 21, 1, 29, 1),
-                    datetime.datetime(2012, 11, 21, 2, 9, 1), datetime.datetime(2012, 11, 21, 2, 49, 1),
-                    datetime.datetime(2012, 11, 21, 3, 29, 1), datetime.datetime(2012, 11, 21, 4, 9, 1),
-                    datetime.datetime(2012, 11, 21, 4, 49, 1), datetime.datetime(2012, 11, 21, 5, 29, 1),
-                    datetime.datetime(2012, 11, 21, 6, 9, 1), datetime.datetime(2012, 11, 21, 6, 49, 1),
-                    datetime.datetime(2012, 11, 21, 7, 29, 1), datetime.datetime(2012, 11, 21, 8, 9, 1),
-                    datetime.datetime(2012, 11, 21, 8, 49, 1), datetime.datetime(2012, 11, 21, 9, 29, 1),
-                    datetime.datetime(2012, 11, 21, 10, 9, 1), datetime.datetime(2012, 11, 21, 10, 49, 1),
-                    datetime.datetime(2012, 11, 21, 11, 29, 1), datetime.datetime(2012, 11, 21, 12, 9, 1),
-                    datetime.datetime(2012, 11, 21, 12, 49, 1), datetime.datetime(2012, 11, 21, 13, 29, 1),
-                    datetime.datetime(2012, 11, 21, 14, 9, 1), datetime.datetime(2012, 11, 21, 14, 49, 1),
-                    datetime.datetime(2012, 11, 21, 15, 29, 1)
+                    datetime.datetime(2012, 11, 20, 19, 29, 1),
+                    datetime.datetime(2012, 11, 20, 20, 9, 1),
+                    datetime.datetime(2012, 11, 20, 20, 49, 1),
+                    datetime.datetime(2012, 11, 20, 21, 29, 1),
+                    datetime.datetime(2012, 11, 20, 22, 9, 1),
+                    datetime.datetime(2012, 11, 20, 22, 49, 1),
+                    datetime.datetime(2012, 11, 21, 0, 49, 1),
+                    datetime.datetime(2012, 11, 21, 1, 29, 1),
+                    datetime.datetime(2012, 11, 21, 2, 9, 1),
+                    datetime.datetime(2012, 11, 21, 2, 49, 1),
+                    datetime.datetime(2012, 11, 21, 3, 29, 1),
+                    datetime.datetime(2012, 11, 21, 4, 9, 1),
+                    datetime.datetime(2012, 11, 21, 4, 49, 1),
+                    datetime.datetime(2012, 11, 21, 5, 29, 1),
+                    datetime.datetime(2012, 11, 21, 6, 9, 1),
+                    datetime.datetime(2012, 11, 21, 6, 49, 1),
+                    datetime.datetime(2012, 11, 21, 7, 29, 1),
+                    datetime.datetime(2012, 11, 21, 8, 9, 1),
+                    datetime.datetime(2012, 11, 21, 8, 49, 1),
+                    datetime.datetime(2012, 11, 21, 9, 29, 1),
+                    datetime.datetime(2012, 11, 21, 10, 9, 1),
+                    datetime.datetime(2012, 11, 21, 10, 49, 1),
+                    datetime.datetime(2012, 11, 21, 11, 29, 1),
+                    datetime.datetime(2012, 11, 21, 12, 9, 1),
+                    datetime.datetime(2012, 11, 21, 12, 49, 1),
+                    datetime.datetime(2012, 11, 21, 13, 29, 1),
+                    datetime.datetime(2012, 11, 21, 14, 9, 1),
+                    datetime.datetime(2012, 11, 21, 14, 49, 1),
+                    datetime.datetime(2012, 11, 21, 15, 29, 1),
                 ]
         elif event == "01B":
             obs_file_name = "CME_01B__20100407__PA265_good_hi2.dat"
@@ -3432,18 +3991,22 @@ def main():
 
         else:
             sys.exit(f"Unknown event {event}.")
-        #obs_dir_name = f"obs_{craft}_{event}_{img}"
-        """baseFilePath = os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
-            "WSA_v", f"{use_model.upper()}", f"ens_{n_ens}", "mo_cone", obs_dir_name,  # "New folder",
-            prior_dir, "0.98",
-        )"""
         baseFilePath = os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
-            "comp_surf", "bias_cl3_on_const_WSA_v", f"ens_{n_ens}", "mo_cone",
+            "C:\\",
+            "Users",
+            "ss905122",
+            "PycharmProjects",
+            "SIR_HUXt",
+            "output",
+            "comp_surf",
+            "bias_cl3_on_const_WSA_v",
+            f"ens_{n_ens}",
+            "mo_cone",
             f"model_{use_model.upper()}",
-            obs_dir_name, "ob_est_lin_0.00_2.00",# "New folder",
-            prior_dir, "0.98",
+            obs_dir_name,
+            "ob_est_lin_0.00_2.00",  # "New folder",
+            prior_dir,
+            "0.98",
         )
         # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
         #  by runs since 31 Oct 2026) or the long name of older runs (obsbias_estimate_constant_prior0.00_2.00):
@@ -3453,18 +4016,20 @@ def main():
         if not os.path.isdir(baseFilePath):
             sys.exit(f"baseFilePath not found: {baseFilePath}")
         # Warn if files written into the run folders would exceed the Windows path limit
-        if path_too_long(os.path.join(baseFilePath, f"run_{start_run:03d}"), allowance=46):
-            print(f"Warning: the run folders under {baseFilePath} leave fewer than 46 characters for file "
-                  f"names before the Windows path limit ({MAX_PATH}); some figures or netCDF files may not "
-                  f"be saved. Shorten the folder names (e.g. the bias folder to its ob_... name) or OUT_BASE_DIR.")
+        if path_too_long(
+            os.path.join(baseFilePath, f"run_{start_run:03d}"), allowance=46
+        ):
+            print(
+                f"Warning: the run folders under {baseFilePath} leave fewer than 46 characters for file "
+                f"names before the Windows path limit ({PathLimits.MAX_PATH}); some figures or netCDF files may not "
+                f"be saved. Shorten the folder names (e.g. the bias folder to its ob_... name) or OUT_BASE_DIR."
+            )
 
         # Read in all nc files and concatenate them into a single xarray object
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             print(runNo)
 
-            filePath = os.path.join(
-                baseFilePath, f"run_{runNo:03d}", "cme_pars.nc"
-            )
+            filePath = os.path.join(baseFilePath, f"run_{runNo:03d}", "cme_pars.nc")
             with xr.load_dataset(filePath) as dsTemp:
                 dsTemp.expand_dims(dim={"run": 1})
                 dsTemp["run"] = (("run",), [runNo])
@@ -3477,8 +4042,8 @@ def main():
         print(ds)
         cme_t_init_mean_sec = ds["t_init"].values.mean(axis=1)
         cme_t_init_mean = [
-                pd.to_datetime(ds["model_init_time"].values) + datetime.timedelta(seconds=i)
-                for i in cme_t_init_mean_sec
+            pd.to_datetime(ds["model_init_time"].values) + datetime.timedelta(seconds=i)
+            for i in cme_t_init_mean_sec
         ]
         cme_speed_mean = ds["v"].values.mean(axis=1)
         cme_width_mean = ds["width"].values.mean(axis=1)
@@ -3486,13 +4051,22 @@ def main():
         cme_lat_mean = ds["lat"].values.mean(axis=1)
 
         print("=======================================================")
-        print(f"Mean CME launch time = Prior: {cme_t_init_mean[0]} - Post: {cme_t_init_mean[-1]}")
-        print(f"Mean CME speed = Prior: {cme_speed_mean[0]:.2f} - Post: {cme_speed_mean[-1]:.2f}")
-        print(f"Mean CME width = Prior: {cme_width_mean[0]:.2f} - Post: {cme_width_mean[-1]:.2f}")
-        print(f"Mean CME lon = Prior: {cme_lon_mean[0]:.2f} - Post: {cme_lon_mean[-1]:.2f}")
-        print(f"Mean CME lat = Prior: {cme_lat_mean[0]:.2f} - Post: {cme_lat_mean[-1]:.2f}")
+        print(
+            f"Mean CME launch time = Prior: {cme_t_init_mean[0]} - Post: {cme_t_init_mean[-1]}"
+        )
+        print(
+            f"Mean CME speed = Prior: {cme_speed_mean[0]:.2f} - Post: {cme_speed_mean[-1]:.2f}"
+        )
+        print(
+            f"Mean CME width = Prior: {cme_width_mean[0]:.2f} - Post: {cme_width_mean[-1]:.2f}"
+        )
+        print(
+            f"Mean CME lon = Prior: {cme_lon_mean[0]:.2f} - Post: {cme_lon_mean[-1]:.2f}"
+        )
+        print(
+            f"Mean CME lat = Prior: {cme_lat_mean[0]:.2f} - Post: {cme_lat_mean[-1]:.2f}"
+        )
         print("=========================================================")
-        #sys.exit()
 
         if event == "twin":
             real_arrival_time, real_arrival_speed = get_true_cme_arrival_time(
@@ -3504,7 +4078,7 @@ def main():
                 true_cme_lat=true_cme_lat,
                 true_cme_lon=true_cme_lon,
                 true_cme_thick=true_cme_thick,
-                cme_hit_object="EARTH"
+                cme_hit_object="EARTH",
             )
         print(f"real_arrival_time = {real_arrival_time}")
         print(f"real_arrival_speed = {real_arrival_speed}")
@@ -3519,13 +4093,13 @@ def main():
                 pool.apply_async(
                     get_cme_arrival_time,
                     kwds={
-                        'ds': ds,
-                        'runNo': runNo,
-                        'use_model': use_model,
-                        'real_arrival_time':real_arrival_time,
-                        'cme_hit_object': "EARTH",
-                        'base_file_path': baseFilePath,
-                        'parallel_ens': False,
+                        "ds": ds,
+                        "runNo": runNo,
+                        "use_model": use_model,
+                        "real_arrival_time": real_arrival_time,
+                        "cme_hit_object": "EARTH",
+                        "base_file_path": baseFilePath,
+                        "parallel_ens": False,
                     },
                 )
             pool.close()
@@ -3544,13 +4118,6 @@ def main():
                 )
 
         n_obs = len(ds["obs_no"][:])
-        # for i in range(n_obs):
-        #     plot_sample_cov(
-        #         ds, 0, i, vars_req=["t_init", "v", "width", "lon", "lat"]
-        #     )
-        # # plot_sample_cov(
-        #     ds, "all", -1, vars_req=["v", "lon", "width"]
-        # )
 
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             if event == "twin":
@@ -3566,7 +4133,7 @@ def main():
                 tick_cadence=3,
                 fig_title=fig_title,
                 parNameLegend="CME initial time",
-                yTruth=t_initTruth,  # (was vTruth: the speed truth was drawn on the launch-time plot)
+                yTruth=t_initTruth,
                 runNo=runNo,
                 parUnits="",
                 n_obs=n_obs,
@@ -3631,7 +4198,7 @@ def main():
                 parNameLegend="CME Latitude",
                 obs_times=obs_times,
                 tick_cadence=3,
-                yTruth=latTruth,  # (was lonTruth)
+                yTruth=latTruth,
                 runNo=runNo,
                 parUnits=r"$^\circ$",
                 n_obs=n_obs,
@@ -3670,7 +4237,9 @@ def main():
             # Full elongation profiles of the ensemble at every observation (reruns the model for
             #  each distinct ensemble; the result is cached in elon_prof_obs.nc)
             if make_profiles_per_obs:
-                compute_elongation_profiles_per_obs(base_file_path=baseFilePath, runNo=runNo)
+                compute_elongation_profiles_per_obs(
+                    base_file_path=baseFilePath, runNo=runNo
+                )
                 plot_elongation_profiles_per_obs(
                     base_file_path=baseFilePath,
                     runNo=runNo,
@@ -3708,83 +4277,8 @@ def main():
                 craft=craft,
             )
 
-    # colours_for_plots = sns.color_palette(cc.glasbey, n_colors=nRuns)
-    # plot_par_values_over_mult_runs(
-    #     ds,
-    #     "obs_no",
-    #     "v",
-    #     vTruth,
-    #     "Observation number",
-    #     "CME speed",
-    #     parUnits="km/s"
-    # )
-    # plot_par_values_over_mult_runs(
-    #     ds,
-    #     "obs_no",
-    #     "width",
-    #     widthTruth,
-    #     "Observation number",
-    #     "CME Width",
-    #     parUnits=r"$^\circ$"
-    # )
-    # plot_par_values_over_mult_runs(
-    #     ds,
-    #     "obs_no",
-    #     "lon",
-    #     lonTruth,
-    #     "Observation number",
-    #     "CME Longitude",
-    #     parUnits=r"$^\circ$"
-    # )
-    #
-    # fig, axes = plt.subplots(figsize=(25, 17), nrows=2, ncols=3, layout="constrained")
-    # axes = axes.flatten()
-    # xNames = ["v", "v", "width", "v", "v", "width"]
-    # yNames = ["width", "lon", "lon", "width", "lon", "lon"]
-    #
-    # xTruth = [vTruth, vTruth, widthTruth, vTruth, vTruth, widthTruth]
-    # yTruth = [widthTruth, lonTruth, lonTruth, widthTruth, lonTruth, lonTruth]
-    #
-    # xLab = ["CME speed (km/s)", "CME speed (km/s)", "CME Width (deg)", "CME speed (km/s)","CME speed (km/s)", "CME width (deg)"]
-    # yLab = ["CME Width (deg)", "CME Longitude (deg)", "CME Longitude (deg)", "CME Width (deg)", "CME Longitude (deg)", "CME Longitude (deg)"]
-    #
-    # xMin = [400, 400, 25, 400, 400, 25]
-    # yMin = [25, -15, -15, 25, -15, -15]
-    #
-    # xMax = [650, 650, 50, 650, 650, 50]
-    # yMax = [50, 15, 15, 50, 15, 15]
-    #
-    # grid_size = 15
-    # """xMin = [380, 380, 24, 380, 380, 24]
-    # yMin = [24, -14, -14, 24, -14, -14]
-    #
-    # xMax = [630, 630, 52, 630, 630, 52]
-    # yMax = [52, 14, 14, 52, 14, 14]"""
-    #
-    # cbarMin = 0
-    # cbarMax = 200
-    #
-    # for i in range(6):
-    #     if i < 3:
-    #         im = plot_par_histograms_over_mult_runs(
-    #             ds, axes[i], xNames[i], yNames[i],
-    #             xTruth[i], yTruth[i], xLab[i], yLab[i], grid_size=grid_size,
-    #             plotPrior=True, cmap=cc.m_gouldian, cbarMin=cbarMin, cbarMax=cbarMax,
-    #             xMin=xMin[i], xMax=xMax[i], yMin=yMin[i], yMax=yMax[i]
-    #         )
-    #     else:
-    #         im = plot_par_histograms_over_mult_runs(
-    #             ds, axes[i], xNames[i], yNames[i],
-    #             xTruth[i], yTruth[i], xLab[i], yLab[i], grid_size=grid_size,
-    #             plotPrior=False, cmap=cc.m_gouldian, cbarMin=cbarMin, cbarMax=cbarMax,
-    #             xMin=xMin[i], xMax=xMax[i], yMin=yMin[i], yMax=yMax[i]
-    #         )
-    # cbar = fig.colorbar(im, ax=axes, orientation='vertical', fraction=.1)
-    # cbar.ax.tick_params(labelsize=24)
-    # cbar.set_label("Count", fontsize=30)
-    # plt.show()
-
     return None
+
 
 if __name__ == "__main__":
     main()

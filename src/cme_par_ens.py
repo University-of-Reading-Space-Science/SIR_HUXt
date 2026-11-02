@@ -2,6 +2,7 @@
 cme_par_ens.py
 A module that defines the classes required for non-standard type-hints
 """
+
 import datetime
 
 from typing import TypedDict
@@ -18,7 +19,9 @@ class CmeParEns(TypedDict):
     lon: list[Quantity[u.deg]] | Quantity[u.deg]
     lat: list[Quantity[u.deg]] | Quantity[u.deg]
     thick: list[Quantity[u.solRad]] | Quantity[u.solRad]
-    bias: list[float] | float  # observation-bias coefficient (deg), optional; see obs_bias.py
+    bias: (
+        list[float] | float
+    )  # observation-bias coefficient (deg), optional; see obs_bias.py
     v_transit: list[float] | float
     v_hit: list[float] | float
     likelihood: list[float] | float

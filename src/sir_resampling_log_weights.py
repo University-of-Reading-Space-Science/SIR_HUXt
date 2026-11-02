@@ -1,25 +1,24 @@
 import numpy as np
+import numpy.typing as npt
 import bisect
-from typing import Generator
 
 
-def jacobian_log(exponents: list[float]) -> float:
+def jacobian_log(exponents: list[float] | npt.NDArray[np.float64]) -> float:
     """
     Function to calculate the Jacobian logarithm of the exponents, given by the sum:
         Jacob_log = log( sum_{j=1}^{N}[exp{exponents_j}] )
     Used for normalising the log_weights.
     Computed with the numerically stable log-sum-exp trick (equivalent to the recursion in
-    Gentner (2008) Algorithm 1). NaN entries are ignored (previously a NaN in the first entry,
-    or two consecutive -inf entries, turned the whole result into NaN).
+    Gentner (2008) Algorithm 1). NaN entries are ignored.
     :return: Jacobian logarithm of exponents
     """
-    x = np.asarray(exponents, dtype=float).ravel()
+    x: npt.NDArray[np.float64] = np.asarray(exponents, dtype=float).ravel()
     x = x[~np.isnan(x)]
 
     if x.size == 0:
         return np.nan
 
-    x_max = np.max(x)
+    x_max: float = np.max(x)
     if not np.isfinite(x_max):
         # All -inf (=> log(0) = -inf) or at least one +inf (=> +inf)
         return float(x_max)
@@ -31,18 +30,14 @@ def jacobian_log(exponents: list[float]) -> float:
 
 class ResampleParsLogWeights:
     def __init__(
-            self,
-            log_weights: list[float],
-            n_ensemble: int = None,
-            rng: Generator = None
-    ):
-        self.log_weights: list[float] = log_weights
-
-        # Remove nan or infinite values from log_weights
-        # (previous condition `~np.isnan(x) or np.isfinite(x)` let +/-inf through)
+        self,
+        log_weights: list[float],
+        n_ensemble: int = None,
+        rng: np.random.Generator | None = None,
+    ) -> None:
+        # Replace NaN or infinite log-weights with a negligible weight
         self.log_weights: list[float] = [
-            float(x) if np.isfinite(x) else -1e31
-            for x in log_weights
+            float(x) if np.isfinite(x) else -1e31 for x in log_weights
         ]
 
         if n_ensemble is None:
@@ -53,10 +48,9 @@ class ResampleParsLogWeights:
             self.n_ensemble: int = n_ensemble
 
         if rng is None:
-            self.rng: Generator = np.random.default_rng()
+            self.rng: np.random.Generator = np.random.default_rng()
         else:
-            self.rng: Generator = rng
-
+            self.rng: np.random.Generator = rng
 
     def norm_log_weights(self) -> list[float]:
         """
@@ -65,7 +59,6 @@ class ResampleParsLogWeights:
         """
         log_norm_const: float = jacobian_log(self.log_weights)
         return [self.log_weights[i] - log_norm_const for i in range(self.n_ensemble)]
-
 
     def make_cdf_log_weights(self) -> list[float]:
         """
@@ -76,20 +69,19 @@ class ResampleParsLogWeights:
         normalised_weights: list[float] = self.norm_log_weights()
 
         cdf_weights: list[float] = [
-            jacobian_log(normalised_weights[:(i + 1)])# / np.sum(normalised_weights)
+            jacobian_log(normalised_weights[: (i + 1)])  # / np.sum(normalised_weights)
             for i in range(0, self.n_ensemble)
         ]
 
         # Round weights to nearest billionth to avoid machine precision errors
-        cdf_weights: list[float] = [
-            float(np.round(x, 9)) for x in cdf_weights
-        ]
+        cdf_weights: list[float] = [float(np.round(x, 9)) for x in cdf_weights]
 
         return cdf_weights
 
-
     # Systematic resampling routine for parameters
-    def systematic_resampling_log_weights(self, init_position: float = None):
+    def systematic_resampling_log_weights(
+        self, init_position: float = None
+    ) -> list[int]:
         """
         Function to systematically resample the particles based upon the weights of each particle
         :param init_position: Initial position for the resampling (to be specified for testing purposes)
@@ -102,16 +94,13 @@ class ResampleParsLogWeights:
         assert (init_position >= 0) and (init_position <= (1.0 / self.n_ensemble))
         # Calculate number of ensemble members required and initialise output
         #  variable to hold resampled particles indices
-        # resamp_ind = np.zeros(self.n_ensemble, dtype=int)
 
         # Define interval for particles to resample and round to nearest billionth to remove machine precision errors
         positions: list[float] = [
-            init_position + (k / self.n_ensemble)
-            for k in range(self.n_ensemble)
+            init_position + (k / self.n_ensemble) for k in range(self.n_ensemble)
         ]
         positions: list[float] = [
-            -np.inf if x == 0 else float(np.round(np.log(x), 9))
-            for x in positions
+            -np.inf if x == 0 else float(np.round(np.log(x), 9)) for x in positions
         ]
 
         # Calculate CDF all weights

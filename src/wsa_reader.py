@@ -11,7 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-class ReadWSAFiles():
+class ReadWSAFiles:
     def __init__(self, date_required, output_dir=None):
         self.base_url = (
             "https://iswa.ccmc.gsfc.nasa.gov/"
@@ -24,14 +24,13 @@ class ReadWSAFiles():
         self.wsa_url, self.wsa_url_prev_month = self.get_wsa_url()
 
         if output_dir is None:
-            self.output_dir="."
+            self.output_dir = "."
         else:
             self.output_dir = output_dir
 
         # Make output directory if it doesn't already exist
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-
 
     def get_wsa_url(self):
         year_req = self.date_required.year
@@ -41,7 +40,6 @@ class ReadWSAFiles():
         wsa_url = f"{self.base_url}/{year_req:04d}/{month_req:02d}"
 
         # Previous month, wrapping January back to December of the previous year
-        #  (previously gave e.g. ".../2012/00" for January)
         if month_req == 1:
             prev_year, prev_month = year_req - 1, 12
         else:
@@ -50,7 +48,6 @@ class ReadWSAFiles():
         print(f"wsa_url={wsa_url}")
 
         return wsa_url, wsa_url_prev_month
-
 
     def list_files(self, url=None):
         """
@@ -86,10 +83,7 @@ class ReadWSAFiles():
             if match is None:
                 continue
 
-            file_time = datetime.strptime(
-                match.group(1),
-                "%Y%m%d%H%M"
-            )
+            file_time = datetime.strptime(match.group(1), "%Y%m%d%H%M")
 
             files.append(
                 {
@@ -104,7 +98,6 @@ class ReadWSAFiles():
 
         return files
 
-
     def find_file(self):
         """
         Find file at or immediately before self.date_required.
@@ -112,26 +105,17 @@ class ReadWSAFiles():
 
         files = self.list_files()
 
-        candidates = [
-            f for f in files
-            if f["datetime"] <= self.date_required
-        ]
+        candidates = [f for f in files if f["datetime"] <= self.date_required]
 
         # Early in the month there may be no file yet, so look at the previous month
         if not candidates:
             files_prev = self.list_files(url=self.wsa_url_prev_month)
-            candidates = [
-                f for f in files_prev
-                if f["datetime"] <= self.date_required
-            ]
+            candidates = [f for f in files_prev if f["datetime"] <= self.date_required]
 
         if not candidates:
-            raise ValueError(
-                f"No file found before {self.date_required}"
-            )
+            raise ValueError(f"No file found before {self.date_required}")
 
         return candidates[-1]
-
 
     def download_file(self):
         """
@@ -145,9 +129,7 @@ class ReadWSAFiles():
             f"Timestamp: {file_info['datetime']}"
         )
 
-        output_path = (
-            Path(self.output_dir) / file_info["filename"]
-        )
+        output_path = Path(self.output_dir) / file_info["filename"]
 
         response = requests.get(
             file_info["url"],
@@ -157,9 +139,7 @@ class ReadWSAFiles():
         response.raise_for_status()
 
         with open(output_path, "wb") as f:
-            for chunk in response.iter_content(
-                chunk_size=1024 * 1024
-            ):
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
@@ -168,16 +148,11 @@ class ReadWSAFiles():
         return output_path
 
 
-if __name__ == "__main__":
-
-    requested_time = datetime(
-        2012, 9, 11, 6, 0
-    )
+def main():
+    requested_time = datetime(2012, 9, 11, 6, 0)
 
     parent_dir = Path(__file__).parent
-    output_dir = os.path.abspath(
-        os.path.join(parent_dir, "..", "WSA_fits_files")
-    )
+    output_dir = os.path.abspath(os.path.join(parent_dir, "..", "WSA_fits_files"))
     readWSAClass = ReadWSAFiles(requested_time, output_dir=output_dir)
     output_path = readWSAClass.download_file()
 
@@ -185,3 +160,9 @@ if __name__ == "__main__":
     vr = Sin.get_WSA_long_profile(output_path, lat=0.0 * u.deg)
     print(f"vr = {vr}")
     print(len(vr))
+
+    return None
+
+
+if __name__ == "__main__":
+    main()
