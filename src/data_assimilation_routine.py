@@ -34,6 +34,8 @@ from obs_bias import resolve_bias_settings
 from state_transform import (StateTransform, resolve_correlation_settings, filter_state_pars,
                              weighted_corr)
 from to_state_vector import ToStateVector
+from output_names import (bias_dir_name, true_bias_suffix, corr_dir_name, check_path_length,
+                          RUN_DIR_FILE_ALLOWANCE)
 import time
 from multiprocessing import Pool
 from typing import Generator
@@ -304,27 +306,20 @@ class RunDataAssimilationRoutine:
         )
         run_dir = f"run_{run_no:03d}"
 
-        # Separate folders for runs with an observation-bias term (and, in twins, the injected bias)
+        # Separate folders for runs with an observation-bias term (and, in twins, the injected bias).
+        #  Short names (output_names.py): Windows limits a full path to 259 characters, and netCDF
+        #  files in a longer path cannot be written ("PermissionError: [Errno 13]").
         if self.bias_settings["mode"] != "off":
-            bias_tag = (
-                f"obsbias_{self.bias_settings['mode']}_{self.bias_settings['predictor']['type']}"
-                f"_prior{self.bias_settings['prior_mean']:.2f}_{self.bias_settings['prior_sd']:.2f}"
+            bias_tag = bias_dir_name(
+                self.bias_settings["mode"], self.bias_settings["predictor"]["type"],
+                self.bias_settings["prior_mean"], self.bias_settings["prior_sd"],
             )
             prior_dir = os.path.join(bias_tag, prior_dir)
         # Separate folders for runs with correlation handling
         if self.correlation_settings["enabled"]:
-            cs = self.correlation_settings
-            corr_tag = (
-                f"corr_{cs['reparam']}"
-                f"{('_r' + format(cs['t_ref_rs'], 'g')) if cs['reparam'] == 'tref_logv' and cs['t_ref_rs'] is not None else ''}"
-                f"{'_white' if cs['whiten'] else ''}"
-                f"_a{cs['shrinkage_alpha']:.2f}_floor{cs['min_jitter_sd']:.3f}"
-            )
-            if cs["carry_from_prior"]:
-                corr_tag += "_carry-" + "-".join(cs["carry_from_prior"])
-            prior_dir = os.path.join(corr_tag, prior_dir)
+            prior_dir = os.path.join(corr_dir_name(self.correlation_settings), prior_dir)
         if self.use_synthetic_obs and float(self.true_cme_par_dict.get("bias", 0.0)) != 0.0:
-            obs_dir = f"{obs_dir}_truebias{float(self.true_cme_par_dict['bias']):.2f}"
+            obs_dir = f"{obs_dir}{true_bias_suffix(self.true_cme_par_dict['bias'])}"
 
         if self.bias_term_bool:
             bias_dir = os.path.join(
@@ -339,6 +334,10 @@ class RunDataAssimilationRoutine:
                 base_dir, model_dir, obs_dir, prior_dir,
                 f"{self.delta_aux_pf}", run_dir
             )
+        # Stop now, before any model runs, if the run's files could not be written; warn if the
+        #  analysis outputs that osse_ana.py writes into the run folder would be too long
+        check_path_length(os.path.join(output_dir, "ens_elongations.nc"), what="run output file")
+        check_path_length(output_dir, what="run folder", allowance=RUN_DIR_FILE_ALLOWANCE + 1, error=False)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 

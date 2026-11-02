@@ -129,7 +129,7 @@ class Setup:
 
 
     def get_ssw_event_craft(self):
-        ssw_event = "09A"
+        ssw_event = "13B"
 
         if ssw_event[0:3] != "ssw":
             if ssw_event[2] == "A":
@@ -1216,7 +1216,7 @@ class Setup:
 
 
     def initialise_da_parameters(self):
-        n_members: int = 20
+        n_members: int = 50
 
         run_start = -1
         n_runs: int = 1
@@ -1244,4 +1244,4 @@ class Setup:
             "correlation_settings": self.get_correlation_settings(),
         }
 
-        return da_par_dict
+        return da_par_dict

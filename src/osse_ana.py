@@ -19,6 +19,7 @@ import huxt.huxt as H
 import surf.surf as S
 import xarray as xr
 from sir_observations import Observations
+from output_names import read_path, write_path, check_path_length, path_too_long, resolve_output_path, MAX_PATH
 import scipy.stats as st
 
 import sunpy.coordinates.sun as sn
@@ -1500,6 +1501,197 @@ def weighted_quantiles(values, weights, quantiles):
     return q
 
 
+def plot_bias_evolution(
+        base_file_path,
+        runNo=-1,
+        fig_title=None,
+        craft=None,
+        band_quantiles=(0.05, 0.95),
+        save_fig=True,
+):
+    """
+    How the observation-bias coefficient beta (obs_bias.py) evolves through the assimilation window.
+
+    Reads <run dir>/cme_pars.nc (bias and log_weight of every member for the prior and after each
+    observation, and the bias settings in its attributes) and <run dir>/ens_elongations.nc
+    (observation times and elongations, which observations were assimilated and which caused
+    resampling, and the ESS of the updated weights). Panels:
+      (a) beta of every member (dot area ~ weight), weighted median and band, the prior mean +/- sd
+          and, in twin experiments, the injected bias;
+      (b) only for the "linear"/"quadratic" predictors: the correction beta * p(y) the bias makes at
+          each observed elongation y (deg), i.e. beta converted to elongation;
+      (c) weighted sd of beta relative to the prior sd, and the ESS (fraction of members) of the
+          updated weights at each observation.
+    Only the prior and the ensembles after assimilated observations are shown (an observation that
+    was not assimilated leaves the ensemble unchanged). Dotted vertical lines mark resampling steps.
+
+    :param base_file_path: Directory containing the run_<runNo> output folders
+    :param runNo: Run number
+    :param fig_title: Figure title
+    :param craft: Spacecraft whose observations were assimilated (for the file name)
+    :param band_quantiles: Weighted quantiles of the shaded band
+    :param save_fig: Save to <run dir>/bias_evolution[_<craft>_assim].png (else show)
+    :return: (fig, axes), or (None, None) if the run has no estimated bias term
+    """
+    import matplotlib.dates as mdates
+    from obs_bias import bias_predictor, bias_units
+
+    run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
+    par_file = os.path.join(run_dir, "cme_pars.nc")
+    elon_file = os.path.join(run_dir, "ens_elongations.nc")
+    for f in [par_file, elon_file]:
+        if not os.path.isfile(f):
+            print(f"plot_bias_evolution: {f} not found")
+            return None, None
+
+    with xr.load_dataset(par_file) as p_ds:
+        if "bias" not in p_ds:
+            print(f"plot_bias_evolution: {par_file} has no bias variable (run without a bias term)")
+            return None, None
+        beta_all = p_ds["bias"].values.astype(float)            # (n_obs + 1, n_ens): prior, after obs k
+        lw_all = p_ds["log_weight"].values.astype(float)
+        attrs = dict(p_ds.attrs)
+    with xr.load_dataset(elon_file) as e_ds:
+        obs_time = pd.to_datetime(e_ds["obs_time"].values)
+        obs = e_ds["observation"].values.astype(float)
+        assimilated = e_ds["assimilated"].values.astype(bool)
+        resampled = e_ds["resampled"].values.astype(bool) if "resampled" in e_ds else np.zeros_like(assimilated)
+        ess_upd = e_ds["ess_updated"].values.astype(float) if "ess_updated" in e_ds else np.full(len(obs), np.nan)
+
+    mode = str(attrs.get("bias_mode", "estimate"))
+    if mode != "estimate":
+        print(f"plot_bias_evolution: bias mode is '{mode}', so beta is not estimated; nothing to plot")
+        return None, None
+    predictor = str(attrs.get("bias_predictor", "constant"))
+    e_ref = attrs.get("bias_e_ref_deg", np.nan)
+    e_scale = attrs.get("bias_e_scale_deg", np.nan)
+    pred_kw = dict(predictor=predictor)
+    if predictor != "constant":
+        pred_kw.update(e_ref=float(e_ref), e_scale=float(e_scale))
+    units = bias_units(**pred_kw)
+    prior_mean = float(attrs.get("bias_prior_mean", np.nan))
+    prior_sd = float(attrs.get("bias_prior_sd", np.nan))
+    true_bias = float(attrs.get("true_bias", np.nan))
+
+    n_obs = min(len(obs_time), beta_all.shape[0] - 1)
+    n_ens = beta_all.shape[1]
+    k_assim = np.flatnonzero(assimilated[:n_obs])
+    if k_assim.size == 0:
+        print("plot_bias_evolution: no observation was assimilated")
+        return None, None
+
+    # Stages shown: prior (row 0), then the ensemble after each assimilated observation k (row k + 1),
+    #  the prior placed one observation spacing before the first assimilated observation
+    t_assim = obs_time[k_assim]
+    dt = (np.median(np.diff(t_assim.values)) if k_assim.size > 1 else np.timedelta64(1, "h"))
+    x_t = np.concatenate([[t_assim.values[0] - dt], t_assim.values])
+    rows = np.concatenate([[0], k_assim + 1])
+    beta = beta_all[rows, :]
+    lw = lw_all[rows, :]
+    w = np.exp(lw - np.nanmax(np.where(np.isfinite(lw), lw, -np.inf), axis=1, keepdims=True))
+    w = np.where(np.isfinite(w), w, 0.0)
+    w = w / np.sum(w, axis=1, keepdims=True)
+
+    q = np.array([weighted_quantiles(beta[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]])
+                  for i in range(len(rows))])
+    mean = np.sum(w * beta, axis=1)
+    sd = np.sqrt(np.sum(w * (beta - mean[:, None]) ** 2, axis=1))
+
+    show_corr = predictor != "constant"
+    n_panels = 3 if show_corr else 2
+    fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3.4 * n_panels + 1.0), sharex=True,
+                             layout="constrained", height_ratios=[1.3] + [1.0] * (n_panels - 1))
+    col_ens, col_med, col_prior, col_true = "#2a78d6", "#1f2430", "#9ca3af", "#c2410c"
+
+    def decorate(ax):
+        ax.axvspan(t_assim.values[0], t_assim.values[-1], color="#f3f5f8", zorder=0)
+        for k in k_assim[resampled[k_assim]]:
+            ax.axvline(obs_time.values[k], color="0.55", lw=0.8, ls=":", zorder=1)
+        ax.grid(True, color="#e5e7eb", lw=0.6)
+        ax.set_axisbelow(True)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+
+    # (a) beta
+    ax = axes[0]
+    decorate(ax)
+    if np.isfinite(prior_mean) and np.isfinite(prior_sd):
+        ax.axhspan(prior_mean - prior_sd, prior_mean + prior_sd, color=col_prior, alpha=0.18, lw=0,
+                   label=f"prior mean ± sd ({prior_mean:g} ± {prior_sd:g})")
+        ax.axhline(prior_mean, color=col_prior, lw=1.0)
+    for i in range(len(rows)):
+        ax.scatter(np.repeat(x_t[i], n_ens), beta[i], s=8 + 220 * w[i], color=col_ens, alpha=0.35,
+                   lw=0, label="members (area ∝ weight)" if i == 0 else None)
+    ax.fill_between(x_t, q[:, 0], q[:, 2], color=col_ens, alpha=0.15, lw=0,
+                    label=f"weighted {int(band_quantiles[0] * 100)}–{int(band_quantiles[1] * 100)}% band")
+    ax.plot(x_t, q[:, 1], color=col_med, lw=2, marker="o", ms=3.5, label="weighted median")
+    if np.isfinite(true_bias):
+        ax.axhline(true_bias, color=col_true, lw=1.6, ls="--", label=f"injected bias ({true_bias:g})")
+    ax.axhline(0, color="0.3", lw=0.6)
+    ax.set_ylabel(f"β ({units})", fontsize=12)
+    ax.set_title(f"(a) Bias coefficient β, {predictor} predictor", loc="left", fontsize=12)
+    ax.legend(fontsize=9, frameon=False, loc="best", ncol=2)
+    ax.annotate("prior", (x_t[0], q[0, 1]), xytext=(0, 10), textcoords="offset points", ha="center",
+                fontsize=9, color="0.35")
+
+    # (b) correction at each observed elongation
+    if show_corr:
+        ax = axes[1]
+        decorate(ax)
+        y_at = np.concatenate([[obs[k_assim[0]]], obs[k_assim]])   # prior: at the first observation
+        p_at = bias_predictor(y_at, **pred_kw)
+        corr = beta * p_at[:, None]
+        qc = np.array([weighted_quantiles(corr[i], w[i], [band_quantiles[0], 0.5, band_quantiles[1]])
+                       for i in range(len(rows))])
+        ax.fill_between(x_t, qc[:, 0], qc[:, 2], color=col_ens, alpha=0.15, lw=0, label="weighted band")
+        ax.plot(x_t, qc[:, 1], color=col_med, lw=2, marker="o", ms=3.5, label="weighted median")
+        if np.isfinite(prior_mean) and np.isfinite(prior_sd):
+            ax.fill_between(x_t, (prior_mean - prior_sd) * p_at, (prior_mean + prior_sd) * p_at,
+                            color=col_prior, alpha=0.18, lw=0, label="prior mean ± sd")
+        if np.isfinite(true_bias):
+            ax.plot(x_t, true_bias * p_at, color=col_true, lw=1.6, ls="--", label="injected bias")
+        ax.axhline(0, color="0.3", lw=0.6)
+        ax.set_ylabel("β·p(y) (deg)", fontsize=12)
+        ax.set_title("(b) Correction the bias term makes at each observed elongation y", loc="left", fontsize=12)
+        ax.legend(fontsize=9, frameon=False, loc="best")
+
+    # (c) spread and ESS
+    ax = axes[-1]
+    decorate(ax)
+    if np.isfinite(prior_sd) and prior_sd > 0:
+        ax.plot(x_t, sd / prior_sd, color=col_med, lw=2, marker="o", ms=3.5, label="weighted sd of β / prior sd")
+        ax.axhline(1, color=col_prior, lw=1.0)
+        ax.set_ylabel("sd / prior sd", fontsize=12)
+    else:
+        ax.plot(x_t, sd, color=col_med, lw=2, marker="o", ms=3.5, label="weighted sd of β")
+        ax.set_ylabel(f"sd ({units})", fontsize=12)
+    ax.set_ylim(bottom=0)
+    ax2 = ax.twinx()
+    ax2.plot(t_assim.values, ess_upd[k_assim] / n_ens, color="#eb6834", lw=1.4, marker="s", ms=3,
+             label="ESS / N of the updated weights")
+    ax2.set_ylim(0, 1.05)
+    ax2.set_ylabel("ESS / N", color="#eb6834", fontsize=12)
+    ax2.spines["top"].set_visible(False)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.plot([], [], color="0.55", lw=0.8, ls=":", label="resampling step")
+    h1, l1 = ax.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=9, frameon=False, loc="lower left")
+    ax.set_title(f"({'c' if show_corr else 'b'}) Spread of β and effective sample size", loc="left", fontsize=12)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
+    ax.set_xlabel("Observation time (UT); shaded: assimilation window", fontsize=12)
+
+    fig.suptitle(fig_title if fig_title else f"Observation-bias term, run {runNo}", fontsize=15)
+    if save_fig:
+        name = "bias_evolution" + (f"_{craft}_assim" if craft is not None else "")
+        out_path = safe_savefig(fig, os.path.join(run_dir, name + ".png"), dpi=150)
+        print(f"Saved bias evolution plot to {out_path}")
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig, axes
+
+
 def plot_full_elongation_profiles(
         base_file_path,
         runNo=0,
@@ -1752,7 +1944,7 @@ def compute_elongation_profiles_per_obs(
     filter only updated the weights, or one that was not assimilated) is not rerun: its profiles are
     copied, and only its weights differ.
 
-    Output: <run dir>/ens_elongation_profiles_per_obs.nc with
+    Output: <run dir>/elon_prof_obs.nc (formerly ens_elongation_profiles_per_obs.nc, which is still read) with
         elon_profile (n_stage, n_ens, n_profile): elongation (deg), NaN where not visible/not computed
         extrapolated (n_stage, n_ens, n_profile): 1 where extrapolated before the first tracked point
         log_weight (n_stage, n_ens): normalised log-weight of each member at that stage
@@ -1774,10 +1966,14 @@ def compute_elongation_profiles_per_obs(
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     par_file = os.path.join(run_dir, "cme_pars.nc")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
-    out_file = os.path.join(run_dir, "ens_elongation_profiles_per_obs.nc")
-    if os.path.isfile(out_file) and not overwrite:
-        print(f"compute_elongation_profiles_per_obs: using existing {out_file}")
-        return out_file
+    # Short file name (output_names.py); a file under the old name, ens_elongation_profiles_per_obs.nc, is reused
+    existing_file = read_path(run_dir, "profiles_per_obs")
+    if os.path.isfile(existing_file) and not overwrite:
+        print(f"compute_elongation_profiles_per_obs: using existing {existing_file}")
+        return existing_file
+    out_file = write_path(run_dir, "profiles_per_obs")
+    # Check now, before the model runs, that the result can be written (Windows path limit)
+    check_path_length(out_file, what="per-observation elongation profile file")
     for f in [par_file, elon_file]:
         if not os.path.isfile(f):
             print(f"compute_elongation_profiles_per_obs: {f} not found")
@@ -1928,9 +2124,9 @@ def plot_elongation_profiles_per_obs(
     """
     Plot, for the prior and for the ensemble after each observation, every member's full elongation
     profile with the weighted median and band, against the observations. One figure per stage, saved in
-    <run dir>/elongation_profiles_per_obs/. Observations already assimilated at that stage are filled,
+    <run dir>/prof_obs/ (formerly elongation_profiles_per_obs/). Observations already assimilated at that stage are filled,
     later ones hollow, and the observation just assimilated is circled and marked with a vertical line.
-    Reads ens_elongation_profiles_per_obs.nc (see compute_elongation_profiles_per_obs).
+    Reads elon_prof_obs.nc, or ens_elongation_profiles_per_obs.nc from older runs (see compute_elongation_profiles_per_obs).
 
     :param base_file_path: Directory containing the run_<runNo> output folders
     :param runNo: Run number
@@ -1948,7 +2144,7 @@ def plot_elongation_profiles_per_obs(
     import matplotlib.dates as mdates
 
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
-    prof_file = os.path.join(run_dir, "ens_elongation_profiles_per_obs.nc")
+    prof_file = read_path(run_dir, "profiles_per_obs")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
     if not (os.path.isfile(prof_file) and os.path.isfile(elon_file)):
         print(f"plot_elongation_profiles_per_obs: {prof_file} or {elon_file} not found "
@@ -1988,7 +2184,8 @@ def plot_elongation_profiles_per_obs(
     pad_e = (obs_sd or 0.0) + 0.05 * max(np.ptp(all_vals) if all_vals.size else 1.0, 1.0)
     y_lim = (max(0.0, np.min(all_vals) - pad_e), np.max(all_vals) + pad_e) if all_vals.size else (0, 35)
 
-    out_dir = os.path.join(run_dir, "elongation_profiles_per_obs")
+    out_dir = write_path(run_dir, "profiles_per_obs_dir")
+    check_path_length(out_dir, what="per-observation profile plot folder", allowance=32, error=False)
     os.makedirs(out_dir, exist_ok=True)
     saved = []
     for st in np.flatnonzero(computed):
@@ -2142,7 +2339,7 @@ def compute_arrival_times_per_obs(
     An ensemble whose particles are identical to one already computed (only its weights differ, e.g. an
     observation where the filter did not resample) reuses those arrival times.
 
-    Output: <run dir>/cme_arrival_per_obs.nc with
+    Output: <run dir>/arr_obs.nc (formerly cme_arrival_per_obs.nc, which is still read) with
         arrival_time (n_stage, n_ens): arrival time (NaT if the CME does not arrive within the run)
         arrival_speed (n_stage, n_ens): arrival speed (km/s)
         log_weight (n_stage, n_ens): normalised log-weight of each member at that stage
@@ -2162,10 +2359,14 @@ def compute_arrival_times_per_obs(
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     par_file = os.path.join(run_dir, "cme_pars.nc")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
-    out_file = os.path.join(run_dir, "cme_arrival_per_obs.nc")
-    if os.path.isfile(out_file) and not overwrite:
-        print(f"compute_arrival_times_per_obs: using existing {out_file}")
-        return out_file
+    # Short file name (output_names.py); a file under the old name, cme_arrival_per_obs.nc, is reused
+    existing_file = read_path(run_dir, "arrivals_per_obs")
+    if os.path.isfile(existing_file) and not overwrite:
+        print(f"compute_arrival_times_per_obs: using existing {existing_file}")
+        return existing_file
+    out_file = write_path(run_dir, "arrivals_per_obs")
+    # Check now, before the model runs, that the result can be written (Windows path limit)
+    check_path_length(out_file, what="per-observation arrival-time file")
     if not os.path.isfile(par_file):
         print(f"compute_arrival_times_per_obs: {par_file} not found")
         return None
@@ -2291,7 +2492,7 @@ def plot_arrival_time_histograms_per_obs(
 ):
     """
     Collate the weighted arrival-time distributions of the ensemble at every observation (from
-    cme_arrival_per_obs.nc, see compute_arrival_times_per_obs) into one figure:
+    arr_obs.nc, see compute_arrival_times_per_obs) into one figure:
       - top: weighted histograms (probability per bin) of the prior (grey), the final ensemble (orange)
         and up to n_overlay intermediate stages (lines shaded from light to dark with observation number);
       - bottom: the full histogram at every stage as a heat map (stage on x, arrival time on y), with
@@ -2312,7 +2513,7 @@ def plot_arrival_time_histograms_per_obs(
     import matplotlib.dates as mdates
 
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
-    in_file = os.path.join(run_dir, "cme_arrival_per_obs.nc")
+    in_file = read_path(run_dir, "arrivals_per_obs")
     if not os.path.isfile(in_file):
         print(f"plot_arrival_time_histograms_per_obs: {in_file} not found "
               f"(run compute_arrival_times_per_obs first)")
@@ -2435,8 +2636,8 @@ def plot_arrival_time_histograms_per_obs(
 
     fig.suptitle(fig_title if fig_title else f"CME arrival times, run {runNo}", fontsize=16)
     if save_fig:
-        name = "arrival_time_histograms_per_obs" + (f"_{craft}_assim" if craft is not None else "")
-        out_path = os.path.join(run_dir, name + ".png")
+        name = write_path(run_dir, "arrival_hist_per_obs") + (f"_{craft}_assim" if craft is not None else "")
+        out_path = name + ".png"
         out_path = safe_savefig(fig, out_path, dpi=150)
         print(f"Saved arrival-time histograms to {out_path}")
         plt.close(fig)
@@ -2841,7 +3042,7 @@ def main():
     #     "truth_495.0_37.4_0.0_0.0_0.0", "prior_470_37.0_-4_0_0","0.98",
     # )
     # event_list = ["ssw_008"]#, "ssw_009", "ssw_012"]#["ssw_007", "ssw_008", "ssw_009", "ssw_012"]
-    event_list = ["09A"]
+    event_list = ["13B"]
     craft_list = ["sta"]#, "stb"]
     img_list = ["diff"] # ["norm", "diff"]
     par_type = "donki"
@@ -2852,12 +3053,15 @@ def main():
     # Compute every member's CME arrival time for the ensemble at every observation and plot the
     #  distributions as histograms. The model runs for arrival_sim_time_days from its start time; CMEs
     #  arriving later count as misses (4 days covers arrivals up to ~4 days after the model start).
-    make_arrivals_per_obs = False
+    make_arrivals_per_obs = True
     arrival_sim_time_days = 4.0
     # Rank (Talagrand) histograms of the observations within the forecast ensemble
     make_rank_histograms = True
+    # Evolution of the observation-bias coefficient through the assimilation window (runs with an
+    #  estimated bias term only)
+    make_bias_plot = True
     bias_folder_name = "bias5_2.5_bias21_2.5"
-    n_ens = 20
+    n_ens = 50
 
     all_comb_list = [
         (x, y, z) for x in event_list for y in craft_list for z in img_list
@@ -3054,7 +3258,7 @@ def main():
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2010, 4, 11, 13, 4, 0)
@@ -3080,14 +3284,14 @@ def main():
             obs_file_name = "CME_03A__20211101__PA268_good_hi2.dat"
             obs_file_path = os.path.join(obs_dir, obs_file_name)
             prior_dir = "prior_1188.0_102.0_5.0_18.0_0.0"
-            obs_dir_name = "obs_stb_03A_diff"
+            obs_dir_name = "obs_sta_03A_diff"
 
             obs_class = Observations(
                 use_model=use_model,
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2021, 11, 3, 19, 49, 0)
@@ -3104,7 +3308,7 @@ def main():
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
 
             cme_hit_object = "EARTH"
             real_arrival_time = datetime.datetime(2010, 5, 28, 2, 58, 0)
@@ -3148,14 +3352,14 @@ def main():
             obs_file_name = "CME_10A__20201206__PA266_good_hi2.dat"
             obs_file_path = os.path.join(obs_dir, obs_file_name)
             prior_dir = "prior_1436.0_82.0_8.0_-18.0_0.0"
-            obs_dir_name = "obs_stb_10A_diff"
+            obs_dir_name = "obs_sta_10A_diff"
 
             obs_class = Observations(
                 use_model=use_model,
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2020, 12, 10, 2, 10, 0)
@@ -3172,7 +3376,7 @@ def main():
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2011, 5, 28, 0, 14, 0)
@@ -3189,7 +3393,7 @@ def main():
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2011, 7, 14, 12, 0, 0)
@@ -3206,7 +3410,7 @@ def main():
                 use_synthetic_obs=False,
                 obs_filenames=obs_file_path,
             )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
+            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
             cme_hit_object = "EARTH"
 
             real_arrival_time = datetime.datetime(2011, 11, 1, 8, 9, 0)
@@ -3236,22 +3440,23 @@ def main():
         )"""
         baseFilePath = os.path.join(
             "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
-            "compress_huxt", "test3", "WSA_v", f"ens_{n_ens}", "mo_cone",
+            "comp_surf", "bias_cl3_on_const_WSA_v", f"ens_{n_ens}", "mo_cone",
             f"model_{use_model.upper()}",
-            obs_dir_name, # "New folder",
+            obs_dir_name, "ob_est_lin_0.00_2.00",# "New folder",
             prior_dir, "0.98",
         )
-        """
-        baseFilePath = os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output",
-            "compress_huxt", "dares", "SURF_parallel", f"ens_{n_ens}", "uncorr", f"model_{use_model.upper()}",
-            truth_dir, prior_dir, "0.98",
-        )"""
-        """baseFilePath = os.path.join(
-            "C:\\", "Users", "ss905122", "PycharmProjects", "SIR_HUXt", "output3",
-            "WSA_v", f"ens_{n_ens}", "mo_cone", obs_dir_name,  # "New folder",
-            prior_dir, "0.98",
-        )"""
+        # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
+        #  by runs since 31 Oct 2026) or the long name of older runs (obsbias_estimate_constant_prior0.00_2.00):
+        #  whichever exists is used. Leave it out for runs without a bias term.
+        baseFilePath = resolve_output_path(baseFilePath)
+        print(f"baseFilePath = {baseFilePath}")
+        if not os.path.isdir(baseFilePath):
+            sys.exit(f"baseFilePath not found: {baseFilePath}")
+        # Warn if files written into the run folders would exceed the Windows path limit
+        if path_too_long(os.path.join(baseFilePath, f"run_{start_run:03d}"), allowance=46):
+            print(f"Warning: the run folders under {baseFilePath} leave fewer than 46 characters for file "
+                  f"names before the Windows path limit ({MAX_PATH}); some figures or netCDF files may not "
+                  f"be saved. Shorten the folder names (e.g. the bias folder to its ob_... name) or OUT_BASE_DIR.")
 
         # Read in all nc files and concatenate them into a single xarray object
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
@@ -3434,6 +3639,15 @@ def main():
                 craft=craft,
             )
 
+            # Observation-bias coefficient through the assimilation window
+            if make_bias_plot:
+                plot_bias_evolution(
+                    base_file_path=baseFilePath,
+                    runNo=runNo,
+                    fig_title=fig_title,
+                    craft=craft,
+                )
+
             # Prior/posterior ensemble elongation profiles against the observations
             #  (obs_sd = sqrt(obs_cov); obs_cov = [0.5] deg^2 in da_surf_setup)
             plot_elongation_profiles(
@@ -3454,7 +3668,7 @@ def main():
             )
 
             # Full elongation profiles of the ensemble at every observation (reruns the model for
-            #  each distinct ensemble; the result is cached in ens_elongation_profiles_per_obs.nc)
+            #  each distinct ensemble; the result is cached in elon_prof_obs.nc)
             if make_profiles_per_obs:
                 compute_elongation_profiles_per_obs(base_file_path=baseFilePath, runNo=runNo)
                 plot_elongation_profiles_per_obs(
@@ -3466,7 +3680,7 @@ def main():
                 )
 
             # CME arrival times of the ensemble at every observation, collated into histograms
-            #  (one ensemble of model runs per distinct ensemble; cached in cme_arrival_per_obs.nc)
+            #  (one ensemble of model runs per distinct ensemble; cached in arr_obs.nc)
             if make_arrivals_per_obs:
                 compute_arrival_times_per_obs(
                     base_file_path=baseFilePath,
