@@ -40,6 +40,8 @@ class Observations:
         vr_longs: Quantity[u.deg] = np.nan * u.deg,
         vr_lats: Quantity[u.deg] = np.nan * u.deg,
         n_lat_surf: int = 45,
+        lat_min: Quantity[u.deg] = np.nan * u.deg,
+        lat_max: Quantity[u.deg] = np.nan * u.deg,
         lon_start: Quantity[u.deg] = None,
         lon_stop: Quantity[u.deg] = None,
         sim_time: Quantity[u.day] = None,
@@ -107,6 +109,8 @@ class Observations:
         self.vr_longs: Quantity[u.deg] = vr_longs
         self.vr_lats: Quantity[u.deg] = vr_lats
         self.n_lat_surf: int = n_lat_surf
+        self.lat_min: Quantity[u.deg] = lat_min
+        self.lat_max: Quantity[u.deg] = lat_max
         self.obs_op_settings: ObsOpSettings | None = obs_op_settings
         self.worker_pool: WorkerPool | None = worker_pool
 
@@ -257,6 +261,8 @@ class Observations:
             vr_longs=self.vr_longs,
             vr_lats=self.vr_lats,
             n_lat_surf=self.n_lat_surf,
+            lat_min=self.lat_min,
+            lat_max=self.lat_max,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
             sim_time=self.sim_time,
@@ -275,6 +281,11 @@ class Observations:
 
         # obs_cov is an error (co)variance, so the noise standard deviation is sqrt(obs_cov)
         obs_sd: float = np.sqrt(np.ravel(np.asarray(self.obs_cov, dtype=float))[0])
+        # Noise-free truth elongations and the noise sd, so twin runs can draw new noise per run
+        self.unperturbed_observations: list[float] = [
+            float(x) for x in unpert_obs[0, :]
+        ]
+        self.obs_noise_sd: float = float(obs_sd)
         synth_obs: list[float] = [
             uo + self.rng.normal(loc=0, scale=obs_sd) for uo in unpert_obs[0, :]
         ]

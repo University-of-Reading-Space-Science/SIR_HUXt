@@ -1,7 +1,9 @@
 import numpy as np
 import numpy.typing as npt
 import datetime
+import filecmp
 import os
+import shutil
 import sys
 
 import pandas as pd
@@ -23,8 +25,9 @@ from cme_par_ens import CmeParEns
 from dataclasses import replace
 from typing import Any
 
-from da_surf_setup import Setup, load_environment
+from da_surf_setup import Setup, load_environment, events_file
 from aux_pf import PFSettings
+from model_run_reuse import ElongationStore
 from sir_observation_operator import ObservationOperator, ObsOpSettings, WorkerPool
 from obs_bias import resolve_bias_settings
 from state_transform import (
@@ -37,6 +40,7 @@ from to_state_vector import ToStateVector
 from output_names import (
     bias_dir_name,
     true_bias_suffix,
+    twin_sampling_dir_name,
     corr_dir_name,
     check_path_length,
     PathLimits,
@@ -87,6 +91,9 @@ class RunDataAssimilationRoutine:
         self.lon_start: Quantity[u.deg] = surf_par_dict["lon_start"]
         self.lon_stop: Quantity[u.deg] = surf_par_dict["lon_stop"]
         self.n_lat_surf: int = surf_par_dict["n_lat_surf"]
+        # Latitude range of the SURF3d grid (NaN: set from the observing craft's field of view)
+        self.lat_min: Quantity[u.deg] = surf_par_dict["latitude_min"]
+        self.lat_max: Quantity[u.deg] = surf_par_dict["latitude_max"]
         self.sim_time: Quantity[u.days] = surf_par_dict["sim_time"]
         self.dt_scale: int | float = surf_par_dict["dt_scale"]
         self.r_min: Quantity[u.solRad] = surf_par_dict["r_min"]
@@ -127,17 +134,24 @@ class RunDataAssimilationRoutine:
         self.ssw_event: str = obs_par_dict["ssw_event"]
         self.craft: str = obs_par_dict["craft"]
         self.img: str = obs_par_dict["img"]
-        self.bias_term_bool: bool = obs_par_dict["bias_term_bool"]
-        self.bias_term_5rs: float = obs_par_dict["bias_term_5rs"]
-        self.bias_term_21rs: float = obs_par_dict["bias_term_21rs"]
         self.use_parallel: bool = obs_par_dict["use_parallel"]
-
-        # Ensure all bias terms exist, if not, set bias_term_bool to False
-        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
-            self.bias_term_bool = False
 
         # If we're using synthetic observations/ running OSSEs define true_cme_par_dict
         self.true_cme_par_dict: CmeParEns = self.setup_class.true_cme_par_dict
+
+        # Twin experiments with several runs (Setup.get_twin_run_sampling, from events.yaml): each
+        #  run's first guess drawn from the prior around the truth, and/or new observation noise per
+        #  run. Both False for real observations
+        twin_sampling: dict[str, bool] = self.setup_class.get_twin_run_sampling()
+        self.sample_first_guess: bool = bool(twin_sampling["sample_first_guess"])
+        self.new_obs_noise_per_run: bool = bool(twin_sampling["new_obs_noise_per_run"])
+        # Whether this run's first guess is perturbed (False for negative run numbers)
+        self.perturb_first_guess: bool = True
+        # This run's first guess (set by make_cme_par_dict)
+        self.run_first_guess: dict[str, Any] = {}
+        # Noise-free synthetic observations and the noise sd (set by get_observations)
+        self.unperturbed_observations: list[float] = []
+        self.obs_noise_sd: float = 0.0
 
         if self.use_synthetic_obs:
             # Generate observations
@@ -296,7 +310,7 @@ class RunDataAssimilationRoutine:
         :return: out_dir: Output directory
         """
         base_dir: str = os.path.join(
-            os.getenv("OUT_BASE_DIR"), f"ens_{self.n_members}", self.cme_cov_type
+            os.getenv("OUT_BASE_DIR"), f"ens_{self.n_members}_{self.cme_cov_type}"
         )
         model_dir: str = f"model_{self.use_model.upper()}"
 
@@ -317,6 +331,21 @@ class RunDataAssimilationRoutine:
         )
         run_dir: str = f"run_{run_no:03d}"
 
+        # Separate folders for twin runs that sample the first guess and/or the observation noise
+        sampling_tag: str = (
+            twin_sampling_dir_name(self.sample_first_guess, self.new_obs_noise_per_run)
+            if self.use_synthetic_obs
+            else ""
+        )
+        if sampling_tag:
+            prior_dir = f"{sampling_tag}_{prior_dir}"
+        # Separate folders for runs whose first-stage weights use the current particles
+        #  (PFSettings.first_stage = "current"; the results differ from the usual shrunk particles).
+        #  Reusing model runs (with reuse_observer_tol_deg = 0) does not change the results, so
+        #  needs no folder of its own.
+        if self.pf_settings.first_stage != "shrunk":
+            prior_dir = f"fsc_{prior_dir}"
+
         # Separate folders for runs with an observation-bias term (and, in twins, the injected bias).
         #  Short names (output_names.py): Windows limits a full path to 259 characters, and netCDF
         #  files in a longer path cannot be written ("PermissionError: [Errno 13]").
@@ -327,7 +356,7 @@ class RunDataAssimilationRoutine:
                 self.bias_settings["prior_mean"],
                 self.bias_settings["prior_sd"],
             )
-            prior_dir = os.path.join(bias_tag, prior_dir)
+            prior_dir = f"{bias_tag}_{prior_dir}"
         # Separate folders for runs with correlation handling
         if self.correlation_settings["enabled"]:
             prior_dir = os.path.join(
@@ -339,24 +368,13 @@ class RunDataAssimilationRoutine:
         ):
             obs_dir = f"{obs_dir}{true_bias_suffix(self.true_cme_par_dict['bias'])}"
 
-        if self.bias_term_bool:
-            bias_dir: str = os.path.join(
-                "bias_correction",
-                f"bias5_{self.bias_term_5rs}_bias21_{self.bias_term_21rs}",
-            )
-            output_dir: str = os.path.join(
-                base_dir,
-                model_dir,
-                bias_dir,
-                obs_dir,
-                prior_dir,
-                f"{self.delta_aux_pf}",
-                run_dir,
-            )
-        else:
-            output_dir = os.path.join(
-                base_dir, model_dir, obs_dir, prior_dir, f"{self.delta_aux_pf}", run_dir
-            )
+        output_dir: str = os.path.join(
+            base_dir,
+            model_dir,
+            obs_dir,
+            f"{prior_dir}_{self.delta_aux_pf}",
+            run_dir,
+        )
         # Stop now, before any model runs, if the run's files could not be written; warn if the
         #  analysis outputs that osse_ana.py writes into the run folder would be too long
         check_path_length(
@@ -370,8 +388,36 @@ class RunDataAssimilationRoutine:
         )
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+        self.copy_events_file(output_dir)
 
         return output_dir
+
+    @staticmethod
+    def copy_events_file(output_dir: str) -> None:
+        """
+        Copy events.yaml (truth and first guesses, latitude range, model start, ... of the events and
+        twin experiments) into the experiment folder, the folder above run_NNN, so osse_ana.py can
+        read the parameters a run was made with. If the folder already has a copy that differs
+        (events.yaml was edited between runs of the experiment), that copy is kept and this run's is
+        written as events_run_NNN.yaml
+        :param output_dir: The run folder (.../run_NNN)
+        """
+        experiment_dir: str = os.path.dirname(os.path.normpath(output_dir))
+        source: str = str(events_file())
+        target: str = os.path.join(experiment_dir, "events.yaml")
+        if os.path.isfile(target) and not filecmp.cmp(source, target, shallow=False):
+            target = os.path.join(
+                experiment_dir,
+                f"events_{os.path.basename(os.path.normpath(output_dir))}.yaml",
+            )
+            print(
+                f"events.yaml differs from the copy already in {experiment_dir}; this run's copy is"
+                f" saved as {os.path.basename(target)}"
+            )
+        try:
+            shutil.copyfile(source, target)
+        except OSError as err:
+            print(f"Warning: could not copy events.yaml to {target} ({err})")
 
     def obs_in_elong_range(
         self, obs_val: float, inclusive_lower: bool = True, inclusive_upper: bool = True
@@ -424,6 +470,8 @@ class RunDataAssimilationRoutine:
             vr_longs=self.vr_longs,
             vr_lats=self.vr_lats,
             n_lat_surf=self.n_lat_surf,
+            lat_min=self.lat_min,
+            lat_max=self.lat_max,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
             sim_time=self.sim_time,
@@ -445,6 +493,8 @@ class RunDataAssimilationRoutine:
         # Get observations and update obs_times, n_obs and obs_lon if necessary
         if self.use_synthetic_obs:
             obs_out: list[float] = obs_class.observations
+            self.unperturbed_observations = list(obs_class.unperturbed_observations)
+            self.obs_noise_sd = float(obs_class.obs_noise_sd)
             return obs_out
         else:
             obs: list[float] = obs_class.observations
@@ -463,20 +513,55 @@ class RunDataAssimilationRoutine:
 
     def initialise_mean_cme_pars(self, rng: np.random.Generator) -> dict[str, Any]:
         #######################################################################
-        if self.setup_class.get_use_synthetic_obs():
+        if self.setup_class.get_use_synthetic_obs() and self.sample_first_guess:
+            # Twin runs that sample their first guess: one draw from the prior around the twin's
+            #  first guess, which is the truth (Setup.get_twin_run_sampling); negative run numbers
+            #  start from the truth itself
+            fg_array: list[float] = [
+                (self.fg_mean_cme_t_init - self.surf_init_time).total_seconds(),
+                self.fg_mean_cme_speed,
+                self.fg_mean_cme_width,
+                self.fg_mean_cme_lon,
+                self.fg_mean_cme_lat,
+                self.fg_mean_cme_thick,
+            ]
+            if self.perturb_first_guess:
+                truth_speed: float = float(fg_array[1])
+                fg_array = [
+                    float(x)
+                    for x in self.sample_prior(fg_array, n_ens=1, rng=rng)[:, 0]
+                ]
+                if self.cme_cov_type == "uncorr":
+                    # The uncorr prior of the speed is uniform within (1 +- sd) x the first guess, not
+                    #  symmetric about it: draw the first guess so that the truth is a uniform draw
+                    #  from the prior around it, v_true = (1 - sd + 2 sd u) v_fg with u uniform in
+                    #  [0, 1] (else the truth can lie outside the run's prior)
+                    sd_v: float = float(self.prior_sd_speed)
+                    fg_array[1] = truth_speed / (
+                        1.0 - sd_v + 2.0 * sd_v * float(rng.uniform(0.0, 1.0))
+                    )
+            mean_cme_t_init: datetime.datetime = (
+                self.surf_init_time + datetime.timedelta(seconds=float(fg_array[0]))
+            )
+            mean_cme_speed: float = float(fg_array[1])
+            mean_cme_width: float = float(fg_array[2])
+            mean_cme_lon: float = float(fg_array[3])
+            mean_cme_lat: float = float(fg_array[4])
+            mean_cme_thick: float = float(fg_array[5])
+        elif self.setup_class.get_use_synthetic_obs():
             # Initialise CME parameters
-            mean_cme_t_init: datetime.datetime = self.fg_mean_cme_t_init
-            mean_cme_speed: float = self.fg_mean_cme_speed + (
+            mean_cme_t_init = self.fg_mean_cme_t_init
+            mean_cme_speed = self.fg_mean_cme_speed + (
                 self.fg_sd_cme_speed * rng.uniform(low=-1, high=1)
             )
-            mean_cme_width: float = self.fg_mean_cme_width + (
+            mean_cme_width = self.fg_mean_cme_width + (
                 self.fg_sd_cme_width * rng.uniform(low=-1, high=1)
             )
-            mean_cme_lon: float = self.fg_mean_cme_lon + (
+            mean_cme_lon = self.fg_mean_cme_lon + (
                 self.fg_sd_cme_lon * rng.uniform(low=-1, high=1)
             )
-            mean_cme_lat: float = self.fg_mean_cme_lat
-            mean_cme_thick: float = self.fg_mean_cme_thick
+            mean_cme_lat = self.fg_mean_cme_lat
+            mean_cme_thick = self.fg_mean_cme_thick
         else:
             # Initialise CME parameters
             mean_cme_t_init = self.fg_mean_cme_t_init + datetime.timedelta(
@@ -510,36 +595,24 @@ class RunDataAssimilationRoutine:
 
         return mean_cme_par_dict
 
-    def make_cme_par_dict(self, rng: np.random.Generator) -> CmeParEns:
-        # Get mean CME parameters
-        mean_cme_par_dict: dict[str, Any] = self.initialise_mean_cme_pars(rng=rng)
-        mean_cme_t_init: float = (
-            mean_cme_par_dict["mean_cme_t_init"] - self.surf_init_time
-        ).total_seconds()
-        mean_cme_speed: float = mean_cme_par_dict["mean_cme_speed"]
-        mean_cme_width: float = mean_cme_par_dict["mean_cme_width"]
-        mean_cme_lon: float = mean_cme_par_dict["mean_cme_lon"]
-        mean_cme_lat: float = mean_cme_par_dict["mean_cme_lat"]
-        mean_cme_thick: float = mean_cme_par_dict["mean_cme_thick"]
-
-        mean_cme_par_array: list[float] = [
-            mean_cme_t_init,
-            mean_cme_speed,
-            mean_cme_width,
-            mean_cme_lon,
-            mean_cme_lat,
-            mean_cme_thick,
-        ]
-
-        # Initialise cme_par_dict
-        cme_par_dict: CmeParEns = initialise_cme_parameter_ensemble_dict(
-            n_ensemble=self.n_members, surf_init_time=self.surf_init_time
-        )
-
+    def sample_prior(
+        self,
+        mean_cme_par_array: list[float],
+        n_ens: int,
+        rng: np.random.Generator,
+    ) -> npt.NDArray[np.float64]:
+        """
+        Draw n_ens CME parameter sets from the prior (cme_cov_type and the prior sds) around
+        mean_cme_par_array
+        :param mean_cme_par_array: [t_init (s after surf_init_time), v, width, lon, lat, thick]
+        :param n_ens: Number of draws
+        :param rng: Random number generator
+        :return: samples (6, n_ens), rows as mean_cme_par_array
+        """
         if self.cme_cov_type == "uncorr":
             print(mean_cme_par_array)
             samples: npt.NDArray[np.float64] = mp_cov.make_uncorr_uniform_samples(
-                n_ens=self.n_members,
+                n_ens=n_ens,
                 mean_cme_pars=mean_cme_par_array,
                 rng=rng,
                 sd_t_init=self.prior_sd_t_init,
@@ -555,7 +628,7 @@ class RunDataAssimilationRoutine:
             end_time_donki: datetime.datetime = datetime.datetime(2026, 2, 1, 0, 0, 0)
 
             samples = mp_cov.make_donki_samples(
-                n_ens=self.n_members,
+                n_ens=n_ens,
                 use_model=self.use_model,
                 mean_cme_pars=mean_cme_par_array,
                 rng=rng,
@@ -590,7 +663,7 @@ class RunDataAssimilationRoutine:
             end_time_mo_cone: datetime.datetime = datetime.datetime(2026, 2, 1, 0, 0, 0)
 
             samples = mp_cov.make_mo_cone_samples(
-                n_ens=self.n_members,
+                n_ens=n_ens,
                 mean_cme_pars=mean_cme_par_array,
                 rng=rng,
                 mo_cone_file_dir=mo_cme_cone_file_dir,
@@ -613,6 +686,39 @@ class RunDataAssimilationRoutine:
             print(f"cme_cov_type provided was: {self.cme_cov_type}")
             print(f"cme_cov_type must be in {self.setup_class.allowed_cov_types()}.")
             sys.exit()
+
+        return samples
+
+    def make_cme_par_dict(self, rng: np.random.Generator) -> CmeParEns:
+        # Get mean CME parameters
+        mean_cme_par_dict: dict[str, Any] = self.initialise_mean_cme_pars(rng=rng)
+        self.run_first_guess = dict(mean_cme_par_dict)
+        mean_cme_t_init: float = (
+            mean_cme_par_dict["mean_cme_t_init"] - self.surf_init_time
+        ).total_seconds()
+        mean_cme_speed: float = mean_cme_par_dict["mean_cme_speed"]
+        mean_cme_width: float = mean_cme_par_dict["mean_cme_width"]
+        mean_cme_lon: float = mean_cme_par_dict["mean_cme_lon"]
+        mean_cme_lat: float = mean_cme_par_dict["mean_cme_lat"]
+        mean_cme_thick: float = mean_cme_par_dict["mean_cme_thick"]
+
+        mean_cme_par_array: list[float] = [
+            mean_cme_t_init,
+            mean_cme_speed,
+            mean_cme_width,
+            mean_cme_lon,
+            mean_cme_lat,
+            mean_cme_thick,
+        ]
+
+        # Initialise cme_par_dict
+        cme_par_dict: CmeParEns = initialise_cme_parameter_ensemble_dict(
+            n_ensemble=self.n_members, surf_init_time=self.surf_init_time
+        )
+
+        samples: npt.NDArray[np.float64] = self.sample_prior(
+            mean_cme_par_array, n_ens=self.n_members, rng=rng
+        )
 
         cme_par_dict["t_init"] = [
             self.surf_init_time + datetime.timedelta(seconds=samples[0, i])
@@ -655,7 +761,8 @@ class RunDataAssimilationRoutine:
          <output_dir>/ens_elongations.nc (overwritten after each observation).
         Variables (dimensions n_obs x n_ens unless stated):
             elon_first_stage: elongation (deg) of each prior particle after Liu-West shrinkage, i.e. the
-                first-stage observation operator used to choose which particles are resampled
+                first-stage observation operator used to choose which particles are resampled (with
+                PFSettings.first_stage = "current", attrs["first_stage"], of the current particles)
             elon_posterior: elongation (deg) of each resampled (posterior) particle
             parent_index: index of the prior particle each posterior particle was resampled from
             log_weight: posterior log-weight of each particle after this observation
@@ -666,6 +773,9 @@ class RunDataAssimilationRoutine:
                 elongations of the (unchanged) particles and parent_index is 0..N-1
             ess_updated (n_obs): effective sample size of the weights w * p(y | theta) of the current
                 particles, which decides whether to resample (NaN if not computed)
+            n_model_runs (n_obs): ensembles of model runs made for the observation
+            n_reused_runs (n_obs): ensembles whose elongations were read from earlier model runs
+                instead (PFSettings.reuse_model_runs)
         Full elongation profiles (dimensions n_ens x n_profile, on the profile_time grid), written once
          they have been computed (see calculate_elongation_profiles):
             prior_profile_elon: elongation (deg) of the prior ensemble, i.e. the ensemble passed to the
@@ -687,6 +797,7 @@ class RunDataAssimilationRoutine:
         obs_times: npt.NDArray[np.datetime64] = np.array(
             self.obs_times[:n_obs_run], dtype="datetime64[ns]"
         )
+        pf_settings: PFSettings = getattr(self, "pf_settings", None) or PFSettings()
 
         elon_ds: xr.Dataset = xr.Dataset(
             data_vars=dict(
@@ -698,6 +809,18 @@ class RunDataAssimilationRoutine:
                 assimilated=(["n_obs"], elon_saved["assimilated"].astype(np.int8)),
                 resampled=(["n_obs"], elon_saved["resampled"].astype(np.int8)),
                 ess_updated=(["n_obs"], elon_saved["ess_updated"]),
+                n_model_runs=(
+                    ["n_obs"],
+                    np.asarray(
+                        elon_saved.get("n_model_runs", np.zeros(n_obs_run)), dtype=int
+                    ),
+                ),
+                n_reused_runs=(
+                    ["n_obs"],
+                    np.asarray(
+                        elon_saved.get("n_reused_runs", np.zeros(n_obs_run)), dtype=int
+                    ),
+                ),
             ),
             coords=dict(
                 obs_no=("n_obs", np.arange(n_obs_run)),
@@ -709,6 +832,9 @@ class RunDataAssimilationRoutine:
                 elongation_units="deg",
                 use_model=self.use_model,
                 craft=str(self.craft),
+                first_stage=str(pf_settings.first_stage),
+                reuse_model_runs=int(bool(pf_settings.reuse_model_runs)),
+                reuse_observer_tol_deg=float(pf_settings.reuse_observer_tol_deg),
             ),
         )
 
@@ -735,6 +861,43 @@ class RunDataAssimilationRoutine:
                     ["n_ens"],
                     np.asarray(profiles[stage]["log_weight"], dtype=float),
                 )
+                # Ensemble stage of the profiles (0 = prior, k + 1 = after observation k)
+                if "stage" in profiles[stage]:
+                    elon_ds.attrs[f"{stage}_profile_stage"] = int(
+                        profiles[stage]["stage"]
+                    )
+                # Each member's CME arrival from the same model runs
+                if "arrival_time" in profiles[stage]:
+                    elon_ds[f"{stage}_profile_arrival_time"] = (
+                        ["n_ens"],
+                        np.array(
+                            [
+                                (
+                                    np.datetime64(t)
+                                    if isinstance(t, datetime.datetime)
+                                    else np.datetime64("NaT")
+                                )
+                                for t in profiles[stage]["arrival_time"]
+                            ],
+                            dtype="datetime64[ns]",
+                        ),
+                    )
+                    elon_ds[f"{stage}_profile_arrival_speed"] = (
+                        ["n_ens"],
+                        np.asarray(profiles[stage]["arrival_speed"], dtype=float),
+                    )
+                    elon_ds[f"{stage}_profile_arrival_available"] = (
+                        ["n_ens"],
+                        np.asarray(profiles[stage]["arrival_available"]).astype(
+                            np.int8
+                        ),
+                    )
+                    elon_ds.attrs["profile_arrival_object"] = str(
+                        self.profile_arrival_object
+                    )
+                    elon_ds.attrs["profile_sim_time_days"] = float(
+                        self.profile_sim_time_days
+                    )
 
         out_file: str = os.path.join(output_dir, "ens_elongations.nc")
         try:
@@ -749,6 +912,11 @@ class RunDataAssimilationRoutine:
     # Full elongation profiles of the prior and posterior ensembles (written to ens_elongations.nc).
     #  Each profile costs one extra ensemble of model runs (about half an observation step).
     compute_elongation_profiles: bool = True
+    # The same model runs also give each member's CME arrival at this body, for osse_ana.py (which
+    #  then need not rerun these ensembles); the runs last profile_sim_time_days (osse_ana.py's
+    #  arrival window, arrival_sim_time_days, should match it for the arrivals to be reused)
+    profile_arrival_object: str = "EARTH"
+    profile_sim_time_days: float = 4.0
     profile_duration_days: float = 3.0
     profile_dt_minutes: float = 30.0
 
@@ -773,6 +941,8 @@ class RunDataAssimilationRoutine:
         self,
         cme_par_dict: CmeParEns,
         obs_index: int = 0,
+        arrival_object: str | None = None,
+        model_sim_time: Quantity[u.day] | None = None,
     ) -> dict:
         """
         Run every ensemble member once and evaluate its modelled CME flank elongation over the full
@@ -783,7 +953,14 @@ class RunDataAssimilationRoutine:
          observer position of observation obs_index.
         :param cme_par_dict: Ensemble of CME parameters to evaluate
         :param obs_index: Observation whose observer position is used (twin experiments)
-        :return: dict with "elon" and "extrapolated" (n_ens, n_profile) and "log_weight" (n_ens)
+        :param arrival_object: If given (e.g. "EARTH"), each member's CME arrival at this body is taken
+            from the same model run (cme_arrival.member_arrival)
+        :param model_sim_time: Run length of the models (None = the usual: 3 days for the
+            compressible SURF models, sim_time for the others); long enough for the arrivals
+        :return: dict with "elon" and "extrapolated" (n_ens, n_profile) and "log_weight" (n_ens) and,
+            with arrival_object, "arrival_time" (n_ens; datetime or None), "arrival_speed" (n_ens;
+            km/s) and "arrival_available" (n_ens; False where the body is outside the model's
+            latitude grid)
         """
         profile_times: list[datetime.datetime] = self.get_profile_times()
         print(
@@ -804,26 +981,28 @@ class RunDataAssimilationRoutine:
             vr_longs=self.vr_longs,
             vr_lats=self.vr_lats,
             n_lat_surf=self.n_lat_surf,
+            lat_min=self.lat_min,
+            lat_max=self.lat_max,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
-            sim_time=self.sim_time,
+            sim_time=self.sim_time if model_sim_time is None else model_sim_time,
             dt_scale=self.dt_scale,
             r_min=self.r_min,
             cme_init_rad=self.cme_init_rad,
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
             plot_surf_output=False,
-            bias_term_bool=self.bias_term_bool,
-            bias_term_5rs=self.bias_term_5rs,
-            bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
             write_diagnostics=False,
             settings=self.obs_op_settings,
             worker_pool=self.worker_pool,
+            compress_sim_time=model_sim_time,
+            arrival_object=arrival_object,
         )
 
+        cme_flanks: list[pd.DataFrame] | None = None
         if self.use_model in ["compress_surf", "compress_surf3d"]:
-            cme_flanks: list[pd.DataFrame] = obs_op_class.get_cme_flanks()
+            cme_flanks = obs_op_class.get_cme_flanks()
             elon: npt.NDArray[np.float64] = np.vstack(
                 [np.asarray(f["el"].values, dtype=float) for f in cme_flanks]
             )
@@ -838,18 +1017,51 @@ class RunDataAssimilationRoutine:
                 ]
             )
         else:
-            elon = np.asarray(obs_op_class.make_obs_op(), dtype=float)
+            # Without the bias term, as for the compressible models above (osse_ana.py adds it
+            #  when plotting the profiles)
+            elon = np.asarray(obs_op_class.make_obs_op(include_bias=False), dtype=float)
             extrap = np.zeros(elon.shape, dtype=bool)
+            cme_flanks = getattr(obs_op_class, "last_cme_flanks", None)
 
-        return {
+        out: dict[str, Any] = {
             "elon": elon,
             "extrapolated": extrap,
             "log_weight": np.asarray(cme_par_dict["log_weight"], dtype=float),
         }
+        if arrival_object is not None:
+            arrivals: list[dict[str, Any]] = [
+                (f.attrs.get("arrival") if cme_flanks is not None else None)
+                or {"time": None, "speed": np.nan, "hit": False, "available": False}
+                for f in (cme_flanks or [None] * len(elon))
+            ]
+            out["arrival_time"] = [a["time"] for a in arrivals]
+            out["arrival_speed"] = np.array([a["speed"] for a in arrivals], dtype=float)
+            out["arrival_available"] = np.array(
+                [a["available"] for a in arrivals], dtype=bool
+            )
+        return out
 
     # Observations must be at least this far (deg) above the smallest elongation the model domain
     #  can show (the inner boundary r_min seen from the observer); see get_min_model_elongation
     elong_model_margin_deg: float = 1.0
+
+    def later_observations(self, obs_index: int) -> list[dict[str, Any]]:
+        """
+        The observations after obs_index, with their observer positions, for evaluating them from the
+        model runs made at obs_index (PFSettings.reuse_model_runs)
+        :param obs_index: Index of the observation being assimilated
+        :return: dicts with "index", "time", "radius", "lon" and "lat"
+        """
+        return [
+            {
+                "index": j,
+                "time": self.obs_times[j],
+                "radius": self.obs_radius[j],
+                "lon": self.obs_lon[j],
+                "lat": self.obs_lat[j],
+            }
+            for j in range(obs_index + 1, len(self.observations))
+        ]
 
     def get_min_model_elongation(self) -> npt.NDArray[np.float64]:
         """
@@ -980,6 +1192,25 @@ class RunDataAssimilationRoutine:
             )
             rng: np.random.Generator = np.random.default_rng(rand_seed)
 
+            # Twin runs: whether the first guess is perturbed, and this run's observation noise
+            #  (its own random stream, so the CME draws are the same with or without it)
+            self.perturb_first_guess = run_no >= 0
+            if self.sample_first_guess and run_no < 0:
+                print(
+                    "Note: negative run numbers start from the truth itself; use run_start >= 0 for"
+                    " first guesses drawn from the prior"
+                )
+            if self.new_obs_noise_per_run:
+                obs_rng: np.random.Generator = np.random.default_rng(
+                    [int(self.obs_rng_seed), int(rand_seed)]
+                )
+                self.observations = list(
+                    np.asarray(self.unperturbed_observations, dtype=float)
+                    + obs_rng.normal(
+                        0.0, self.obs_noise_sd, len(self.unperturbed_observations)
+                    )
+                )
+
             cme_par_dict: CmeParEns = self.make_cme_par_dict(rng=rng)
             cme_saved_pars: npt.NDArray[np.float64] = np.zeros(
                 (self.n_obs + 1, self.n_members, 7)
@@ -1011,7 +1242,16 @@ class RunDataAssimilationRoutine:
                 "assimilated": np.zeros(n_obs_run, dtype=bool),
                 "resampled": np.zeros(n_obs_run, dtype=bool),
                 "ess_updated": np.full(n_obs_run, np.nan),
+                # Ensembles of model runs made at each observation, and ensembles read from earlier
+                #  runs instead (PFSettings.reuse_model_runs)
+                "n_model_runs": np.zeros(n_obs_run, dtype=int),
+                "n_reused_runs": np.zeros(n_obs_run, dtype=int),
             }
+
+            # Elongations of this run's model runs, for reuse (PFSettings.reuse_model_runs)
+            elon_store: ElongationStore | None = (
+                ElongationStore() if self.pf_settings.reuse_model_runs else None
+            )
 
             # Save prior state
             cme_saved_pars[0] = self.saved_cme_pars(cme_par_dict)
@@ -1043,8 +1283,12 @@ class RunDataAssimilationRoutine:
                 }
                 try:
                     profiles["prior"] = self.calculate_elongation_profiles(
-                        cme_par_dict, obs_index=0
+                        cme_par_dict,
+                        obs_index=0,
+                        arrival_object=self.profile_arrival_object,
+                        model_sim_time=self.profile_sim_time_days * u.day,
                     )
+                    profiles["prior"]["stage"] = 0
                 except Exception as err:
                     print(
                         f"Warning: could not compute the prior elongation profiles: {err}"
@@ -1091,6 +1335,8 @@ class RunDataAssimilationRoutine:
                         vr_longs=self.vr_longs,
                         vr_lats=self.vr_lats,
                         n_lat_surf=self.n_lat_surf,
+                        lat_min=self.lat_min,
+                        lat_max=self.lat_max,
                         lon_start=self.lon_start,
                         lon_stop=self.lon_stop,
                         time_tolerance=self.time_tolerance,
@@ -1100,18 +1346,21 @@ class RunDataAssimilationRoutine:
                         cme_init_rad=self.cme_init_rad,
                         cme_fixed_duration=self.cme_fixed_duration,
                         fixed_duration=self.fixed_duration,
-                        bias_term_bool=self.bias_term_bool,
-                        bias_term_5rs=self.bias_term_5rs,
-                        bias_term_21rs=self.bias_term_21rs,
                         use_parallel=self.use_parallel,
                         rng=rng,
                         state_transform=state_transform,
                         pf_settings=self.pf_settings,
                         obs_op_settings=self.obs_op_settings,
                         worker_pool=self.worker_pool,
+                        elon_store=elon_store,
+                        obs_index=yi,
+                        later_obs=self.later_observations(yi) if elon_store else None,
+                        run_until=self.obs_times[n_obs_run - 1] if elon_store else None,
                     )
 
                     cme_par_dict = aux_pf_class.aux_pf()
+                    elon_saved["n_model_runs"][yi] = aux_pf_class.n_model_runs
+                    elon_saved["n_reused_runs"][yi] = aux_pf_class.n_reused_runs
 
                     # Record each member's modelled elongation at this observation
                     elon_saved["elon_first_stage"][
@@ -1165,6 +1414,12 @@ class RunDataAssimilationRoutine:
                     profiles=profiles,
                 )
 
+            print(
+                f"run_no = {run_no}: {int(elon_saved['n_model_runs'].sum())} ensembles of model runs"
+                f" for the observations, {int(elon_saved['n_reused_runs'].sum())} read from earlier"
+                f" runs (first stage: {self.pf_settings.first_stage})"
+            )
+
             # Full elongation profiles of the posterior ensemble (after the last observation in the
             #  permitted elongation range has been assimilated)
             if profiles is not None:
@@ -1176,7 +1431,14 @@ class RunDataAssimilationRoutine:
                 )
                 try:
                     profiles["posterior"] = self.calculate_elongation_profiles(
-                        cme_par_dict, obs_index=last_obs_ind
+                        cme_par_dict,
+                        obs_index=last_obs_ind,
+                        arrival_object=self.profile_arrival_object,
+                        model_sim_time=self.profile_sim_time_days * u.day,
+                    )
+                    # The ensemble after the last assimilated observation (stage = obs index + 1)
+                    profiles["posterior"]["stage"] = (
+                        last_obs_ind + 1 if assimilated_ind.size else 0
                     )
                 except Exception as err:
                     print(
@@ -1217,6 +1479,39 @@ class RunDataAssimilationRoutine:
                     ),
                 }
             )
+            # Truth CME of a twin experiment, so the run can be analysed (osse_ana.py) without the
+            #  settings it was made with
+            if self.use_synthetic_obs:
+                truth: CmeParEns = self.true_cme_par_dict
+                cme_par_ds.attrs.update(
+                    {
+                        "twin_experiment": self.setup_class.get_twin_experiment(),
+                        "true_t_init": pd.Timestamp(truth["t_init"]).isoformat(),
+                        "true_v": float(truth["v"].to(u.km / u.s).value),
+                        "true_width": float(truth["width"].to(u.deg).value),
+                        "true_lon": float(truth["lon"].to(u.deg).value),
+                        "true_lat": float(truth["lat"].to(u.deg).value),
+                        "true_thick": float(truth["thick"].to(u.solRad).value),
+                        "obs_cov": float(np.ravel(np.asarray(self.obs_cov, float))[0]),
+                        "sample_first_guess": int(self.sample_first_guess),
+                        "new_obs_noise_per_run": int(self.new_obs_noise_per_run),
+                    }
+                )
+                # This run's first guess (the centre of its prior ensemble)
+                fg: dict[str, Any] = self.run_first_guess
+                if fg:
+                    cme_par_ds.attrs.update(
+                        {
+                            "first_guess_t_init": pd.Timestamp(
+                                fg["mean_cme_t_init"]
+                            ).isoformat(),
+                            "first_guess_v": float(fg["mean_cme_speed"]),
+                            "first_guess_width": float(fg["mean_cme_width"]),
+                            "first_guess_lon": float(fg["mean_cme_lon"]),
+                            "first_guess_lat": float(fg["mean_cme_lat"]),
+                            "first_guess_thick": float(fg["mean_cme_thick"]),
+                        }
+                    )
 
             # Parameter correlations (v as ln v) and the correlation-handling settings (state_transform.py)
             cme_par_ds["state_corr"] = (

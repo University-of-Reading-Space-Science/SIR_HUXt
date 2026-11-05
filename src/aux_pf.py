@@ -17,7 +17,13 @@ from astropy.time import Time
 from sir_resampling_log_weights import jacobian_log, ResampleParsLogWeights
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
-from sir_observation_operator import ObservationOperator, ObsOpSettings, WorkerPool
+from sir_observation_operator import (
+    ObservationOperator,
+    ObsOpSettings,
+    WorkerPool,
+    add_obs_bias,
+)
+from model_run_reuse import ElongationStore
 from sir_likelihood import LikelihoodFunction
 from cme_par_ens import CmeParEns
 from state_transform import StateTransform
@@ -44,13 +50,50 @@ class PFSettings:
         ensemble's family tree (and its spread) collapses even when the weights are fairly even. If
         False, the auxiliary-PF step is done at every observation.
         Cost: a step without resampling needs one ensemble of model runs (the current particles); a
-        step with resampling needs three (current, shrunk and resampled particles).
+        step with resampling needs three (current, shrunk and resampled particles), or two with
+        first_stage = "current". With reuse_model_runs, the current particles' runs are usually not
+        needed.
     resample_ess_fraction: ESS threshold for resampling, as a fraction of the ensemble size
+    first_stage: First-stage weights of the auxiliary step, which choose the particles to resample:
+        "shrunk" (Liu & West 2001; Pitt & Shephard 1999): w_i p(y | mu_i), with mu_i the particle
+            after Liu-West shrinkage, which needs an ensemble of model runs of the shrunk particles.
+        "current": w_i p(y | theta_i), the likelihood of the current particles, which the adaptive
+            resampling step has already computed, so no extra model runs are needed.
+        Either is valid: the second-stage weights p(y | theta_new) / g(parent), with g the first-stage
+        likelihood, give the same target whatever g is (Johansen & Doucet 2008, Statistics &
+        Probability Letters 78, 1498-1504); g only changes the variance of the weights. The jittered
+        particles are drawn around mu_i in both cases. With "current", elon_first_stage in
+        ens_elongations.nc holds the current particles' elongations.
+    reuse_model_runs: Reuse model runs of particles that have not changed (see model_run_reuse.py):
+        every ensemble of runs also gives the elongations at the later observations of the run, so
+        when the particles are unchanged at the next observation (no resampling, or the resampled
+        particles at the next observation) their elongations are read from the earlier runs instead
+        of solving the model again. The results are the same as without it when the observer stays
+        at the same position (twin experiments); for a real spacecraft, which moves between
+        observations, only observations with the observer within reuse_observer_tol_deg of the
+        earlier run's observer are read from it. For surf and huxt, whose runs otherwise stop
+        time_tolerance after each observation, every run then lasts until time_tolerance after the
+        run's last observation (compress_surf and compress_surf3d always run for a fixed time).
+    reuse_observer_tol_deg: Largest change in the observer's longitude and latitude (deg) between an
+        earlier run's observation and a later one for the later one to be read from the earlier run
+        (0 = the same position only, so the results do not change; a real spacecraft then reuses
+        runs only when the ephemeris gives the same position)
     """
 
     skip_update_if_any_member_nan: bool = True
     adaptive_resampling: bool = True
     resample_ess_fraction: float = 0.5
+    first_stage: str = "shrunk"
+    reuse_model_runs: bool = False
+    reuse_observer_tol_deg: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.first_stage not in ("shrunk", "current"):
+            raise ValueError(
+                f'PFSettings.first_stage must be "shrunk" or "current", not {self.first_stage!r}'
+            )
+        if self.reuse_observer_tol_deg < 0:
+            raise ValueError("PFSettings.reuse_observer_tol_deg must not be negative")
 
 
 def n_members_without_elongation(obs_op: npt.NDArray[np.float64]) -> int:
@@ -79,6 +122,8 @@ class AuxPF:
         vr_longs: Quantity[u.rad] = np.nan * u.rad,
         vr_lats: Quantity[u.rad] = np.nan * u.rad,
         n_lat_surf: int = 1,
+        lat_min: Quantity[u.deg] = np.nan * u.deg,
+        lat_max: Quantity[u.deg] = np.nan * u.deg,
         lon_start: Quantity[u.deg] = 290 * u.deg,
         lon_stop: Quantity[u.deg] = 380 * u.deg,
         time_tolerance: Quantity[u.day] = 0.5 * u.day,
@@ -89,15 +134,16 @@ class AuxPF:
         cme_fixed_duration: bool = True,
         fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
         plot_surf_output: bool = False,
-        bias_term_bool: bool = False,
-        bias_term_5rs: float = None,
-        bias_term_21rs: float = None,
         use_parallel: bool = False,
         rng: np.random.Generator | None = None,
         state_transform: StateTransform | None = None,
         pf_settings: PFSettings | None = None,
         obs_op_settings: ObsOpSettings | None = None,
         worker_pool: WorkerPool | None = None,
+        elon_store: ElongationStore | None = None,
+        obs_index: int | None = None,
+        later_obs: list[dict] | None = None,
+        run_until: datetime.datetime | None = None,
     ) -> None:
         """
         Set up the auxiliary PF for one observation (the other parameters are described where they are used)
@@ -109,12 +155,29 @@ class AuxPF:
         :param obs_op_settings: Observation-operator settings (ObsOpSettings; None = the defaults)
         :param worker_pool: Worker pool shared by the run for parallel model runs (None = a pool is
             started and closed for each ensemble of model runs)
+        :param elon_store: Elongations of earlier model runs of this data assimilation run, read
+            instead of running the model again and added to after each ensemble of runs (see
+            PFSettings.reuse_model_runs; None = no reuse)
+        :param obs_index: Index of this observation in the run (needed with elon_store)
+        :param later_obs: The run's later observations, evaluated from the same model runs for
+            elon_store: dicts with "index", "time", "radius", "lon" and "lat" (the observer position)
+        :param run_until: With elon_store, the surf and huxt runs last until time_tolerance after this
+            time (the run's last observation), so that they cover the later observations
         """
         self.pf_settings: PFSettings = (
             PFSettings() if pf_settings is None else pf_settings
         )
         self.obs_op_settings: ObsOpSettings | None = obs_op_settings
         self.worker_pool: WorkerPool | None = worker_pool
+        self.elon_store: ElongationStore | None = elon_store
+        self.obs_index: int | None = obs_index
+        self.later_obs: list[dict] = list(later_obs or [])
+        self.run_until: datetime.datetime | None = run_until
+        if self.elon_store is not None and self.obs_index is None:
+            raise ValueError("AuxPF: elon_store needs obs_index")
+        # Ensembles of model runs made for this observation, and ensembles read from earlier runs
+        self.n_model_runs: int = 0
+        self.n_reused_runs: int = 0
         self.use_model: str = use_model
         self.craft: str = craft
         self.cme_par_dict: CmeParEns = cme_par_dict
@@ -132,6 +195,8 @@ class AuxPF:
         self.vr_longs: Quantity[u.rad] = vr_longs
         self.vr_lats: Quantity[u.rad] = vr_lats
         self.n_lat_surf: int = n_lat_surf
+        self.lat_min: Quantity[u.deg] = lat_min
+        self.lat_max: Quantity[u.deg] = lat_max
         self.lon_start: Quantity[u.deg] = lon_start
         self.lon_stop: Quantity[u.deg] = lon_stop
         self.time_tolerance: Quantity[u.day] = time_tolerance
@@ -186,15 +251,6 @@ class AuxPF:
         self.state_vector_shrunk_dict: CmeParEns = self.make_state_vector_dictionary()
 
         self.sim_time: Quantity = self.get_sim_time()
-
-        # Linear elongation-bias correction of the observation operator (SURF/HUXt solvers only)
-        self.bias_term_bool: bool = (
-            bias_term_bool
-            and (bias_term_5rs is not None)
-            and (bias_term_21rs is not None)
-        )
-        self.bias_term_5rs: float = bias_term_5rs
-        self.bias_term_21rs: float = bias_term_21rs
 
     def unnormalised_weights(self) -> npt.NDArray[np.float64]:
         """
@@ -327,7 +383,14 @@ class AuxPF:
         init_astro_time: Time = Time(
             self.surf_init_time, format="datetime", scale="utc"
         )
-        obs_astro_time: Time = Time(self.obs_time, format="datetime", scale="utc")
+        # (with reused runs, until the run's last observation, so that the runs cover the later
+        #  observations; see PFSettings.reuse_model_runs)
+        end_time: datetime.datetime = (
+            max(self.obs_time, self.run_until)
+            if (self.elon_store is not None and self.run_until is not None)
+            else self.obs_time
+        )
+        obs_astro_time: Time = Time(end_time, format="datetime", scale="utc")
 
         return (obs_astro_time - init_astro_time).to(u.day) + self.time_tolerance
 
@@ -358,9 +421,30 @@ class AuxPF:
         self, state_dict_in: CmeParEns
     ) -> npt.NDArray[np.float64]:
         """
-        Function to get the observation operator
+        Function to get the observation operator. With an elongation store (reused model runs), the
+        stored elongations are used if every member has one for this observation; otherwise the model
+        is run, and the elongations at this and the later observations are stored.
         :return: hx: Observation operator for self.obs_time
         """
+        obs_op_settings: ObsOpSettings = (
+            ObsOpSettings() if self.obs_op_settings is None else self.obs_op_settings
+        )
+        store: ElongationStore | None = self.elon_store
+        obs_index: int = -1 if self.obs_index is None else int(self.obs_index)
+        if store is not None:
+            stored: npt.NDArray[np.float64] | None = store.lookup(
+                state_dict_in, obs_index
+            )
+            if stored is not None:
+                self.n_reused_runs += 1
+                print(
+                    f"Observation {obs_index}: elongations of these particles read from "
+                    "earlier model runs"
+                )
+                return add_obs_bias(
+                    stored[:, None], state_dict_in, obs_op_settings, self.n_members
+                )
+
         obs_op_class: ObservationOperator = ObservationOperator(
             use_model=self.use_model,
             cme_par_dict=state_dict_in,
@@ -376,6 +460,8 @@ class AuxPF:
             vr_longs=self.vr_longs,
             vr_lats=self.vr_lats,
             n_lat_surf=self.n_lat_surf,
+            lat_min=self.lat_min,
+            lat_max=self.lat_max,
             lon_start=self.lon_start,
             lon_stop=self.lon_stop,
             sim_time=self.sim_time,
@@ -385,14 +471,33 @@ class AuxPF:
             cme_fixed_duration=self.cme_fixed_duration,
             fixed_duration=self.fixed_duration,
             plot_surf_output=self.plot_surf_output,
-            bias_term_bool=self.bias_term_bool,
-            bias_term_5rs=self.bias_term_5rs,
-            bias_term_21rs=self.bias_term_21rs,
             use_parallel=self.use_parallel,
             settings=self.obs_op_settings,
             worker_pool=self.worker_pool,
+            extra_obs_times=(
+                [o["time"] for o in self.later_obs] if store is not None else None
+            ),
+            extra_obs_positions=(
+                [(o["radius"], o["lon"], o["lat"]) for o in self.later_obs]
+                if store is not None
+                else None
+            ),
+            observer_tol_deg=self.pf_settings.reuse_observer_tol_deg,
         )
-        return obs_op_class.make_obs_op()
+        self.n_model_runs += 1
+        if store is None:
+            return obs_op_class.make_obs_op()
+
+        # Elongations without the bias term (the bias coefficient is not part of the model run), at
+        #  this observation and the later ones evaluated from the same runs
+        hx: npt.NDArray[np.float64] = obs_op_class.make_obs_op(include_bias=False)
+        to_store: dict[int, npt.NDArray[np.float64]] = {obs_index: hx[:, 0]}
+        for k, j in enumerate(obs_op_class.extra_obs_index):
+            to_store[int(self.later_obs[j]["index"])] = obs_op_class.extra_elongations[
+                :, k
+            ]
+        store.add(state_dict_in, to_store)
+        return add_obs_bias(hx, state_dict_in, obs_op_settings, self.n_members)
 
     def calculate_likelihood_single_ens(self, hx: npt.NDArray[np.float64]) -> float:
         """
@@ -506,15 +611,16 @@ class AuxPF:
         self.resampled: bool = False
         self.ess_updated: float = np.nan
 
-        if self.pf_settings.adaptive_resampling:
+        use_current_first_stage: bool = self.pf_settings.first_stage == "current"
+        log_likelihood_current: npt.NDArray[np.float64] | None = None
+        elon_current: npt.NDArray[np.float64] | None = None
+        if self.pf_settings.adaptive_resampling or use_current_first_stage:
             # Elongations and likelihoods of the current (unshrunk, unjittered) particles
             obs_op_current: npt.NDArray[np.float64] = self.get_observation_operator(
                 self.cme_par_dict
             )
-            elon_current: npt.NDArray[np.float64] = np.asarray(
-                obs_op_current, dtype=float
-            )[:, 0].copy()
-            log_likelihood_current: npt.NDArray[np.float64] = np.array(
+            elon_current = np.asarray(obs_op_current, dtype=float)[:, 0].copy()
+            log_likelihood_current = np.array(
                 [
                     self.calculate_log_likelihood_single_ens(obs_op_current[i, :])
                     for i in range(self.n_members)
@@ -532,6 +638,8 @@ class AuxPF:
                     f"{n_no_elon}/{self.n_members} members produced no elongation"
                 )
 
+        if self.pf_settings.adaptive_resampling:
+            assert elon_current is not None and log_likelihood_current is not None
             # Updated weights w_i * p(y | theta_i) and their effective sample size
             log_weights_upd: npt.NDArray[np.float64] = (
                 np.asarray(self.log_weights, dtype=float) + log_likelihood_current
@@ -563,35 +671,41 @@ class AuxPF:
             print("ESS below threshold: auxiliary-PF step with resampling")
         self.resampled = True
 
-        # First stage: likelihoods of the shrunk particles. Their modelled elongations (indexed by the
-        #  pre-resampling particle) are kept for the routine to write out.
-        obs_op_shrunk: npt.NDArray[np.float64] = self.get_observation_operator(
-            self.state_vector_shrunk_dict
-        )
-        self.elon_first_stage: npt.NDArray[np.float64] = np.asarray(
-            obs_op_shrunk, dtype=float
-        )[:, 0].copy()
-        log_likelihood_shrunk_ens: list[float] = [
-            self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
-            for i in range(self.n_members)
-        ]
-
-        # Skip the update, returning the ensemble and its weights unchanged, if
-        #  - any member's CME produced no elongation and PFSettings.skip_update_if_any_member_nan is set, or
-        #  - no member produced a finite likelihood (e.g. every modelled CME is outside the imager's
-        #    field of view): the observation then carries no information, and resampling with the
-        #    resulting uniform weights would only destroy ensemble diversity.
-        n_no_elon = n_members_without_elongation(obs_op_shrunk)
-        no_finite_lik: bool = not np.any(
-            np.isfinite(np.asarray(log_likelihood_shrunk_ens, dtype=float))
-        )
-        if (
-            self.pf_settings.skip_update_if_any_member_nan and n_no_elon > 0
-        ) or no_finite_lik:
-            return self.skip_update(
-                f"{n_no_elon}/{self.n_members} (shrunk) members produced no elongation"
+        if use_current_first_stage:
+            # First stage: likelihoods of the current particles (PFSettings.first_stage = "current"),
+            #  already computed above; the members without an elongation were checked there
+            assert elon_current is not None and log_likelihood_current is not None
+            self.elon_first_stage: npt.NDArray[np.float64] = elon_current.copy()
+            log_likelihood_shrunk_ens: list[float] = list(log_likelihood_current)
+            self.update_skipped = False
+        else:
+            # First stage: likelihoods of the shrunk particles. Their modelled elongations (indexed by
+            #  the pre-resampling particle) are kept for the routine to write out.
+            obs_op_shrunk: npt.NDArray[np.float64] = self.get_observation_operator(
+                self.state_vector_shrunk_dict
             )
-        self.update_skipped = False
+            self.elon_first_stage = np.asarray(obs_op_shrunk, dtype=float)[:, 0].copy()
+            log_likelihood_shrunk_ens = [
+                self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
+                for i in range(self.n_members)
+            ]
+
+            # Skip the update, returning the ensemble and its weights unchanged, if
+            #  - any member's CME produced no elongation and PFSettings.skip_update_if_any_member_nan is set, or
+            #  - no member produced a finite likelihood (e.g. every modelled CME is outside the imager's
+            #    field of view): the observation then carries no information, and resampling with the
+            #    resulting uniform weights would only destroy ensemble diversity.
+            n_no_elon = n_members_without_elongation(obs_op_shrunk)
+            no_finite_lik: bool = not np.any(
+                np.isfinite(np.asarray(log_likelihood_shrunk_ens, dtype=float))
+            )
+            if (
+                self.pf_settings.skip_update_if_any_member_nan and n_no_elon > 0
+            ) or no_finite_lik:
+                return self.skip_update(
+                    f"{n_no_elon}/{self.n_members} (shrunk) members produced no elongation"
+                )
+            self.update_skipped = False
 
         # Choose the particles to resample from the auxiliary probabilities
         log_aux_prob: list[float] = [

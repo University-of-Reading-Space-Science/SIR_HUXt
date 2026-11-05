@@ -1,0 +1,426 @@
+# CME events for the data assimilation runs (read by da_surf_setup.py).
+#
+# Choose the event in da_surf_setup.Setup.get_ssw_event_craft (ssw_event = "...").
+# To add an event, copy an entry and change the values.
+#
+#   model_start     start time of the model run (UTC), for runs with real observations
+#   obs_file        observation file, in the OBS_DIR folder set in .env
+#   first_guess     first-guess CME from the DONKI catalogue (around which the prior is drawn):
+#     time_at_21rs  time the CME is at 21.5 solar radii (UTC)
+#     speed         km/s
+#     width         full angular width, deg
+#     lon, lat      direction, deg (HEEQ)
+#     thick         thickness, solar radii
+#   first_guess_other   the non-DONKI first guess, used when donki_cme = False in
+#                       initialise_fg_cme_parameters (only the ssw events have one; the others use
+#                       first_guess for both)
+#
+# Used by osse_ana.py (analysis of the runs):
+#   arrival_time    observed arrival time of the CME at Earth (UTC)
+#   title           figure title; {event} and {craft_name} (e.g. STEREO-A) are filled in
+#                   (default: CME-{event})
+#   prior_dir, prior_dir_other
+#                   run folder of the prior made from first_guess / first_guess_other, for events
+#                   whose runs use older folder names (default: prior_<speed>_<width>_<lon>_<lat>_<thick>
+#                   from the first guess, as data_assimilation_routine.py names it)
+#   obs_times_sta, obs_times_stb
+#                   observation times for each spacecraft, for events whose observations osse_ana.py does
+#                   not read from obs_file (the ssw events)
+#
+# Times are written YYYY-MM-DD HH:MM (or HH:MM:SS).
+#
+# Twin experiments (synthetic observations): entries with a truth. Run one by setting ssw_event in
+# da_surf_setup.Setup.get_ssw_event_craft to its name (e.g. "twin"); a real event code with
+# get_use_synthetic_obs returning True uses "twin". Copy an entry to set up another twin experiment.
+#
+#   model_start     start time of the model run (UTC)
+#   truth           CME the synthetic observations are made from ("truth run"):
+#     launch_time   time the CME is at the model's inner boundary (cme_init_rad) (UTC)
+#     speed         km/s
+#     width         full angular width, deg
+#     lon, lat      direction, deg (HEEQ); "earth" = Earth's direction at model_start
+#     thick         thickness, solar radii
+#   first_guess     first-guess CME (around which the prior is drawn), same fields as truth
+#   lat_min,        latitude range of the SURF3d grid (compress_surf3d), deg; optional, default
+#   lat_max           -30 and 30. Used for the truth run and every ensemble member; it must cover the
+#                     CME (lat +- width / 2) and the observer's field of view
+#
+# For a set of runs of a twin experiment (n_runs > 1, run_start >= 0), optional:
+#   sample_first_guess     true: each run's first guess is a draw from the prior around the truth
+#                          (the same distribution as the ensemble), so the filter starts as wrong as
+#                          it assumes; first_guess is then not needed. Negative run numbers start
+#                          from the truth itself. false (default): every run starts from first_guess
+#   new_obs_noise_per_run  true: each run gets its own observation noise (seeded by the run number);
+#                          false (default): every run sees the same noisy observations
+# Either one adds a tag (fgs, ons) to the run folder.
+#
+# osse_ana.py reads the same entry (event "twin"); the run folders are named from these values.
+
+twin:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 550
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+
+# Baseline of a rigorous set of twin runs: the same truth as "twin", each run with its own first
+# guess (drawn from the prior around the truth) and its own observation noise
+twin_base:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  sample_first_guess: true
+  new_obs_noise_per_run: true
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+
+"ssw_007":
+  model_start: 2012-08-31 00:00
+  obs_file: SSW_cme_classifications.hdf5
+  arrival_time: 2012-09-03 11:23
+  title: "CME-1: {craft_name} data assimilated"
+  prior_dir: prior_1498_150_-63_-15_0
+  prior_dir_other: prior_1010_66_-30_0_0
+  first_guess:
+    time_at_21rs: 2012-08-31 22:43
+    speed: 1498
+    width: 150
+    lon: -63
+    lat: -15
+    thick: 0
+  first_guess_other:
+    time_at_21rs: 2012-08-31 22:46
+    speed: 1010
+    width: 66
+    lon: -30
+    lat: 0
+    thick: 0
+  obs_times_sta: [
+    2012-09-01 00:09:01, 2012-09-01 00:49:01, 2012-09-01 01:29:01, 2012-09-01 02:09:01,
+    2012-09-01 02:49:01, 2012-09-01 03:29:01, 2012-09-01 04:09:01, 2012-09-01 04:49:01,
+    2012-09-01 05:29:01, 2012-09-01 06:09:01, 2012-09-01 06:49:01, 2012-09-01 07:29:01,
+    2012-09-01 08:09:01, 2012-09-01 08:49:01, 2012-09-01 09:29:01, 2012-09-01 10:09:01,
+    2012-09-01 10:49:01, 2012-09-01 11:29:01, 2012-09-01 12:09:01, 2012-09-01 12:49:01,
+    2012-09-01 13:29:01, 2012-09-01 14:09:01, 2012-09-01 14:49:01, 2012-09-01 15:29:01,
+    2012-09-01 16:09:01, 2012-09-01 16:49:01, 2012-09-01 17:29:01, 2012-09-01 18:09:01,
+    2012-09-01 18:49:01, 2012-09-01 19:29:01
+  ]
+  obs_times_stb: [
+    2012-08-31 23:29:01, 2012-09-01 00:09:01, 2012-09-01 00:49:01, 2012-09-01 01:29:01,
+    2012-09-01 02:09:01, 2012-09-01 02:49:01, 2012-09-01 03:29:01, 2012-09-01 04:09:01,
+    2012-09-01 04:49:01, 2012-09-01 05:29:01, 2012-09-01 06:09:01, 2012-09-01 06:49:01,
+    2012-09-01 07:29:01, 2012-09-01 08:09:01, 2012-09-01 08:49:01, 2012-09-01 09:29:01,
+    2012-09-01 10:09:01, 2012-09-01 10:49:01
+  ]
+
+"ssw_008":
+  model_start: 2012-09-27 15:00
+  obs_file: SSW_cme_classifications.hdf5
+  arrival_time: 2012-09-30 22:13
+  title: "CME-2: {craft_name} data assimilated"
+  prior_dir: prior_1160_170_30_5_0
+  prior_dir_other: prior_872_110_20_4_0
+  first_guess:
+    time_at_21rs: 2012-09-28 01:56
+    speed: 1160
+    width: 170
+    lon: 30
+    lat: 5
+    thick: 0
+  first_guess_other:
+    time_at_21rs: 2012-09-28 03:49
+    speed: 872
+    width: 110
+    lon: 20
+    lat: 4
+    thick: 0
+  obs_times_sta: [
+    2012-09-28 03:29:01, 2012-09-28 04:09:01, 2012-09-28 04:49:01, 2012-09-28 05:29:01,
+    2012-09-28 06:09:01, 2012-09-28 06:49:01, 2012-09-28 07:29:01, 2012-09-28 08:09:01,
+    2012-09-28 08:49:01, 2012-09-28 09:29:01, 2012-09-28 10:09:01, 2012-09-28 10:49:01,
+    2012-09-28 11:29:01, 2012-09-28 12:09:01, 2012-09-28 12:49:01, 2012-09-28 13:29:01,
+    2012-09-28 14:09:01, 2012-09-28 14:49:01, 2012-09-28 15:29:01, 2012-09-28 16:09:01,
+    2012-09-28 16:49:01
+  ]
+  obs_times_stb: [
+    2012-09-28 08:09:01, 2012-09-28 08:49:01, 2012-09-28 09:29:01, 2012-09-28 10:09:01,
+    2012-09-28 10:49:01, 2012-09-28 11:29:01, 2012-09-28 12:09:01, 2012-09-28 12:49:01,
+    2012-09-28 13:29:01, 2012-09-28 14:09:01, 2012-09-28 14:49:01, 2012-09-28 15:29:01,
+    2012-09-28 16:09:01, 2012-09-28 16:49:01, 2012-09-28 17:29:01, 2012-09-28 18:09:01,
+    2012-09-28 18:49:01, 2012-09-28 19:29:01, 2012-09-28 20:09:01, 2012-09-28 20:49:01,
+    2012-09-28 21:29:01, 2012-09-28 22:09:01, 2012-09-28 22:49:01, 2012-09-28 23:29:01,
+    2012-09-29 00:09:01, 2012-09-29 00:49:01, 2012-09-29 01:29:01
+  ]
+
+"ssw_009":
+  model_start: 2012-10-04 20:00
+  obs_file: SSW_cme_classifications.hdf5
+  arrival_time: 2012-10-08 04:31
+  title: "CME-3: {craft_name} data assimilated"
+  prior_dir: prior_650_94_10_-28_0
+  prior_dir_other: prior_698_84_9_-24_0
+  first_guess:
+    time_at_21rs: 2012-10-05 09:15
+    speed: 650
+    width: 94
+    lon: 10
+    lat: -28
+    thick: 0
+  first_guess_other:
+    time_at_21rs: 2012-10-05 08:47
+    speed: 698
+    width: 84
+    lon: 9
+    lat: -24
+    thick: 0
+  obs_times_sta: [
+    2012-10-05 09:29:01, 2012-10-05 10:09:01, 2012-10-05 10:49:01, 2012-10-05 11:29:01,
+    2012-10-05 12:09:01, 2012-10-05 12:49:01, 2012-10-05 13:29:01, 2012-10-05 14:09:01,
+    2012-10-05 14:49:01, 2012-10-05 15:29:01, 2012-10-05 16:09:01, 2012-10-05 16:49:01,
+    2012-10-05 17:29:01, 2012-10-05 18:09:01, 2012-10-05 18:49:01, 2012-10-05 19:29:01,
+    2012-10-05 20:09:01, 2012-10-05 20:49:01, 2012-10-05 21:29:01, 2012-10-05 22:09:01,
+    2012-10-05 22:49:01, 2012-10-05 23:29:01, 2012-10-06 00:09:01, 2012-10-06 00:49:01,
+    2012-10-06 01:29:01, 2012-10-06 02:09:01, 2012-10-06 02:49:01
+  ]
+  obs_times_stb: [
+    2012-10-05 10:49:01, 2012-10-05 11:29:01, 2012-10-05 12:09:01, 2012-10-05 12:49:01,
+    2012-10-05 13:29:01, 2012-10-05 14:09:01, 2012-10-05 14:49:01, 2012-10-05 15:29:01,
+    2012-10-05 16:09:01, 2012-10-05 16:49:01, 2012-10-05 17:29:01, 2012-10-05 18:09:01,
+    2012-10-05 18:49:01, 2012-10-05 19:29:01, 2012-10-05 20:09:01, 2012-10-05 20:49:01,
+    2012-10-05 21:29:01, 2012-10-05 22:09:01, 2012-10-05 22:49:01, 2012-10-05 23:29:01,
+    2012-10-06 00:09:01, 2012-10-06 00:49:01, 2012-10-06 01:29:01, 2012-10-06 02:09:01,
+    2012-10-06 03:29:01, 2012-10-06 04:09:01
+  ]
+
+"ssw_012":
+  model_start: 2012-11-20 00:00
+  obs_file: SSW_cme_classifications.hdf5
+  arrival_time: 2012-11-23 21:10
+  title: "CME-4: {craft_name} data assimilated"
+  prior_dir: prior_725_60_90_5_0
+  prior_dir_other: prior_664_94_22_20_0
+  first_guess:
+    time_at_21rs: 2012-11-20 17:32
+    speed: 725
+    width: 60
+    lon: 90
+    lat: 5
+    thick: 0
+  first_guess_other:
+    time_at_21rs: 2012-11-20 17:40
+    speed: 664
+    width: 94
+    lon: 22
+    lat: 20
+    thick: 0
+  obs_times_sta: [
+    2012-11-20 16:49:01, 2012-11-20 17:29:01, 2012-11-20 18:09:01, 2012-11-20 18:49:01,
+    2012-11-20 19:29:01, 2012-11-20 20:09:01, 2012-11-20 20:49:01, 2012-11-20 21:29:01,
+    2012-11-20 22:09:01, 2012-11-20 22:49:01, 2012-11-20 23:29:01, 2012-11-21 00:09:01,
+    2012-11-21 00:49:01, 2012-11-21 01:29:01, 2012-11-21 02:09:01, 2012-11-21 02:49:01,
+    2012-11-21 03:29:01, 2012-11-21 04:09:01, 2012-11-21 04:49:01, 2012-11-21 05:29:01,
+    2012-11-21 06:09:01, 2012-11-21 06:49:01, 2012-11-21 07:29:01, 2012-11-21 08:09:01,
+    2012-11-21 08:49:01, 2012-11-21 09:29:01, 2012-11-21 10:09:01
+  ]
+  obs_times_stb: [
+    2012-11-20 19:29:01, 2012-11-20 20:09:01, 2012-11-20 20:49:01, 2012-11-20 21:29:01,
+    2012-11-20 22:09:01, 2012-11-20 22:49:01, 2012-11-21 00:49:01, 2012-11-21 01:29:01,
+    2012-11-21 02:09:01, 2012-11-21 02:49:01, 2012-11-21 03:29:01, 2012-11-21 04:09:01,
+    2012-11-21 04:49:01, 2012-11-21 05:29:01, 2012-11-21 06:09:01, 2012-11-21 06:49:01,
+    2012-11-21 07:29:01, 2012-11-21 08:09:01, 2012-11-21 08:49:01, 2012-11-21 09:29:01,
+    2012-11-21 10:09:01, 2012-11-21 10:49:01, 2012-11-21 11:29:01, 2012-11-21 12:09:01,
+    2012-11-21 12:49:01, 2012-11-21 13:29:01, 2012-11-21 14:09:01, 2012-11-21 14:49:01,
+    2012-11-21 15:29:01
+  ]
+
+"01B":
+  model_start: 2010-04-08 04:00
+  obs_file: CME_01B__20100407__PA265_good_hi2.dat
+  arrival_time: 2010-04-11 13:04
+  first_guess:
+    time_at_21rs: 2010-04-08 20:34
+    speed: 258
+    width: 50
+    lon: -74
+    lat: 18
+    thick: 0
+
+"02A":
+  model_start: 2020-10-25 22:00
+  obs_file: CME_02A__20201025__PA272_good_hi2.dat
+  arrival_time: 2020-11-01 11:54
+  first_guess:
+    time_at_21rs: 2020-10-26 05:57
+    speed: 159
+    width: 36
+    lon: -15
+    lat: -10
+    thick: 0
+
+"03A":
+  model_start: 2021-11-01 18:00
+  obs_file: CME_03A__20211101__PA268_good_hi2.dat
+  arrival_time: 2021-11-03 19:49
+  first_guess:
+    time_at_21rs: 2021-11-02 05:46
+    speed: 1188
+    width: 102
+    lon: 5
+    lat: 18
+    thick: 0
+
+"04B":
+  model_start: 2010-05-24 10:00
+  obs_file: CME_04B__20100523__PA271_good_hi2.dat
+  arrival_time: 2010-05-28 02:58
+  first_guess:
+    time_at_21rs: 2010-05-24 20:31
+    speed: 542
+    width: 76
+    lon: 24
+    lat: 1
+    thick: 0
+
+"05B":
+  model_start: 2009-12-14 01:00
+  obs_file: CME_05B__20091215__PA266_good_hi2.dat
+  arrival_time: 2009-12-19 10:00
+  first_guess:
+    time_at_21rs: 2009-12-16 09:40
+    speed: 542
+    width: 48
+    lon: -7
+    lat: 10
+    thick: 0
+
+"06B":
+  model_start: 2011-06-14 04:00
+  obs_file: CME_06B__20110614__PA270_good_hi2.dat
+  first_guess:
+    time_at_21rs: 2011-06-14 14:13
+    speed: 672
+    width: 70
+    lon: -34
+    lat: 1
+    thick: 0
+
+"07B":
+  model_start: 2010-03-19 11:00
+  obs_file: CME_07B__20100318__PA264_good_hi2.dat
+  first_guess:
+    time_at_21rs: 2010-03-20 03:05
+    speed: 239
+    width: 66
+    lon: 36
+    lat: -4
+    thick: 0
+
+"08B":
+  model_start: 2010-04-03 03:00
+  obs_file: CME_08B__20100402__PA265_good_hi2.dat
+  first_guess:
+    time_at_21rs: 2010-04-03 14:36
+    speed: 740
+    width: 68
+    lon: 16
+    lat: -21
+    thick: 0
+
+"09A":
+  model_start: 2021-10-28 08:00
+  obs_file: CME_09A__20211027__PA268_good_hi2.dat
+  arrival_time: 2021-10-31 09:13
+  first_guess:
+    time_at_21rs: 2021-10-28 18:19
+    speed: 1368
+    width: 100
+    lon: 2
+    lat: -23
+    thick: 0
+
+"10A":
+  model_start: 2020-12-07 08:00
+  obs_file: CME_10A__20201206__PA266_good_hi2.dat
+  arrival_time: 2020-12-10 02:10
+  first_guess:
+    time_at_21rs: 2020-12-07 18:44
+    speed: 1436
+    width: 82
+    lon: 8
+    lat: -18
+    thick: 0
+
+"11A":
+  model_start: 2020-09-30 07:00
+  obs_file: CME_11A__20200930__PA277_good_hi2.dat
+  first_guess:
+    time_at_21rs: 2020-10-01 08:49
+    speed: 126
+    width: 32
+    lon: 14
+    lat: 12
+    thick: 0
+
+"12A":
+  model_start: 2021-02-10 16:00
+  obs_file: CME_12A__20210210__PA263_good_hi2.dat
+  first_guess:
+    time_at_21rs: 2021-02-10 23:12
+    speed: 262
+    width: 26
+    lon: -33
+    lat: -3
+    thick: 0
+
+"13B":
+  model_start: 2011-05-24 23:00
+  obs_file: CME_13B__20110524__PA271_good_hi2.dat
+  arrival_time: 2011-05-28 00:14
+  first_guess:
+    time_at_21rs: 2011-05-25 17:40
+    speed: 598
+    width: 52
+    lon: 6
+    lat: -10
+    thick: 0
+
+"14B":
+  model_start: 2011-07-11 06:00
+  obs_file: CME_14B__20110710__PA274_good_hi2.dat
+  arrival_time: 2011-07-14 12:00
+  first_guess:
+    time_at_21rs: 2011-07-11 17:40
+    speed: 552
+    width: 42
+    lon: 14
+    lat: -11
+    thick: 0
+
+"15B":
+  model_start: 2011-10-28 17:00
+  obs_file: CME_15B__20111027__PA276_good_hi2.dat
+  arrival_time: 2011-11-01 08:09
+  first_guess:
+    time_at_21rs: 2011-10-29 08:36
+    speed: 589
+    width: 78
+    lon: -7
+    lat: 24
+    thick: 0

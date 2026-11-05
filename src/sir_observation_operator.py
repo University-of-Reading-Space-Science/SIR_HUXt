@@ -20,7 +20,7 @@ import huxt.huxt_analysis as HA
 
 import datetime
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
@@ -31,6 +31,7 @@ from init_sir import setup_huxt, setup_surf, setup_surf3d
 from cme_par_ens import CmeParEns
 from cme_par_dict_structure import required_dict_keys
 from obs_bias import apply_bias, BiasPredictor
+from cme_arrival import member_arrival
 
 import atexit
 import time
@@ -166,6 +167,63 @@ class ObsOpSettings:
     search_band_time_pad_hours: float = 2.0  # as in SURF
 
     bias_predictor: BiasPredictor = field(default_factory=BiasPredictor)
+
+
+def add_obs_bias(
+    obs_op: npt.NDArray[np.float64],
+    cme_par_dict: CmeParEns,
+    settings: "ObsOpSettings",
+    n_members: int,
+) -> npt.NDArray[np.float64]:
+    """
+    Observation-bias term, the same for every model (surf, huxt, compress_surf, compress_surf3d):
+     h' = h + beta * p(h) for each member (see obs_bias.py). beta is 0 unless the bias is estimated or
+     fixed (and, in twin experiments, for the synthetic truth it is the injected bias), so this leaves
+     the elongations unchanged by default.
+    :param obs_op: Modelled elongations without the bias term, (n_members, n_times)
+    :param cme_par_dict: Ensemble (its "bias" entry gives each member's beta)
+    :param settings: ObsOpSettings (its bias_predictor gives p(h))
+    :param n_members: Number of members
+    :return: Elongations with the bias term
+    """
+    beta: npt.NDArray[np.float64] = np.asarray(
+        cme_par_dict.get("bias", 0.0), dtype=float
+    )
+    if np.any(beta != 0):
+        obs_op = apply_bias(
+            obs_op,
+            np.broadcast_to(np.atleast_1d(beta), (n_members,)),
+            **settings.bias_predictor.kwargs(),
+        )
+    return obs_op
+
+
+def same_observer(
+    pos_a: tuple[Quantity, Quantity, Quantity],
+    pos_b: tuple[Quantity, Quantity, Quantity],
+    tol_deg: float = 0.0,
+) -> bool:
+    """
+    Whether two observer positions (radius, longitude, latitude) are the same, to within tol_deg in
+    longitude and latitude and the same angle (tol_deg in radians) as a fraction of the radius.
+    tol_deg = 0 means identical positions.
+    """
+    r_a, lon_a, lat_a = (
+        float(np.ravel(np.asarray(x.value))[0])
+        for x in (pos_a[0].to(u.AU), pos_a[1].to(u.deg), pos_a[2].to(u.deg))
+    )
+    r_b, lon_b, lat_b = (
+        float(np.ravel(np.asarray(x.value))[0])
+        for x in (pos_b[0].to(u.AU), pos_b[1].to(u.deg), pos_b[2].to(u.deg))
+    )
+    if tol_deg <= 0:
+        return (r_a, lon_a, lat_a) == (r_b, lon_b, lat_b)
+    dlon: float = abs((lon_a - lon_b + 180.0) % 360.0 - 180.0)
+    return bool(
+        dlon <= tol_deg
+        and abs(lat_a - lat_b) <= tol_deg
+        and abs(r_a - r_b) <= np.deg2rad(tol_deg) * max(r_a, r_b)
+    )
 
 
 def merge_tracked_features(
@@ -698,6 +756,7 @@ class ObserverSynthHI:
         * u.hour,
         diag_info: dict | None = None,
         settings: ObsOpSettings | None = None,
+        n_diag_times: int | None = None,
     ) -> None:
         """
         Class to generate synthetic HI profiles and extract the elongation profiles
@@ -713,8 +772,12 @@ class ObserverSynthHI:
         :param hi_resolution: Temporal resolution to model the HI data in
         :param diag_info: Member information for the diagnostics (None = no diagnostics)
         :param settings: ObsOpSettings (search band, extrapolation, diagnostics; None = the defaults)
+        :param n_diag_times: Only the first n_diag_times observation times are the observation(s) being
+            assimilated (the others are later observations evaluated from the same run, see
+            ObservationOperator's extra_obs_times); the diagnostics cover only these. None = all times
         """
         self.settings: ObsOpSettings = ObsOpSettings() if settings is None else settings
+        self.n_diag_times: int | None = n_diag_times
 
         self.use_model: str = use_model
         if self.use_model not in ["compress_surf", "compress_surf3d"]:
@@ -1069,7 +1132,15 @@ class ObserverSynthHI:
         )
         frame_days: npt.NDArray[np.float64] = surf_run.time_out.to(u.day).value
         elons_deg: npt.NDArray[np.float64] = imager.e.to(u.deg).value
-        obs_days: npt.NDArray[np.float64] = np.atleast_1d(self.obs_time_day.value)
+        # (only the observation(s) being assimilated, see n_diag_times)
+        n_diag: int = (
+            len(np.atleast_1d(self.obs_time_day.value))
+            if self.n_diag_times is None
+            else int(self.n_diag_times)
+        )
+        obs_days: npt.NDArray[np.float64] = np.atleast_1d(self.obs_time_day.value)[
+            :n_diag
+        ]
 
         # Observer position and the smallest elongation the model domain can show
         r_obs: float = float(imager.position.r[0].to(u.solRad).value)
@@ -1091,7 +1162,7 @@ class ObserverSynthHI:
                 }
             )
 
-        elon_interp = np.atleast_1d(np.asarray(elon_interp, dtype=float))
+        elon_interp = np.atleast_1d(np.asarray(elon_interp, dtype=float))[:n_diag]
         # Classify against the merged track actually used for the interpolation
         if track_t is None or track_e is None:
             track_t, track_e = merge_tracked_features(cme_profile)
@@ -1119,7 +1190,7 @@ class ObserverSynthHI:
         cme: S.ConeCME | None = surf_run.cmes[0] if surf_run.cmes else None
         record: dict[str, Any] = {
             "ens_no": diag_info.get("ens_no"),
-            "obs_time_utc": [str(t) for t in np.atleast_1d(self.obs_time)],
+            "obs_time_utc": [str(t) for t in np.atleast_1d(self.obs_time)[:n_diag]],
             "obs_time_day": obs_days.tolist(),
             "model_elongation": elon_interp.tolist(),
             "reason": reasons,
@@ -1209,6 +1280,11 @@ class ObserverSynthHI:
 
 
 class ObservationOperator:
+    # (defaults for an instance whose later observations were not set up in __init__)
+    n_main_times: int = 1
+    extra_obs_index: list[int] = []
+    extra_obs_times_used: list[datetime.datetime] = []
+
     def __init__(
         self,
         use_model: str,
@@ -1240,13 +1316,15 @@ class ObservationOperator:
         cme_fixed_duration: bool = True,
         fixed_duration: Quantity[u.s] = 12 * 60 * 60 * u.s,
         plot_surf_output: bool = False,
-        bias_term_bool: bool = False,
-        bias_term_5rs: float = None,
-        bias_term_21rs: float = None,
         use_parallel: bool = True,
         write_diagnostics: bool = True,
         settings: ObsOpSettings | None = None,
         worker_pool: WorkerPool | None = None,
+        compress_sim_time: Quantity[u.day] | None = None,
+        arrival_object: str | None = None,
+        extra_obs_times: list[datetime.datetime] | None = None,
+        extra_obs_positions: list[tuple[Quantity, Quantity, Quantity]] | None = None,
+        observer_tol_deg: float = 0.0,
     ) -> None:
         """
         Class to get observations operator for DA from
@@ -1274,17 +1352,28 @@ class ObservationOperator:
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
         :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
-        :param bias_term_bool: Boolean to determine whether to use bias term or not
-        :param bias_term_5rs: Float to determine bias term at 5Rs
-        :param bias_term_21rs: Float to determine bias term at 21Rs
-        :param bias_term_5rs: Float to determine bias term at 5Rs
-        :param bias_term_21rs: Float to determine bias term at 21Rs
         :param use_parallel: Boolean to determine whether to use multiprocessing
         :param write_diagnostics: Allow the per-member diagnostics (also needs settings.write_diagnostics)
         :param settings: ObsOpSettings (imager range, search band, extrapolation, diagnostics, bias
             predictor; None = the defaults)
         :param worker_pool: WorkerPool shared by the run (None = a pool is started and closed for
             each call of get_cme_flanks)
+        :param compress_sim_time: Run length of the compressible SURF models (compress_surf,
+            compress_surf3d); None = 3 days. The other models run for sim_time
+        :param arrival_object: If given (e.g. "EARTH"), each member's CME arrival at this body is also
+            taken from the same model run, in the attrs["arrival"] of its flank DataFrame (see
+            cme_arrival.member_arrival)
+        :param extra_obs_times: Later observation times whose elongations are also evaluated from the
+            same model runs (for PFSettings.reuse_model_runs). Only those whose observer position is
+            the same as this observation's (see observer_tol_deg) are evaluated; they are listed in
+            self.extra_obs_index, and make_obs_op puts their elongations (without the bias term) in
+            self.extra_elongations. The observation operator itself (make_obs_op's result) is
+            unchanged. Needs a single observation time in obs_time_in_datetime
+        :param extra_obs_positions: Observer position (radius, longitude, latitude) at each of
+            extra_obs_times, when the observer position is given (twin experiments, craft "twin" or
+            None); a real craft's positions come from its ephemeris, as for this observation
+        :param observer_tol_deg: Largest change in observer longitude and latitude (deg) for which a
+            later observation is evaluated from the same run (0 = the same position only)
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
                INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE
                IN CASE OF REAL OBS
@@ -1395,9 +1484,16 @@ class ObservationOperator:
         # Observation value(s), if provided (only used for printing)
         self.obs: list[float] | float | None = obs
         self.write_diagnostics: bool = write_diagnostics
+        self.compress_sim_time: Quantity[u.day] = (
+            3 * u.day if compress_sim_time is None else compress_sim_time
+        )
+        self.arrival_object: str | None = arrival_object
 
         # Initialise observation related quantities.
         #  craft=None is treated like "twin": use the observer position provided.
+        craft_positions: (
+            Callable[[datetime.datetime], tuple[Quantity, Quantity, Quantity]] | None
+        ) = None
         if (craft is None) or (str(craft).lower() == "twin"):
             self.obs_radius: list[Quantity[u.AU]] | Quantity[u.AU] = obs_radius
             self.obs_lon: list[Quantity[u.deg]] | Quantity[u.deg] = obs_lon
@@ -1427,6 +1523,28 @@ class ObservationOperator:
             self.obs_radius = craft_observer.r[ind_req].to(u.AU)
             self.obs_lon = craft_observer.lon[ind_req].to(u.deg)
             self.obs_lat = craft_observer.lat[ind_req].to(u.deg)
+
+            def craft_position_at(
+                t: datetime.datetime,
+            ) -> tuple[Quantity, Quantity, Quantity]:
+                """The craft's position at time t, located as for the observation above"""
+                i: int = int(
+                    np.argmin(
+                        np.abs(
+                            [
+                                (cod - t).total_seconds()
+                                for cod in craft_observer_datetime
+                            ]
+                        )
+                    )
+                )
+                return (
+                    craft_observer.r[i].to(u.AU),
+                    craft_observer.lon[i].to(u.deg),
+                    craft_observer.lat[i].to(u.deg),
+                )
+
+            craft_positions = craft_position_at
 
             craft_obs_class: SynthObsEphem = SynthObsEphem(
                 surf_init_time=surf_init_time,
@@ -1475,14 +1593,36 @@ class ObservationOperator:
 
         self.obs_cov = obs_cov
 
-        # Read in bias terms
-        self.plot_surf_output: bool = plot_surf_output
-        self.bias_term_bool: bool = bias_term_bool
-        self.bias_term_5rs: float = bias_term_5rs
-        self.bias_term_21rs: float = bias_term_21rs
+        # Later observations evaluated from the same model runs (see extra_obs_times)
+        self.n_main_times: int = (
+            1
+            if isinstance(self.obs_time_in_datetime, datetime.datetime)
+            else len(self.obs_time_in_datetime)
+        )
+        self.extra_obs_index: list[int] = []
+        self.extra_obs_times_used: list[datetime.datetime] = []
+        if extra_obs_times and isinstance(self.obs_time_in_datetime, datetime.datetime):
+            main_pos: tuple[Quantity, Quantity, Quantity] = (
+                self.obs_radius,
+                self.obs_lon,
+                self.obs_lat,
+            )
+            if np.size(main_pos[1]) == 1:
+                for j, t_extra in enumerate(extra_obs_times):
+                    if craft_positions is not None:
+                        pos_j = craft_positions(t_extra)
+                    elif extra_obs_positions is not None:
+                        pos_j = extra_obs_positions[j]
+                    else:
+                        continue
+                    if same_observer(main_pos, pos_j, observer_tol_deg):
+                        self.extra_obs_index.append(j)
+                        self.extra_obs_times_used.append(t_extra)
+        self.extra_elongations: npt.NDArray[np.float64] = np.full(
+            (self.n_members, len(self.extra_obs_index)), np.nan
+        )
 
-        if (self.bias_term_5rs is None) or (self.bias_term_21rs is None):
-            self.bias_term_bool = False
+        self.plot_surf_output: bool = plot_surf_output
 
         # Determine whether to use parallel computation for each ensemble member
         self.use_parallel: bool = use_parallel
@@ -1721,7 +1861,7 @@ class ObservationOperator:
                 vr_in=self.vr_in,
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
-                sim_time=3 * u.day,
+                sim_time=self.compress_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
@@ -1743,7 +1883,7 @@ class ObservationOperator:
                 lon_start=self.lon_start,
                 lon_stop=self.lon_stop,
                 n_lon_surf=self.n_lon_surf,
-                sim_time=3 * u.day,
+                sim_time=self.compress_sim_time,
                 dt_scale=self.dt_scale,
                 r_min=self.r_min,
                 solver=self.solver,
@@ -1788,7 +1928,11 @@ class ObservationOperator:
             cme_flank: pd.DataFrame = observer_object.model_flank
 
         elif self.use_model in ["compress_surf", "compress_surf3d"]:
-            obs_datetime: npt.NDArray[np.object_] = np.array(self.obs_time_in_datetime)
+            obs_datetime: npt.NDArray[np.object_] = (
+                np.array([self.obs_time_in_datetime] + self.extra_obs_times_used)
+                if self.extra_obs_times_used
+                else np.array(self.obs_time_in_datetime)
+            )
             obs_radius: Quantity = np.array(self.obs_radius.to(u.AU).value) * u.AU
             obs_longitude = np.array(self.obs_lon.to(u.deg).value) * u.deg
             obs_latitude: Quantity = np.array(self.obs_lat.to(u.deg).value) * u.deg
@@ -1805,6 +1949,7 @@ class ObservationOperator:
                 el_min=self.settings.imager_elon_min,
                 el_max=self.settings.imager_elon_max,
                 settings=self.settings,
+                n_diag_times=self.n_main_times if self.extra_obs_times_used else None,
                 # (no diagnostics for e.g. full elongation profiles, where NaNs before the CME
                 #  appears and after it leaves the field of view are expected)
                 diag_info=(
@@ -1820,7 +1965,10 @@ class ObservationOperator:
             )
             cme_flank: pd.DataFrame = obs_synth_HI_class.model_flank
 
-            if self.write_diagnostics and np.isnan(cme_flank["el"].values).any():
+            if (
+                self.write_diagnostics
+                and np.isnan(cme_flank["el"].values[: self.n_main_times]).any()
+            ):
                 print("=====================================================")
                 print(f"psi_ert_avg = {self.psi_ert_avg}")
                 print(f"Observation operator failed: ens_no = {ens_no}")
@@ -1839,6 +1987,12 @@ class ObservationOperator:
 
         if ens_no is not None:
             cme_flank.index = [ens_no for _ in range(len(cme_flank.index))]
+
+        # The member's CME arrival from the same model run
+        if self.arrival_object is not None:
+            cme_flank.attrs["arrival"] = member_arrival(
+                model, self.use_model, self.arrival_object
+            )
 
         if self.plot_surf_output:
             self.plot_surf(model)
@@ -1931,31 +2085,19 @@ class ObservationOperator:
 
         return cme_flanks
 
-    def obs_op_bias_correction(
-        self, elon: float | npt.NDArray[np.float64]
-    ) -> float | npt.NDArray[np.float64]:
-        """
-        Function to calculate the bias correction due to using tracer particles to measure CME flank
-        Initial experiments will use a simple linear relation
-        :param elon: Elongation to calculate the bias correction for
-        :return: bias_corr: bias correction
-        """
-        # Straight line through (x1, bias_term_5rs) and (x2, bias_term_21rs) with x1 = 5, x2 = 21
-        x1: float = 5.0
-        x2: float = 21.0
-        m: float = (self.bias_term_21rs - self.bias_term_5rs) / (x2 - x1)
-        c: float = self.bias_term_5rs - (m * x1)
-
-        return (m * elon) + c
-
-    def make_obs_op(self) -> npt.NDArray[np.float64]:
+    def make_obs_op(self, include_bias: bool = True) -> npt.NDArray[np.float64]:
         """
         obs_op: The purpose of this definition is to perform the observation operator
                   function that maps from the cme_parameters to observation space (in this
                   case, the CME's flank position)
-        :return: obs_op: CME flank estimated by model
+        :param include_bias: Add the observation-bias term h' = h + beta * p(h) (obs_bias.py), the
+            same for every model. False gives the modelled flank elongation h alone (as for the full
+            elongation profiles, to which osse_ana.py adds the bias when plotting)
+        :return: obs_op: CME flank estimated by model (n_members, n_times)
         """
         cme_flanks: list[pd.DataFrame] = self.get_cme_flanks()
+        # Kept for callers that also want each member's arrival (attrs["arrival"])
+        self.last_cme_flanks: list[pd.DataFrame] = cme_flanks
 
         # Get type of a list of datetimes
         type_list_datetime: bool = isinstance(self.obs_time_in_datetime, list) and all(
@@ -1978,8 +2120,7 @@ class ObservationOperator:
         single_time: bool = isinstance(self.obs_time_in_datetime, datetime.datetime)
 
         if self.use_model in ["surf", "huxt"]:
-            # Elongation at the model output time nearest each observation time, plus the optional
-            #  linear bias correction
+            # Elongation at the model output time nearest each observation time
             obs_times_in_jd: list[float] | npt.NDArray[np.float64] = (
                 [Time(self.obs_time_in_datetime).jd]
                 if single_time
@@ -1997,31 +2138,41 @@ class ObservationOperator:
                     )
                     for t in obs_times_in_jd
                 ]
-                el: npt.NDArray[np.float64] = cme_flank["el"].values[inds_req]
-                if self.bias_term_bool:
-                    el = el + self.obs_op_bias_correction(elon=el)
-                obs_op[i, :] = el
+                obs_op[i, :] = cme_flank["el"].values[inds_req]
+
+            # Later observations evaluated from the same runs (extra_obs_times), each picked as it
+            #  would be if it were the observation being assimilated (a single time)
+            if self.extra_obs_times_used:
+                extra_jd: npt.NDArray[np.float64] = Time(
+                    self.extra_obs_times_used, format="datetime"
+                ).jd
+                for i, cme_flank in enumerate(cme_flanks):
+                    times_jd = np.asarray(cme_flank["time"].values, dtype=float)
+                    el_all = np.asarray(cme_flank["el"].values, dtype=float)
+                    self.extra_elongations[i, :] = [
+                        el_all[int(np.argmin(abs(times_jd - t)))] for t in extra_jd
+                    ]
 
         elif self.use_model in ["compress_surf", "compress_surf3d"]:
-            # The flank is already evaluated at the observation time(s)
+            # The flank is already evaluated at the observation time(s), followed by any later
+            #  observations evaluated from the same runs (extra_obs_times)
+            n_main: int = self.n_main_times
             for i, cme_flank in enumerate(cme_flanks):
-                obs_op[i, :] = (
-                    cme_flank["el"].values[0] if single_time else cme_flank["el"].values
+                el: npt.NDArray[np.float64] = np.asarray(
+                    cme_flank["el"].values, dtype=float
                 )
+                obs_op[i, :] = el[0] if single_time else el[:n_main]
+                if self.extra_obs_times_used:
+                    self.extra_elongations[i, :] = el[
+                        n_main : n_main + len(self.extra_obs_times_used)
+                    ]
         else:
             sys.exit(f"make_obs_op: unsupported use_model '{self.use_model}'")
 
-        # Observation-bias term: h' = h + beta * p(h) for each member (see obs_bias.py). beta is 0 unless
-        #  the bias is estimated or fixed (and, in twin experiments, for the synthetic truth it is the
-        #  injected bias), so this leaves the elongations unchanged by default.
-        beta: npt.NDArray[np.float64] = np.asarray(
-            self.cme_par_dict.get("bias", 0.0), dtype=float
-        )
-        if np.any(beta != 0):
-            obs_op = apply_bias(
-                obs_op,
-                np.broadcast_to(np.atleast_1d(beta), (self.n_members,)),
-                **self.settings.bias_predictor.kwargs(),
+        # Observation-bias term (see add_obs_bias)
+        if include_bias:
+            obs_op = add_obs_bias(
+                obs_op, self.cme_par_dict, self.settings, self.n_members
             )
 
         return obs_op

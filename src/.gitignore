@@ -8,3 +8,26 @@ __pycache__
 *.hdf5
 
 *.png
+
+# Files not needed to run the data assimilation (data_assimilation_routine.py) or osse_ana.py
+#  (they need only the modules they import, and events.yaml)
+# Analysis and test scripts that neither imports
+innovation_statistics.py
+twin_bias_test.py
+twin_summary.py
+wsa_reader.py
+# Notebook and its exported page
+osse_analysis.ipynb
+osse_ana.html
+# Unused files and logs
+config.dat
+mypy.ini
+nohup.out
+# Folders: old versions, backups and side projects (WSA_DIR in .env uses ../WSA_fits_files)
+_backup/
+origHuxt/
+optimised_comparison/
+surf_err_prop/
+WSA_fits_files/
+.mypy_cache/
+.pytest_cache/

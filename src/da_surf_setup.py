@@ -18,6 +18,7 @@ from astropy.time import Time
 import functools
 from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -26,6 +27,107 @@ from init_sir import initialise_cme_parameter_ensemble_dict
 from cme_par_ens import CmeParEns
 from aux_pf import PFSettings
 from sir_observation_operator import ObsOpSettings
+
+
+def events_file() -> Path:
+    """events.yaml next to this file (data_assimilation_routine.py copies it into each experiment)"""
+    return Path(__file__).with_name("events.yaml")
+
+
+@functools.cache
+def load_events(path: str | None = None) -> dict[str, dict[str, Any]]:
+    """
+    The CME events in events.yaml: model start time, observation file, first guesses and (for
+    osse_ana.py) arrival time of each event, and the truth and first-guess CMEs of twin experiments,
+    with the times as datetimes
+    :param path: events.yaml to read, e.g. the copy in an experiment folder; None = the one next to
+        this file
+    """
+    with open(events_file() if path is None else path) as f:
+        events: dict[str, dict[str, Any]] = {
+            str(code): event for code, event in (yaml.safe_load(f) or {}).items()
+        }
+    for event in events.values():
+        event["model_start"] = _to_datetime(event["model_start"])
+        if "arrival_time" in event:
+            event["arrival_time"] = _to_datetime(event["arrival_time"])
+        for key in ("obs_times_sta", "obs_times_stb"):
+            if key in event:
+                event[key] = [_to_datetime(t) for t in event[key]]
+        for key in ("first_guess", "first_guess_other", "truth"):
+            for time_key in ("time_at_21rs", "launch_time"):
+                if key in event and time_key in event[key]:
+                    event[key][time_key] = _to_datetime(event[key][time_key])
+    return events
+
+
+def get_event(code: str, path: str | None = None) -> dict[str, Any]:
+    """The entry of event `code` in events.yaml (path: see load_events)"""
+    events: dict[str, dict[str, Any]] = load_events(path)
+    if code not in events:
+        raise KeyError(
+            f"Unknown event {code!r}: add it to events.yaml (events there: {', '.join(events)})"
+        )
+    return events[code]
+
+
+def get_twin_cme(code: str, which: str, path: str | None = None) -> dict[str, Any]:
+    """
+    The truth or first-guess CME of twin experiment `code` in events.yaml, with lon or lat "earth"
+    replaced by Earth's direction (HEEQ) at the model start
+    :param code: Name of the twin experiment in events.yaml (e.g. "twin")
+    :param which: "truth" or "first_guess"
+    :param path: events.yaml to read (see load_events)
+    :return: {"t_init": time at the model's inner boundary, "speed": km/s, "width": deg, "lon": deg,
+        "lat": deg, "thick": solar radii}
+    """
+    event: dict[str, Any] = get_event(code, path)
+    entry: str = (
+        "truth"
+        if which == "first_guess" and event.get("sample_first_guess", False)
+        else which
+    )
+    if which not in ("truth", "first_guess") or "launch_time" not in event.get(
+        entry, {}
+    ):
+        raise KeyError(
+            f"Twin experiment {code!r} in events.yaml needs a {which} entry with a launch_time"
+        )
+    # Runs that draw their first guess from the prior around the truth: the first guess (the centre
+    #  of those draws) is the truth
+    if which == "first_guess" and event.get("sample_first_guess", False):
+        which = "truth"
+    cme: dict[str, Any] = event[which]
+    twin_cme: dict[str, Any] = {"t_init": cme["launch_time"]}
+    for key in ("speed", "width", "lon", "lat", "thick"):
+        value: Any = cme[key]
+        if (
+            key in ("lon", "lat")
+            and isinstance(value, str)
+            and value.strip().lower() == "earth"
+        ):
+            earth: S.Observer = S.Observer(
+                "EARTH", Time(event["model_start"], format="datetime")
+            )
+            twin_cme[key] = getattr(earth, key).to(u.deg).value
+        else:
+            twin_cme[key] = float(value)
+    return twin_cme
+
+
+def is_twin_experiment(code: str, path: str | None = None) -> bool:
+    """
+    Whether `code` is a twin experiment in events.yaml (an entry with a truth CME, e.g. "twin");
+    path: see load_events
+    """
+    return "truth" in load_events(path).get(code, {})
+
+
+def _to_datetime(value: Any) -> datetime.datetime:
+    """A time from events.yaml (YYYY-MM-DD HH:MM, read as text or as a YAML timestamp)"""
+    if isinstance(value, datetime.datetime):
+        return value.replace(tzinfo=None)
+    return datetime.datetime.fromisoformat(str(value))
 
 
 @functools.cache
@@ -65,7 +167,43 @@ class Setup:
     def get_use_synthetic_obs(self) -> bool:
         use_synthetic_obs: bool = False
 
+        # A twin experiment chosen as the event in get_ssw_event_craft (e.g. "twin") always uses
+        #  synthetic observations
+        if is_twin_experiment(self.get_ssw_event_craft()[0]):
+            use_synthetic_obs = True
+
         return use_synthetic_obs
+
+    def get_twin_experiment(self) -> str:
+        """
+        The twin experiment (entry of events.yaml with the truth and first-guess CMEs) used when
+        get_use_synthetic_obs() is True
+        """
+        # The event chosen in get_ssw_event_craft if it is a twin experiment, otherwise "twin" (for
+        #  synthetic observations with a real event's code)
+        ssw_event: str = self.get_ssw_event_craft()[0]
+        twin_experiment: str = ssw_event if is_twin_experiment(ssw_event) else "twin"
+
+        return twin_experiment
+
+    def get_twin_run_sampling(self) -> dict[str, bool]:
+        """
+        How the runs of a twin experiment differ (events.yaml, the twin's entry):
+        sample_first_guess: each run's first guess is a draw from the prior around the truth (run
+            numbers >= 0; negative run numbers start from the truth itself)
+        new_obs_noise_per_run: each run gets its own observation noise (seeded by the run number)
+        Both False for real observations, or when the entry does not set them.
+        """
+        sampling: dict[str, bool] = {
+            "sample_first_guess": False,
+            "new_obs_noise_per_run": False,
+        }
+        if self.get_use_synthetic_obs():
+            event: dict[str, Any] = get_event(self.get_twin_experiment())
+            for key in sampling:
+                sampling[key] = bool(event.get(key, False))
+
+        return sampling
 
     def get_bias_settings(self) -> dict[str, Any]:
         """
@@ -99,11 +237,15 @@ class Setup:
 
     def get_pf_settings(self) -> PFSettings:
         """
-        Settings of the auxiliary particle filter (adaptive resampling and its ESS threshold, and
-        what to do when a member produces no elongation); see aux_pf.PFSettings
+        Settings of the auxiliary particle filter (adaptive resampling and its ESS threshold, what to
+        do when a member produces no elongation, the first-stage weights and the reuse of model runs);
+        see aux_pf.PFSettings. For example, to read the elongations of unchanged particles from
+        earlier model runs (same results, fewer model runs) and to use the current particles'
+        likelihoods as the first-stage weights (no model runs of the shrunk particles):
+            return PFSettings(reuse_model_runs=True, first_stage="current")
         :return: PFSettings
         """
-        return PFSettings()
+        return PFSettings(reuse_model_runs=True)
 
     def get_obs_op_settings(self) -> ObsOpSettings:
         """
@@ -154,15 +296,24 @@ class Setup:
         return correlation_settings
 
     def get_ssw_event_craft(self) -> tuple[str, str, str]:
-        ssw_event: str = "13B"
+        ssw_event: str = "twin_base"
 
-        if ssw_event[0:3] != "ssw":
-            if ssw_event[2] == "A":
-                craft: str = "sta"
-            elif ssw_event[2] == "B":
-                craft = "stb"
-        else:
+        # Observing spacecraft: from the event code (09A -> STEREO-A, 13B -> STEREO-B, ssw_ events ->
+        #  STEREO-A); "twin" for a twin experiment (synthetic observations)
+        craft: str
+        if is_twin_experiment(ssw_event):
+            craft = "twin"
+        elif ssw_event[0:3] == "ssw":
             craft = "sta"
+        elif ssw_event[2:3] == "A":
+            craft = "sta"
+        elif ssw_event[2:3] == "B":
+            craft = "stb"
+        else:
+            raise ValueError(
+                f"Event {ssw_event!r}: not a twin experiment in events.yaml (an entry with a truth) and"
+                f" its spacecraft cannot be told from the code (e.g. 09A -> sta, 13B -> stb)"
+            )
 
         img: str = "diff"
 
@@ -172,92 +323,11 @@ class Setup:
         ssw_event: str
         ssw_event, _, _ = self.get_ssw_event_craft()
         if self.get_use_synthetic_obs():
-            surf_init_time: datetime.datetime = datetime.datetime(2012, 1, 1, 0, 0)
+            surf_init_time: datetime.datetime = get_event(self.get_twin_experiment())[
+                "model_start"
+            ]
         else:
-            if ssw_event == "ssw_007":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2012, 8, 31, 0, 0, 0
-                )
-
-            elif ssw_event == "ssw_008":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2012, 9, 27, 15, 0, 0
-                )
-
-            elif ssw_event == "ssw_009":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2012, 10, 4, 20, 0, 0
-                )
-
-            elif ssw_event == "ssw_012":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2012, 11, 20, 0, 0, 0
-                )
-
-            elif ssw_event == "01B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2010, 4, 8, 4, 0, 0
-                )
-            elif ssw_event == "02A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2020, 10, 26, 12, 0, 0
-                )
-            elif ssw_event == "03A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2021, 11, 1, 18, 0, 0
-                )
-            elif ssw_event == "04B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2010, 5, 24, 10, 0, 0
-                )
-            elif ssw_event == "05B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2009, 12, 14, 1, 0, 0
-                )
-            elif ssw_event == "06B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2011, 6, 14, 4, 0, 0
-                )
-            elif ssw_event == "07B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2010, 3, 19, 11, 0, 0
-                )
-            elif ssw_event == "08B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2010, 4, 3, 3, 0, 0
-                )
-            elif ssw_event == "09A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2021, 10, 28, 8, 0, 0
-                )
-            elif ssw_event == "10A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2020, 12, 7, 8, 0, 0
-                )
-            elif ssw_event == "11A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2020, 9, 30, 7, 0, 0
-                )
-            elif ssw_event == "12A":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2021, 2, 10, 16, 0, 0
-                )
-            elif ssw_event == "13B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2011, 5, 24, 23, 0, 0
-                )
-            elif ssw_event == "14B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2011, 7, 11, 6, 0, 0
-                )
-            elif ssw_event == "15B":
-                surf_init_time: datetime.datetime = datetime.datetime(
-                    2011, 10, 28, 17, 0, 0
-                )
-            else:
-                sys.exit(
-                    "Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'"
-                )
+            surf_init_time = get_event(ssw_event)["model_start"]
 
         return surf_init_time
 
@@ -273,6 +343,38 @@ class Setup:
         assert use_model.lower() in poss_models
 
         return use_model.lower()
+
+    def get_twin_latitude_range(self) -> tuple[Quantity, Quantity]:
+        """
+        Latitude range of the SURF3d grid: lat_min/lat_max of the twin experiment in events.yaml
+        (default -30 and 30 deg) for synthetic observations, NaN (set from the imager's field of view)
+        for real observations. Warns if the truth or first-guess CME is not inside the range
+        :return: latitude_min, latitude_max
+        """
+        if not self.get_use_synthetic_obs():
+            return np.nan * u.deg, np.nan * u.deg
+
+        twin_experiment: str = self.get_twin_experiment()
+        event: dict[str, Any] = get_event(twin_experiment)
+        lat_min: float = float(event.get("lat_min", -30))
+        lat_max: float = float(event.get("lat_max", 30))
+        if not lat_min < lat_max:
+            raise ValueError(
+                f"Twin experiment {twin_experiment!r} in events.yaml: lat_min ({lat_min}) must be"
+                f" less than lat_max ({lat_max})"
+            )
+        for which in ("truth", "first_guess"):
+            cme: dict[str, Any] = get_twin_cme(twin_experiment, which)
+            cme_lat_min: float = cme["lat"] - cme["width"] / 2
+            cme_lat_max: float = cme["lat"] + cme["width"] / 2
+            if cme_lat_min < lat_min or cme_lat_max > lat_max:
+                print(
+                    f"WARNING: twin experiment {twin_experiment!r}: the {which} CME spans latitudes"
+                    f" {cme_lat_min:.1f} to {cme_lat_max:.1f} deg, outside the SURF3d grid"
+                    f" ({lat_min:g} to {lat_max:g} deg); widen lat_min/lat_max in events.yaml"
+                )
+
+        return lat_min * u.deg, lat_max * u.deg
 
     def initialise_surf_parameters(self) -> dict[str, Any]:
         """
@@ -299,8 +401,12 @@ class Setup:
         print(use_model)
         lon_start: Quantity[u.deg] = -70 * u.deg
         lon_stop: Quantity[u.deg] = 70 * u.deg
-        latitude_min: Quantity = -30 * u.deg
-        latitude_max: Quantity = 30 * u.deg
+        # Latitude range of the SURF3d grid (compress_surf3d): for twin experiments lat_min/lat_max of
+        #  the twin entry in events.yaml; for real observations NaN, i.e. the range is set from the
+        #  imager's field of view in sir_observation_operator.ObservationOperator
+        latitude_min: Quantity[u.deg]
+        latitude_max: Quantity[u.deg]
+        latitude_min, latitude_max = self.get_twin_latitude_range()
         n_lat_surf: int = 45
         sim_time: Quantity[u.day] = 3 * u.day
         dt_scale: int = 10
@@ -428,15 +534,19 @@ class Setup:
             1, surf_init_time
         )
 
-        # Initialise true CME parameters
-        true_cme_t_init: datetime.datetime = surf_init_time + datetime.timedelta(
-            hours=1
+        # Initialise true CME parameters: the truth of the twin experiment in events.yaml. The
+        #  launch time is kept relative to the model start (so it is the truth's launch_time in twin
+        #  runs; runs with real observations have no truth CME)
+        twin_experiment: str = self.get_twin_experiment()
+        truth: dict[str, Any] = get_twin_cme(twin_experiment, "truth")
+        true_cme_t_init: datetime.datetime = surf_init_time + (
+            truth["t_init"] - get_event(twin_experiment)["model_start"]
         )
-        true_cme_speed: float = 495
-        true_cme_width: float = 37.4
-        true_cme_lon: float = 0
-        true_cme_lat: float = 0
-        true_cme_thick: float = 0
+        true_cme_speed: float = truth["speed"]
+        true_cme_width: float = truth["width"]
+        true_cme_lon: float = truth["lon"]
+        true_cme_lat: float = truth["lat"]
+        true_cme_thick: float = truth["thick"]
 
         true_cme_par_dict["t_init"]: datetime.datetime = true_cme_t_init
         true_t_init_str: str = true_cme_par_dict["t_init"].strftime("%Y%m%d-%H%M")
@@ -463,684 +573,39 @@ class Setup:
         donki_cme: bool = True
 
         if self.get_use_synthetic_obs():
-            surf_init_time: datetime.datetime = self.get_surf_init_time()
-            cme_at_12rs: datetime.datetime = surf_init_time + datetime.timedelta(
-                hours=1
+            # First guess of the twin experiment in events.yaml
+            first_guess: dict[str, Any] = get_twin_cme(
+                self.get_twin_experiment(), "first_guess"
             )
-            surf_init_time_astro: Time = Time(surf_init_time, format="datetime")
-            ert: S.Observer = S.Observer("EARTH", surf_init_time_astro)
-            earth_lat: Quantity = ert.lat.to(u.deg)
-            earth_lon: Quantity = ert.lon.to(u.deg)
-
-            fg_cme_speed: float = 495
-            fg_cme_width: float = 37.4
-            fg_cme_lon: float = earth_lon.value
-            fg_cme_lat: float = earth_lat.value
-            fg_cme_thick: float = 0
+            cme_at_12rs: datetime.datetime = first_guess["t_init"]
+            fg_cme_speed: float = first_guess["speed"]
+            fg_cme_width: float = first_guess["width"]
+            fg_cme_lon: float = first_guess["lon"]
+            fg_cme_lat: float = first_guess["lat"]
+            fg_cme_thick: float = first_guess["thick"]
         else:
-            if donki_cme:
-                if ssw_event == "ssw_007":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 8, 31, 22, 43, 0
-                    )
-                    print(f"CR = {sn.carrington_rotation_number(cme_at_21rs)}")
-                    fg_cme_speed: float = 1498
-
-                    dist_from_12_to_21rs_km: float = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs: float = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 150
-                    fg_cme_lon: float = -63
-                    fg_cme_lat: float = -15
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_008":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 9, 28, 1, 56, 0
-                    )
-
-                    fg_cme_speed: float = 1160
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 170
-                    fg_cme_lon: float = 30
-                    fg_cme_lat: float = 5
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_009":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 10, 5, 9, 15, 0
-                    )
-
-                    fg_cme_speed: float = 650
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 94
-                    fg_cme_lon: float = 10
-                    fg_cme_lat: float = -28
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_012":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 11, 20, 17, 32, 0
-                    )
-
-                    fg_cme_speed: float = 725
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 60
-                    fg_cme_lon: float = 90
-                    fg_cme_lat: float = 5
-                    fg_cme_thick: float = 0
-                elif ssw_event == "01B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 4, 8, 20, 34, 0
-                    )
-
-                    fg_cme_speed: float = 258
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 50
-                    fg_cme_lon: float = -74
-                    fg_cme_lat: float = 18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "02A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 10, 26, 5, 57, 0
-                    )
-
-                    fg_cme_speed: float = 159
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 36
-                    fg_cme_lon: float = -15
-                    fg_cme_lat: float = -10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "03A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 11, 2, 5, 46, 0
-                    )
-
-                    fg_cme_speed: float = 1188
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 102
-                    fg_cme_lon: float = 5
-                    fg_cme_lat: float = 18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "04B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 5, 24, 20, 31, 0
-                    )
-
-                    fg_cme_speed: float = 542
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 76
-                    fg_cme_lon: float = 24
-                    fg_cme_lat: float = 1
-                    fg_cme_thick: float = 0
-                elif ssw_event == "05B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2009, 12, 16, 9, 40, 0
-                    )
-
-                    fg_cme_speed: float = 542
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 48
-                    fg_cme_lon: float = -7
-                    fg_cme_lat: float = 10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "06B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 6, 14, 14, 13, 0
-                    )
-
-                    fg_cme_speed: float = 672
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 70
-                    fg_cme_lon: float = -34
-                    fg_cme_lat: float = 1
-                    fg_cme_thick: float = 0
-                elif ssw_event == "07B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 3, 20, 3, 5, 0
-                    )
-
-                    fg_cme_speed: float = 239
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 66
-                    fg_cme_lon: float = 36
-                    fg_cme_lat: float = -4
-                    fg_cme_thick: float = 0
-                elif ssw_event == "08B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 4, 3, 14, 36, 0
-                    )
-
-                    fg_cme_speed: float = 740
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 68
-                    fg_cme_lon: float = 16
-                    fg_cme_lat: float = -21
-                    fg_cme_thick: float = 0
-                elif ssw_event == "09A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 10, 28, 18, 19, 0
-                    )
-
-                    fg_cme_speed: float = 1368
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 100
-                    fg_cme_lon: float = 2
-                    fg_cme_lat: float = -23
-                    fg_cme_thick: float = 0
-                elif ssw_event == "10A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 12, 7, 18, 44, 0
-                    )
-
-                    fg_cme_speed: float = 1436
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 82
-                    fg_cme_lon: float = 8
-                    fg_cme_lat: float = -18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "11A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 10, 1, 8, 49, 0
-                    )
-
-                    fg_cme_speed: float = 126
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 32
-                    fg_cme_lon: float = 14
-                    fg_cme_lat: float = 12
-                    fg_cme_thick: float = 0
-                elif ssw_event == "12A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 2, 10, 23, 12, 0
-                    )
-
-                    fg_cme_speed: float = 262
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 26
-                    fg_cme_lon: float = -33
-                    fg_cme_lat: float = -3
-                    fg_cme_thick: float = 0
-                elif ssw_event == "13B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 5, 25, 17, 40, 0
-                    )
-
-                    fg_cme_speed: float = 598
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 52
-                    fg_cme_lon: float = 6
-                    fg_cme_lat: float = -10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "14B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 7, 11, 17, 40, 0
-                    )
-
-                    fg_cme_speed: float = 552
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 42
-                    fg_cme_lon: float = 14
-                    fg_cme_lat: float = -11
-                    fg_cme_thick: float = 0
-                elif ssw_event == "15B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 10, 29, 8, 36, 0
-                    )
-
-                    fg_cme_speed: float = 589
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 78
-                    fg_cme_lon: float = -7
-                    fg_cme_lat: float = 24
-                    fg_cme_thick: float = 0
-                else:
-                    sys.exit(
-                        "Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'"
-                    )
-            else:
-                if ssw_event == "ssw_007":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 8, 31, 22, 46, 0
-                    )
-                    print(f"CR = {sn.carrington_rotation_number(cme_at_21rs)}")
-                    fg_cme_speed: float = 1010
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 66
-                    fg_cme_lon: float = -30
-                    fg_cme_lat: float = 0
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_008":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 9, 28, 3, 49, 0
-                    )
-
-                    fg_cme_speed: float = 872
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 110
-                    fg_cme_lon: float = 20
-                    fg_cme_lat: float = 4
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_009":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 10, 5, 8, 47, 0
-                    )
-
-                    fg_cme_speed: float = 698
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 84
-                    fg_cme_lon: float = 9
-                    fg_cme_lat: float = -24
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "ssw_012":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2012, 11, 20, 17, 40, 0
-                    )
-
-                    fg_cme_speed: float = 664
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 94
-                    fg_cme_lon: float = 22
-                    fg_cme_lat: float = 20
-                    fg_cme_thick: float = 0
-
-                elif ssw_event == "01B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 4, 8, 20, 34, 0
-                    )
-
-                    fg_cme_speed: float = 258
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 50
-                    fg_cme_lon: float = -74
-                    fg_cme_lat: float = 18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "02A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 10, 26, 5, 57, 0
-                    )
-
-                    fg_cme_speed: float = 159
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 36
-                    fg_cme_lon: float = -15
-                    fg_cme_lat: float = -10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "03A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 11, 2, 5, 46, 0
-                    )
-
-                    fg_cme_speed: float = 1188
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 102
-                    fg_cme_lon: float = 5
-                    fg_cme_lat: float = 18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "04B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 5, 24, 20, 31, 0
-                    )
-
-                    fg_cme_speed: float = 542
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 76
-                    fg_cme_lon: float = 24
-                    fg_cme_lat: float = 1
-                    fg_cme_thick: float = 0
-                elif ssw_event == "05B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2009, 12, 16, 9, 40, 0
-                    )
-
-                    fg_cme_speed: float = 542
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 48
-                    fg_cme_lon: float = -7
-                    fg_cme_lat: float = 10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "06B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 6, 14, 14, 13, 0
-                    )
-
-                    fg_cme_speed: float = 672
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 70
-                    fg_cme_lon: float = -34
-                    fg_cme_lat: float = 1
-                    fg_cme_thick: float = 0
-                elif ssw_event == "07B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 3, 20, 3, 5, 0
-                    )
-
-                    fg_cme_speed: float = 239
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 66
-                    fg_cme_lon: float = 36
-                    fg_cme_lat: float = -4
-                    fg_cme_thick: float = 0
-                elif ssw_event == "08B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2010, 4, 3, 14, 36, 0
-                    )
-
-                    fg_cme_speed: float = 740
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 68
-                    fg_cme_lon: float = 16
-                    fg_cme_lat: float = -21
-                    fg_cme_thick: float = 0
-                elif ssw_event == "09A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 10, 28, 18, 19, 0
-                    )
-
-                    fg_cme_speed: float = 1368
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 100
-                    fg_cme_lon: float = 2
-                    fg_cme_lat: float = -23
-                    fg_cme_thick: float = 0
-                elif ssw_event == "10A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 12, 7, 18, 44, 0
-                    )
-
-                    fg_cme_speed: float = 1436
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 82
-                    fg_cme_lon: float = 8
-                    fg_cme_lat: float = -18
-                    fg_cme_thick: float = 0
-                elif ssw_event == "11A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2020, 10, 1, 8, 49, 0
-                    )
-
-                    fg_cme_speed: float = 126
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 32
-                    fg_cme_lon: float = 14
-                    fg_cme_lat: float = 12
-                    fg_cme_thick: float = 0
-                elif ssw_event == "12A":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2021, 2, 10, 23, 12, 0
-                    )
-
-                    fg_cme_speed: float = 262
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 26
-                    fg_cme_lon: float = -33
-                    fg_cme_lat: float = -3
-                    fg_cme_thick: float = 0
-                elif ssw_event == "13B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 5, 25, 17, 40, 0
-                    )
-
-                    fg_cme_speed: float = 598
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 52
-                    fg_cme_lon: float = 6
-                    fg_cme_lat: float = -10
-                    fg_cme_thick: float = 0
-                elif ssw_event == "14B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 7, 11, 17, 40, 0
-                    )
-
-                    fg_cme_speed: float = 552
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 42
-                    fg_cme_lon: float = 14
-                    fg_cme_lat: float = -11
-                    fg_cme_thick: float = 0
-                elif ssw_event == "15B":
-                    cme_at_21rs: datetime.datetime = datetime.datetime(
-                        2011, 10, 29, 8, 36, 0
-                    )
-
-                    fg_cme_speed: float = 589
-
-                    dist_from_12_to_21rs_km = (9.5 * u.solRad).to(u.km).value
-                    time_from_12_to_21rs = dist_from_12_to_21rs_km / fg_cme_speed
-                    cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                        seconds=time_from_12_to_21rs
-                    )
-
-                    fg_cme_width: float = 78
-                    fg_cme_lon: float = -7
-                    fg_cme_lat: float = 24
-                    fg_cme_thick: float = 0
-                else:
-                    sys.exit(
-                        "Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'"
-                    )
+            # First guess from events.yaml: DONKI, or the other first guess if donki_cme is False
+            #  (events without one use the DONKI values)
+            event: dict[str, Any] = get_event(ssw_event)
+            first_guess: dict[str, Any] = (
+                event["first_guess"]
+                if donki_cme
+                else event.get("first_guess_other", event["first_guess"])
+            )
+            cme_at_21rs: datetime.datetime = first_guess["time_at_21rs"]
+            fg_cme_speed: float = first_guess["speed"]
+
+            # Launch time at 12 Rs (cme_init_rad), 9.5 Rs before 21.5 Rs at the first-guess speed
+            dist_from_12_to_21rs_km: float = (9.5 * u.solRad).to(u.km).value
+            time_from_12_to_21rs: float = dist_from_12_to_21rs_km / fg_cme_speed
+            cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
+                seconds=time_from_12_to_21rs
+            )
+
+            fg_cme_width: float = first_guess["width"]
+            fg_cme_lon: float = first_guess["lon"]
+            fg_cme_lat: float = first_guess["lat"]
+            fg_cme_thick: float = first_guess["thick"]
 
         # Time taken to get from cme_init_rad to r_min
         #  (reuse self.surf_par_dict if already built: initialise_surf_parameters re-reads the WSA map)
@@ -1269,55 +734,14 @@ class Setup:
             #  "sta"), which ObservationOperator uses to overwrite obs_lon with that craft's real position
             #  for both the truth run and every ensemble member, so obs_lon = 300 deg was silently ignored.
             craft = "twin"
-            bias_term_bool: bool = False  # True
             obs_filenames: list[str] = ["Synth_obs"]
         else:
-            bias_term_bool = False
-
-            if ssw_event in ["ssw_007", "ssw_008", "ssw_009", "ssw_012"]:
-                obs_file_name: str = "SSW_cme_classifications.hdf5"
-            elif ssw_event == "01B":
-                obs_file_name = "CME_01B__20100407__PA265_good_hi2.dat"
-            elif ssw_event == "02A":
-                obs_file_name = "CME_02A__20201025__PA272_good_hi2.dat"
-            elif ssw_event == "03A":
-                obs_file_name = "CME_03A__20211101__PA268_good_hi2.dat"
-            elif ssw_event == "04B":
-                obs_file_name = "CME_04B__20100523__PA271_good_hi2.dat"
-            elif ssw_event == "05B":
-                obs_file_name = "CME_05B__20091215__PA266_good_hi2.dat"
-            elif ssw_event == "06B":
-                obs_file_name = "CME_06B__20110614__PA270_good_hi2.dat"
-            elif ssw_event == "07B":
-                obs_file_name = "CME_07B__20100318__PA264_good_hi2.dat"
-            elif ssw_event == "08B":
-                obs_file_name = "CME_08B__20100402__PA265_good_hi2.dat"
-            elif ssw_event == "09A":
-                obs_file_name = "CME_09A__20211027__PA268_good_hi2.dat"
-            elif ssw_event == "10A":
-                obs_file_name = "CME_10A__20201206__PA266_good_hi2.dat"
-            elif ssw_event == "11A":
-                obs_file_name = "CME_11A__20200930__PA277_good_hi2.dat"
-            elif ssw_event == "12A":
-                obs_file_name = "CME_12A__20210210__PA263_good_hi2.dat"
-            elif ssw_event == "13B":
-                obs_file_name = "CME_13B__20110524__PA271_good_hi2.dat"
-            elif ssw_event == "14B":
-                obs_file_name = "CME_14B__20110710__PA274_good_hi2.dat"
-            elif ssw_event == "15B":
-                obs_file_name = "CME_15B__20111027__PA276_good_hi2.dat"
-            else:
-                sys.exit(
-                    "Unknown ssw_event name, expected ssw_event = 'ssw_007', 'ssw_008', 'ssw_009' or 'ssw_012'"
-                )
+            obs_file_name: str = get_event(ssw_event)["obs_file"]
 
             # Initialise a dummy SURF model to get
             obs_filenames: list[str] = [
                 os.path.join(str(os.getenv("OBS_DIR")), obs_file_name)
             ]
-        bias_term_5: float = 2.5
-        bias_term_21: float = 2.5
-
         use_parallel: bool = self.get_use_parallel()
 
         # Set limits on minimum and maximum elongation to use for simulating HI
@@ -1344,9 +768,6 @@ class Setup:
             "ssw_event": ssw_event,
             "craft": craft,
             "img": img,
-            "bias_term_bool": bias_term_bool,
-            "bias_term_5rs": bias_term_5,
-            "bias_term_21rs": bias_term_21,
             "use_parallel": use_parallel,
         }
 
@@ -1355,8 +776,8 @@ class Setup:
     def initialise_da_parameters(self) -> dict[str, Any]:
         n_members: int = 50
 
-        run_start: int = -1
-        n_runs: int = 1
+        run_start: int = 0
+        n_runs: int = 20
 
         delta_aux_pf: float = 0.98
         if self.get_use_synthetic_obs():

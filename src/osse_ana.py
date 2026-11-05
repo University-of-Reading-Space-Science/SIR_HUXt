@@ -13,6 +13,9 @@ import surf.surf as S
 import xarray as xr
 from sir_observations import Observations
 from output_names import (
+    bias_dir_name,
+    true_bias_suffix,
+    twin_sampling_dir_name,
     read_path,
     write_path,
     check_path_length,
@@ -26,7 +29,12 @@ import sunpy.coordinates.sun as sn
 import pandas as pd
 from multiprocessing import Pool
 
-from da_surf_setup import load_environment
+from da_surf_setup import load_environment, get_event, get_twin_cme, is_twin_experiment
+from cme_arrival import (
+    get_arrival_cme,
+    get_arrival_speed_from_front,
+    get_arrival_time_and_speed,
+)
 
 
 def safe_savefig(fig, out_path, **kwargs):
@@ -227,14 +235,13 @@ def get_prior_post_cme_pars_from_ds(ds, runNo=0):
     # Prior (first row) and posterior (last row) of each variable; ds may hold several runs
     #  (run, obs, member), in which case run runNo is taken
     names = ["t_init", "v", "width", "lon", "lat", "thick"]
-    try:
-        prior = {k: ds[k][0, :].values for k in names}
-        post = {k: ds[k][-1, :].values for k in names}
-        log_weights_in = ds["log_weight"][-1, :].values
-    except Exception:
-        prior = {k: ds[k][runNo, 0, :].values for k in names}
-        post = {k: ds[k][runNo, -1, :].values for k in names}
-        log_weights_in = ds["log_weight"][runNo, -1, :].values
+    # (ds[k][0, :] does not fail on several runs, so the run dimension is checked, not caught)
+    if "run" in ds.dims:
+        run_values = list(np.ravel(ds["run"].values))
+        ds = ds.isel(run=run_values.index(runNo) if runNo in run_values else 0)
+    prior = {k: ds[k].values[0, :] for k in names}
+    post = {k: ds[k].values[-1, :] for k in names}
+    log_weights_in = ds["log_weight"].values[-1, :]
     (
         prior_t_init_in,
         prior_v_in,
@@ -305,91 +312,6 @@ def get_transit_time_to_r_min(ds, cme_speed):
     return ((r_min - cme_init_rad) / cme_speed).to(u.s)
 
 
-def get_arrival_cme(model, use_model, cme_hit_object="EARTH"):
-    """
-    Return the solved ConeCME used for arrival statistics.
-    For compress_surf3d the model is a stack of 2D SURF runs, one per latitude. The CME must be
-    taken from the latitude slice nearest the target body's latitude; SURFlat[0] is the most
-    southerly slice (e.g. -7.7 deg), not the one containing Earth.
-    :param model: Solved SURF/SURF3d/HUXt model
-    :param use_model: Model name
-    :param cme_hit_object: Body the CME arrival is computed for
-    :return: ConeCME object of the relevant (latitude slice of the) model
-    """
-    if use_model in ["compress_surf3d"]:
-        times = model.SURFlat[0].time_init + model.SURFlat[0].time_out
-        body = S.Observer(cme_hit_object.upper(), times)
-        body_lat = np.nanmean(body.lat.to(u.deg).value)
-        slice_lats = np.array([sl.latitude.to(u.deg).value for sl in model.SURFlat])
-        i_lat = int(np.argmin(np.abs(slice_lats - body_lat)))
-        return model.SURFlat[i_lat].cmes[0]
-    return model.cmes[0]
-
-
-def get_arrival_speed_from_front(cme, stats, n_side=2):
-    """
-    Estimate the CME front speed at arrival as dr/dt of the front along the hit longitude.
-    Needed for the compressible SURF solver, which tracks the CME front radius but never fills
-    the tracer-particle speeds (cme_particles_v stays NaN), so compute_arrival_at_body returns
-    v = NaN for every member.
-    :param cme: Solved ConeCME
-    :param stats: Output of cme.compute_arrival_at_body
-    :param n_side: Number of output time steps either side of the arrival step to fit
-    :return: Arrival speed in km/s (float), NaN if it cannot be estimated
-    """
-    if not stats["hit"]:
-        return np.nan
-    hit_id = int(stats["hit_id"])
-    hit_lon = stats["lon"].to(u.rad).value
-    t_list, r_list = [], []
-    for i in range(hit_id - n_side, hit_id + n_side + 1):
-        coord = cme.coords.get(i)
-        if (coord is None) or (len(coord["r"]) == 0):
-            continue
-        front = np.asarray(coord["front_id"].value) == 1.0
-        if np.sum(front) < 2:
-            continue
-        # longitudes relative to the CME nose, in (-pi, pi], so the front is monotonic in lon
-        lon_rel = np.angle(
-            np.exp(
-                1j
-                * (coord["lon"].to(u.rad).value[front] - cme.longitude.to(u.rad).value)
-            )
-        )
-        target = np.angle(np.exp(1j * (hit_lon - cme.longitude.to(u.rad).value)))
-        order = np.argsort(lon_rel)
-        r_at = np.interp(
-            target,
-            lon_rel[order],
-            coord["r"].to(u.km).value[front][order],
-            left=np.nan,
-            right=np.nan,
-        )
-        if np.isfinite(r_at):
-            t_list.append(coord["time"].jd * 86400.0)
-            r_list.append(r_at)
-    if len(t_list) < 2:
-        return np.nan
-    slope = np.polyfit(np.array(t_list) - t_list[0], np.array(r_list), 1)[0]
-    return float(slope)
-
-
-def get_arrival_time_and_speed(model, use_model, cme_hit_object):
-    """
-    Solve-independent helper: compute arrival stats for the relevant CME, with a speed fallback
-    :return: (arrival datetime or NaN, arrival speed km/s or NaN, hit count 0/1, stats dict)
-    """
-    cme = get_arrival_cme(model, use_model, cme_hit_object)
-    stats = cme.compute_arrival_at_body(cme_hit_object)
-    if stats["hit"]:
-        arr_time = stats["t_arrive"].datetime
-        arr_speed = (stats["v"].to(u.km / u.s)).value
-        if not np.isfinite(arr_speed):
-            arr_speed = get_arrival_speed_from_front(cme, stats)
-        return arr_time, arr_speed, 1, stats
-    return np.nan, np.nan, 0, stats
-
-
 def get_true_cme_arrival_time(
     ds,
     use_model,
@@ -400,106 +322,43 @@ def get_true_cme_arrival_time(
     true_cme_lon,
     true_cme_thick,
     cme_hit_object="EARTH",
+    sim_time=5.0 * u.day,
 ):
-    print(ds["model_init_time"].values)
-    try:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
-        )
-        r_min_value = ds["r_min"].values * u.solRad
-        v_bound_val = ds["ambient_vr"].values * u.km / u.s
-    except:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values[0]), "%Y-%m-%dT%H:%M:%S.000000000"
-        )
-        r_min_value = ds["r_min"].values[0] * u.solRad
-        v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
-    else:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
-        )
-        r_min_value = ds["r_min"].values * u.solRad
-        v_bound_val = ds["ambient_vr"].values * u.km / u.s
-
-    print(start_time)
-    start_time_astro = Time(start_time, format="datetime")
-    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
-
-    if use_model in ["surf", "compress_surf"]:
-        ert = S.Observer("EARTH", start_time_astro)
-    elif use_model in ["huxt"]:
-        ert = H.Observer("EARTH", start_time_astro)
-    else:
+    """
+    Arrival time and speed at cme_hit_object of the true CME of a twin experiment, from a model set up
+    as for the ensemble's arrival times (make_arrival_model: the run's ambient solar wind, longitudes
+    300-420 deg and, for compress_surf3d, the SURF3d latitude range), so the two are comparable
+    :param ds: The run's cme_pars.nc (several runs concatenated along "run": the first is used)
+    :param use_model: "surf", "compress_surf", "compress_surf3d" or "huxt"
+    :param true_cme_t_init: Time the true CME is at cme_init_rad
+    :param true_cme_speed, true_cme_width, true_cme_lat, true_cme_lon, true_cme_thick: True CME (km/s,
+        deg, deg, deg, solar radii)
+    :param cme_hit_object: Body to compute the arrival at
+    :param sim_time: Model run length (a CME arriving later counts as a miss)
+    :return: (arrival datetime or NaN, arrival speed km/s or NaN)
+    """
+    if use_model not in ["surf", "compress_surf", "compress_surf3d", "huxt"]:
         sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
+            "Unknown use_model name, expected 'surf', 'compress_surf', 'compress_surf3d' or 'huxt'"
         )
-
-    lon_start = 300 * u.deg
-    lon_end = 420 * u.deg
-
-    # Initialise list
-    cme_arrival_prior = []
-    cme_arr_prior_speed = []
-    cme_arrival_post = []
-    cme_arr_post_speed = []
-
-    n_members = len(ds["ens_no"].values)
-
-    if use_model in ["surf"]:
-        model: SURF = S.SURF(
-            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=5 * u.day,
-            dt_scale=20,
-            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
-            solver="huxt",
-        )
-    elif use_model in ["compress_surf"]:
-        model: SURF = S.SURF(
-            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=5 * u.day,
-            dt_scale=20,
-            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
-            solver="hydro",
-        )
-    elif use_model in ["huxt"]:
-        model: HUXt = H.HUXt(
-            v_boundary=v_bound_val,  # ds["ambient_vr"].values * u.km / u.s,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=5 * u.day,
-            dt_scale=20,
-            r_min=r_min_value,  # ds["r_min"].values * u.solRad,
-        )
-    else:
-        sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
-        )
+    ds_run = ds.isel(run=0) if "run" in ds.dims else ds
+    model, start_time = make_arrival_model(
+        ds_run, use_model, sim_time=sim_time, dt_scale=20
+    )
+    print(f"Model start: {start_time}")
 
     # Generate CME object
     v_true = float(true_cme_speed) * u.km / u.s
     # Launch at r_min, not at cme_init_rad (see get_transit_time_to_r_min)
     sec_to_cme_true = float(
         (true_cme_t_init - start_time).total_seconds()
-    ) * u.s + get_transit_time_to_r_min(ds, v_true)
+    ) * u.s + get_transit_time_to_r_min(ds_run, v_true)
     width_true = float(true_cme_width) * u.deg
     lon_true = float(true_cme_lon) * u.deg
     lat_true = float(true_cme_lat) * u.deg
     thick_true = float(true_cme_thick) * u.solRad
 
-    if use_model in ["surf", "compress_surf"]:
+    if use_model in ["surf", "compress_surf", "compress_surf3d"]:
         cme_object: S.ConeCME = S.ConeCME(
             t_launch=sec_to_cme_true,
             v=v_true,
@@ -521,10 +380,6 @@ def get_true_cme_arrival_time(
             thickness=thick_true,
             cme_fixed_duration=True,
             fixed_duration=12 * 3600 * u.s,
-        )
-    else:
-        sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
         )
 
     # Make true CME arrival time
@@ -595,328 +450,64 @@ def get_cme_arrival_time(
     cme_hit_object="EARTH",
     base_file_path=None,
     parallel_ens=False,
+    sim_time_days=4.0,
 ):
-    print(ds["model_init_time"].values)
-    try:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
+    """
+    Prior and posterior CME arrival times at cme_hit_object of run runNo: statistics, a histogram of
+    the arrival-time errors and cme_arrival_stats.json in the run folder. The arrival times are read
+    from the run's arr_obs.nc (stage 0 = prior, last stage = posterior); compute_arrival_times_per_obs
+    computes those two stages only if they are not there yet, so the model is not rerun for them.
+    :param ds: Not used (the run is read from base_file_path/run_<runNo>); kept for existing calls
+    :param use_model: Model used in the run
+    :param runNo: Run number
+    :param real_arrival_time: Observed (or true) arrival time, for the errors
+    :param cme_hit_object: Body for the arrivals
+    :param base_file_path: Directory containing the run_<runNo> output folders
+    :param parallel_ens: Solve the members in parallel where arrivals must be computed
+    :param sim_time_days: Model run length (days) of the arrival runs, as for
+        compute_arrival_times_per_obs (CMEs arriving later count as misses)
+    """
+    if base_file_path is None:
+        raise ValueError(
+            "get_cme_arrival_time needs base_file_path (the folder of the run_NNN folders)"
         )
-        r_min_value = ds["r_min"].values * u.solRad
-        v_bound_val = ds["ambient_vr"].values * u.km / u.s
-    except:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values[0]), "%Y-%m-%dT%H:%M:%S.000000000"
-        )
-        r_min_value = ds["r_min"].values[0] * u.solRad
-        v_bound_val = ds["ambient_vr"].values[0] * u.km / u.s
-    else:
-        start_time = datetime.datetime.strptime(
-            str(ds["model_init_time"].values), "%Y-%m-%dT%H:%M:%S.000000000"
-        )
-        r_min_value = ds["r_min"].values * u.solRad
-        v_bound_val = ds["ambient_vr"].values * u.km / u.s
+    run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
+    par_ds = xr.load_dataset(os.path.join(run_dir, "cme_pars.nc"))
+    n_members = par_ds.sizes["n_ens"]
+    final_stage = par_ds.sizes["n_obs"] - 1
 
-    print(start_time)
-    start_time_astro = Time(start_time, format="datetime")
-    cr_num: int = np.trunc(sn.carrington_rotation_number(start_time))
+    arr_file = compute_arrival_times_per_obs(
+        base_file_path,
+        runNo=runNo,
+        use_model=use_model,
+        stages=[0, final_stage],
+        cme_hit_object=cme_hit_object,
+        sim_time_days=sim_time_days,
+        parallel=parallel_ens,
+    )
+    if arr_file is None:
+        print(f"get_cme_arrival_time: no arrival times for run {runNo}")
+        return None
+    with xr.load_dataset(arr_file) as arr_ds:
+        arr_times = arr_ds["arrival_time"].values
+        arr_speeds = np.asarray(arr_ds["arrival_speed"].values, dtype=float)
 
-    if use_model in ["surf", "compress_surf", "compress_surf3d"]:
-        ert = S.Observer("EARTH", start_time_astro)
-    elif use_model in ["huxt"]:
-        ert = H.Observer("EARTH", start_time_astro)
-    else:
-        sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
-        )
-
-    lon_start = 300 * u.deg
-    lon_end = 420 * u.deg
-
-    n_members = len(ds["ens_no"].values)
-
-    # (A leftover debugging block here printed each member's speeds and then called sys.exit(),
-    #  so the arrival-time analysis below never ran.)
-
-    # Initialise list
-    cme_arrival_prior = [None for _ in range(n_members)]
-    cme_arr_prior_speed = [None for _ in range(n_members)]
-    cme_arrival_post = [None for _ in range(n_members)]
-    cme_arr_post_speed = [None for _ in range(n_members)]
-
-    if use_model in ["huxt", "surf", "compress_surf"]:
-        try:
-            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
-            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
-        except:
-            v_bound_in = ds["ambient_vr"].values * u.km / u.s
-            r_min_in = ds["r_min"].values * u.solRad
-        else:
-            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
-            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
-    elif use_model in ["compress_surf3d"]:
-        try:
-            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
-            vr_longs_in = ds["vr_longs"].values[runNo, :, :] * u.deg
-            vr_lats_in = ds["vr_lats"].values[runNo, :, :] * u.deg
-            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
-        except:
-            v_bound_in = ds["ambient_vr"].values * u.km / u.s
-            vr_longs_in = ds["vr_longs"].values * u.deg
-            vr_lats_in = ds["vr_lats"].values * u.deg
-            r_min_in = ds["r_min"].values * u.solRad
-        else:
-            v_bound_in = ds["ambient_vr"].values[runNo, :, :] * u.km / u.s
-            vr_longs_in = ds["vr_longs"].values[runNo, :, :] * u.deg
-            vr_lats_in = ds["vr_lats"].values[runNo, :, :] * u.deg
-            r_min_in = ds["r_min"].values[runNo, :, :] * u.solRad
-
-    if use_model in ["surf"]:
-        model: SURF = S.SURF(
-            v_boundary=v_bound_in,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=5 * u.day,
-            dt_scale=20,
-            r_min=r_min_in,
-            solver="huxt",
-        )
-    elif use_model in ["compress_surf"]:
-        model: SURF = S.SURF(
-            v_boundary=v_bound_in,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=3 * u.day,
-            dt_scale=20,
-            r_min=r_min_in,
-            solver="hydro",
-        )
-    elif use_model in ["compress_surf3d"]:
-        # TODO: Need to remove hard-coded numbers here
-        model: SURF3d = S.SURF3d(
-            v_map=v_bound_in,
-            v_map_long=vr_longs_in,
-            v_map_lat=vr_lats_in,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude_min=-15 * u.deg,
-            latitude_max=15 * u.deg,
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=3 * u.day,
-            dt_scale=20,
-            r_min=r_min_in,
-            solver="hydro",
-        )
-    elif use_model in ["huxt"]:
-        model: HUXt = H.HUXt(
-            v_boundary=v_bound_in,
-            cr_num=cr_num,
-            cr_lon_init=ert.lon_c.to(u.deg),
-            latitude=ert.lat.to(u.deg),
-            lon_start=lon_start.to(u.rad),
-            lon_stop=lon_end.to(u.rad),
-            simtime=3 * u.day,
-            dt_scale=20,
-            r_min=r_min_in,
-        )
-    else:
-        sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf', 'compress_surf3d' or 'huxt'"
-        )
-
-    # Generate CME object
-
-    # Extract the CME parameters from the xr.Dataset
-    prior_dict, post_dict = get_prior_post_cme_pars_from_ds(ds, runNo=runNo)
-    # u.Quantity keeps the units (np.array of a list of Quantities returns a plain float array,
-    #  so v_prior.value below and the ConeCME unit checks failed)
-    sec_to_cme_prior = u.Quantity([t.to(u.s) for t in prior_dict["t_init"]])
-    v_prior = u.Quantity(prior_dict["v"])
-    width_prior = u.Quantity(prior_dict["width"])
-    lon_prior = u.Quantity(prior_dict["lon"])
-    lat_prior = u.Quantity(prior_dict["lat"])
-    thick_prior = u.Quantity(prior_dict["thick"])
-
-    # t_init in the DA output is the time the CME is at cme_init_rad, but these models start at r_min,
-    #  so (as in ObservationOperator.extract_cme_launch_time_and_speed) launch each CME at
-    #  t_init + (r_min - cme_init_rad) / v (about 3 h at 600 km/s).
-    sec_to_cme_prior = sec_to_cme_prior + get_transit_time_to_r_min(ds, v_prior)
-    sec_to_cme_post = [
-        t + get_transit_time_to_r_min(ds, v)
-        for t, v in zip(post_dict["t_init"], post_dict["v"])
-    ]
-
-    v_post = post_dict["v"]
-    width_post = post_dict["width"]
-    lon_post = post_dict["lon"]
-    lat_post = post_dict["lat"]
-    thick_post = post_dict["thick"]
-    log_weights_post = post_dict["log_weights"]
-    weights_post = post_dict["weights"]
-
-    print(f"t_init: {np.shape(sec_to_cme_prior.value)}, {sec_to_cme_prior}")
-    print(f"v_prior: {np.shape(v_prior.value)}, {v_prior}")
-    print(f"width_prior: {np.shape(width_prior.value)}, {width_prior}")
-    print(f"lon_prior: {np.shape(lon_prior)}, {lon_prior}")
-    print(f"lat_prior: {np.shape(lat_prior)}, {lat_prior}")
-    print(f"thick_prior: {np.shape(thick_prior)}, {thick_prior}")
-
-    print(f"v_post: {v_post}")
-    print(f"width_post: {width_post}")
-
-    if use_model in ["surf", "compress_surf", "compress_surf3d"]:
-        prior_cme_objects: list[S.ConeCME] = [
-            S.ConeCME(
-                t_launch=sec_to_cme_prior[i],
-                v=v_prior[i],
-                width=width_prior[i],
-                longitude=lon_prior[i],
-                latitude=lat_prior[i],
-                thickness=thick_prior[i],
-                cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s,
-            )
-            for i in range(n_members)
+    def stage_arrivals(stage):
+        times = [
+            (None if np.isnat(t) else pd.Timestamp(t).to_pydatetime())
+            for t in arr_times[stage]
         ]
+        return times, list(arr_speeds[stage])
 
-        post_cme_objects: list[S.ConeCME] = [
-            S.ConeCME(
-                t_launch=sec_to_cme_post[i],
-                v=v_post[i],
-                width=width_post[i],
-                longitude=lon_post[i],
-                latitude=lat_post[i],
-                thickness=thick_post[i],
-                cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s,
-            )
-            for i in range(n_members)
-        ]
-    elif use_model in ["huxt"]:
-        prior_cme_objects: list[H.ConeCME] = [
-            H.ConeCME(
-                t_launch=sec_to_cme_prior[i],
-                v=v_prior[i],
-                width=width_prior[i],
-                longitude=lon_prior[i],
-                latitude=lat_prior[i],
-                thickness=thick_prior[i],
-                cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s,
-            )
-            for i in range(n_members)
-        ]
-
-        post_cme_objects: list[H.ConeCME] = [
-            H.ConeCME(
-                t_launch=sec_to_cme_post[i],
-                v=v_post[i],
-                width=width_post[i],
-                longitude=lon_post[i],
-                latitude=lat_post[i],
-                thickness=thick_post[i],
-                cme_fixed_duration=True,
-                fixed_duration=12 * 3600 * u.s,
-            )
-            for i in range(n_members)
-        ]
-    else:
-        sys.exit(
-            "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
-        )
-
-    prior_count_hit_list = np.zeros(n_members)
-    post_count_hit_list = np.zeros(n_members)
-    prior_stat_dict = {}
-    post_stat_dict = {}
-
-    if parallel_ens:
-
-        def log_result(result):
-            # This is called whenever self.get_cme_flank_single_ens_member(i)
-            #  returns a result in parallel computation.
-            # result_list is modified only by the main process, not the pool workers.
-            result_list.append(result)
-
-        print("Use parallel execution on ensemble.")
-
-        # Initialise variables required for parallel computations
-        result_list = []
-        obj_result = [None] * n_members
-
-        # Use no more workers than there are ensemble members, leaving one core free
-        n_proc = max(1, min(int((os.cpu_count() or 2) - 1), int(n_members)))
-        pool = Pool(processes=n_proc)
-
-        for i in range(n_members):
-            obj_result[i] = pool.apply_async(
-                get_cme_stats_prior_post,
-                kwds={
-                    "ens_no": i,
-                    "n_members": n_members,
-                    "model": model,
-                    "use_model": use_model,
-                    "prior_cme": prior_cme_objects[i],
-                    "post_cme": post_cme_objects[i],
-                    "cme_hit_object": cme_hit_object,
-                },
-                callback=log_result,
-            )
-
-        pool.close()
-        pool.join()
-
-        for i in range(n_members):
-            obs_tuple = obj_result[i].get()
-
-            cme_arrival_prior[i] = obs_tuple[0]
-            cme_arr_prior_speed[i] = obs_tuple[1]
-            prior_count_hit_list[i] = obs_tuple[2]
-            prior_stat_dict[f"{i}"] = obs_tuple[3]
-
-            cme_arrival_post[i] = obs_tuple[4]
-            cme_arr_post_speed[i] = obs_tuple[5]
-            post_count_hit_list[i] = obs_tuple[6]
-            post_stat_dict[f"{i}"] = obs_tuple[7]
-
-        prior_count_hit = np.sum(prior_count_hit_list)
-        post_count_hit = np.sum(post_count_hit_list)
-
-    else:
-        print("Use serial execution on ensemble.")
-
-        for i in range(n_members):
-            obs_tuple = get_cme_stats_prior_post(
-                ens_no=i,
-                n_members=n_members,
-                model=model,
-                use_model=use_model,
-                prior_cme=prior_cme_objects[i],
-                post_cme=post_cme_objects[i],
-                cme_hit_object=cme_hit_object,
-            )
-
-            cme_arrival_prior[i] = obs_tuple[0]
-            cme_arr_prior_speed[i] = obs_tuple[1]
-            prior_count_hit_list[i] = obs_tuple[2]
-            prior_stat_dict[f"{i}"] = obs_tuple[3]
-
-            cme_arrival_post[i] = obs_tuple[4]
-            cme_arr_post_speed[i] = obs_tuple[5]
-            post_count_hit_list[i] = obs_tuple[6]
-            post_stat_dict[f"{i}"] = obs_tuple[7]
-
-        prior_count_hit = np.sum(prior_count_hit_list)
-        post_count_hit = np.sum(post_count_hit_list)
-
-    prior_hit_rate = prior_count_hit / n_members
-    post_hit_rate = post_count_hit / n_members
+    cme_arrival_prior, cme_arr_prior_speed = stage_arrivals(0)
+    cme_arrival_post, cme_arr_post_speed = stage_arrivals(final_stage)
+    # Posterior weights (normalised by renorm_weights_post below)
+    log_w_post = np.asarray(par_ds["log_weight"].values[final_stage], dtype=float)
+    weights_post = np.exp(
+        np.where(np.isfinite(log_w_post), log_w_post, -np.inf) - np.nanmax(log_w_post)
+    )
+    prior_hit_rate = np.mean([t is not None for t in cme_arrival_prior])
+    post_hit_rate = np.mean([t is not None for t in cme_arrival_post])
 
     print(f"Cme_arrival_prior = {cme_arrival_prior}")
     print(f"Cme_arr_prior_speed = {cme_arr_prior_speed}")
@@ -1761,6 +1352,78 @@ def plot_bias_evolution(
     return fig, axes
 
 
+def experiment_events_file(base_file_path, run_no):
+    """
+    The copy of events.yaml that data_assimilation_routine.py saved in an experiment folder (the
+    folder above run_NNN): events_run_NNN.yaml if events.yaml was edited before run NNN, otherwise
+    events.yaml; None if the experiment has no copy (runs before 5 Nov 2026)
+    """
+    for name in (f"events_run_{run_no:03d}.yaml", "events.yaml"):
+        path = os.path.join(base_file_path, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def read_twin_truth(ds, base_file_path, fallback, fallback_from_run=False):
+    """
+    The truth CME of the twin run being analysed, which may have been made with other settings than
+    the current events.yaml:
+    - the true_* attributes of cme_pars.nc (runs since 5 Nov 2026), otherwise
+    - the truth_<v>_<width>_<lon>_<lat>_<thick> folder in base_file_path; the launch time is not in
+      the folder name, so it is taken from `fallback` relative to the model start, i.e. the
+      run's model_init_time + (launch time - model start of the twin's entry in events.yaml)
+    - otherwise `fallback`
+    :param ds: The run's cme_pars.nc (with model_init_time)
+    :param base_file_path: Folder of the run_NNN folders
+    :param fallback: Truth from events.yaml (get_twin_cme), plus "model_start"
+    :param fallback_from_run: The fallback comes from the experiment's own copy of events.yaml
+        (experiment_events_file), so it is used before the folder name
+    :return: (truth: dict with t_init, speed, width, lon, lat, thick; where it came from)
+    """
+    attrs = ds.attrs
+    if "true_v" in attrs:
+        truth = {
+            "t_init": datetime.datetime.fromisoformat(str(attrs["true_t_init"])),
+            "speed": float(attrs["true_v"]),
+            "width": float(attrs["true_width"]),
+            "lon": float(attrs["true_lon"]),
+            "lat": float(attrs["true_lat"]),
+            "thick": float(attrs["true_thick"]),
+        }
+        return truth, "cme_pars.nc"
+    if fallback_from_run:
+        return {
+            k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")
+        }, "the experiment's copy of events.yaml"
+
+    for part in reversed(
+        os.path.normpath(base_file_path).replace("/", os.sep).split(os.sep)
+    ):
+        if not part.startswith("truth_"):
+            continue
+        try:
+            speed, width, lon, lat, thick = (
+                float(x) for x in part[len("truth_") :].split("_")[:5]
+            )
+        except ValueError:
+            break
+        model_init_time = pd.to_datetime(ds["model_init_time"].values).to_pydatetime()
+        truth = {
+            "t_init": model_init_time + (fallback["t_init"] - fallback["model_start"]),
+            "speed": speed,
+            "width": width,
+            "lon": lon,
+            "lat": lat,
+            "thick": thick,
+        }
+        return truth, f"folder name {part} (launch time from events.yaml)"
+
+    return {
+        k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")
+    }, "events.yaml"
+
+
 def load_profile_bias(run_dir):
     """
     The observation-bias term of a run, for adding to modelled elongation profiles.
@@ -2138,40 +1801,121 @@ def plot_full_elongation_profiles(
     return fig, ax
 
 
-def compute_elongation_profiles_per_obs(
+def _stage_list(stages, n_stage, assimilated):
+    """
+    Stages to compute: "assimilated" (the prior and the ensemble after each assimilated observation),
+    "all", or a list of stage numbers
+    """
+    if isinstance(stages, (list, tuple, np.ndarray)):
+        return sorted({int(s) for s in stages if 0 <= int(s) < n_stage})
+    if stages == "all":
+        return list(range(n_stage))
+    return [0] + [
+        k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]
+    ]
+
+
+def _separate_arrivals(
+    par_ds, use_model, pars, members, cme_hit_object, sim_time_days, model, pool
+):
+    """
+    Arrival times (s after the model start) and speeds of some members of an ensemble from separate
+    model runs (make_arrival_model), for members whose observation-operator run gave none
+    :param pars: (6, n_ens) parameters of the ensemble: t_init (s), v, width, lon, lat, thick
+    :param members: Indices of the members to run
+    :return: dict member -> (arrival seconds after the model start or NaN, speed km/s or NaN)
+    """
+    model_obj, start_time = model
+    v = pars[1] * u.km / u.s
+    t_launch = (pars[0] * u.s) + get_transit_time_to_r_min(par_ds, v)
+    cme_cls = H.ConeCME if use_model in ["huxt"] else S.ConeCME
+    cmes = {
+        i: cme_cls(
+            t_launch=t_launch[i],
+            v=v[i],
+            width=pars[2][i] * u.deg,
+            longitude=pars[3][i] * u.deg,
+            latitude=pars[4][i] * u.deg,
+            thickness=pars[5][i] * u.solRad,
+            cme_fixed_duration=True,
+            fixed_duration=12 * 3600 * u.s,
+        )
+        for i in members
+    }
+    if pool is not None:
+        jobs = {
+            i: pool.apply_async(
+                _arrival_for_cme, (model_obj, use_model, c, cme_hit_object)
+            )
+            for i, c in cmes.items()
+        }
+        results = {i: j.get() for i, j in jobs.items()}
+    else:
+        results = {
+            i: _arrival_for_cme(model_obj, use_model, c, cme_hit_object)
+            for i, c in cmes.items()
+        }
+    return {
+        i: (
+            ((t - start_time).total_seconds(), s) if t is not None else (np.nan, np.nan)
+        )
+        for i, (t, s) in results.items()
+    }
+
+
+def compute_profiles_and_arrivals_per_obs(
     base_file_path,
     runNo=-1,
+    use_model=None,
     stages="assimilated",
+    cme_hit_object="EARTH",
+    sim_time_days=4.0,
+    want_profiles=True,
+    want_arrivals=True,
+    parallel=True,
     overwrite=False,
 ):
     """
-    Compute the full (3-day) modelled CME flank elongation profile of every ensemble member for the
-    ensemble at each observation: the prior (stage 0) and the ensemble after observation k (stage k+1).
+    Full elongation profiles and/or CME arrival times at cme_hit_object of every member, for the
+    ensemble at each observation (stage 0 = prior, stage k+1 = after observation k), rebuilt from
+    <run dir>/cme_pars.nc. Each distinct ensemble is run ONCE: the observation operator's model run
+    (set up as in the data assimilation, RunDataAssimilationRoutine.calculate_elongation_profiles)
+    gives the profile and, from the same solved model, the arrival.
 
-    The ensembles are rebuilt from <run dir>/cme_pars.nc and run through the same observation operator
-    the data assimilation used (RunDataAssimilationRoutine.calculate_elongation_profiles), so the model
-    set-up, imager, search band and tracking match what the filter compared with the observations.
-    The routine is set up from the current da_surf_setup.py, which must match the run (the number of
-    members and the model start time are checked).
+    Model runs are avoided where possible:
+      - stages already in the output files are kept (unless overwrite)
+      - an ensemble identical to one already computed (the filter only reweighted, or the
+        observation was not assimilated) is copied (reused_from = that stage)
+      - the prior and posterior ensembles' profiles and arrivals saved by the data assimilation run
+        in ens_elongations.nc are used (reused_from = -2); its arrivals only if their body and run
+        length match cme_hit_object and sim_time_days
+    The arrivals come from separate runs (make_arrival_model, the former set-up) for members whose run
+    does not reach the body (a compress_surf3d latitude grid that misses it), and for every member if
+    the current da_surf_setup.py does not match the run (number of members, model start or model).
+    The profiles need da_surf_setup.py to match the run (as before).
 
-    An ensemble whose particles are identical to one already computed (e.g. an observation where the
-    filter only updated the weights, or one that was not assimilated) is not rerun: its profiles are
-    copied, and only its weights differ.
-
-    Output: <run dir>/elon_prof_obs.nc (formerly ens_elongation_profiles_per_obs.nc, which is still read) with
+    Output: <run dir>/elon_prof_obs.nc (want_profiles) with
         elon_profile (n_stage, n_ens, n_profile): elongation (deg), NaN where not visible/not computed
         extrapolated (n_stage, n_ens, n_profile): 1 where extrapolated before the first tracked point
-        log_weight (n_stage, n_ens): normalised log-weight of each member at that stage
-        computed (n_stage): 1 if profiles are available for that stage
-        reused_from (n_stage): stage whose model runs were reused (-1 if run for this stage)
-        stage_obs_no (n_stage): observation index after which the ensemble is taken (-1 = prior)
+        log_weight (n_stage, n_ens), computed (n_stage), reused_from (n_stage), stage_obs_no (n_stage)
         coords: stage, ens_no, profile_time, stage_obs_time
+    and <run dir>/arr_obs.nc (want_arrivals) with
+        arrival_time (n_stage, n_ens): arrival time (NaT if the CME does not arrive within the run)
+        arrival_speed (n_stage, n_ens): arrival speed (km/s)
+        log_weight, computed, reused_from, stage_obs_no as above; coords: stage, ens_no, stage_obs_time
+    (reused_from: -1 = run for this stage, -2 = from the data assimilation run, k = copied from stage k)
 
     :param base_file_path: Directory containing the run_<runNo> output folders
     :param runNo: Run number
-    :param stages: "assimilated" (prior + ensembles after each assimilated observation) or "all"
-    :param overwrite: If False and the output file exists, return it without recomputing
-    :return: Path of the output file, or None if the inputs are missing
+    :param use_model: Model used in the run (None = from ens_elongations.nc)
+    :param stages: "assimilated", "all" or a list of stage numbers
+    :param cme_hit_object: Body for the arrivals
+    :param sim_time_days: Model run length in days from the model start (CMEs arriving later miss)
+    :param want_profiles: Compute the profiles
+    :param want_arrivals: Compute the arrivals
+    :param parallel: Solve members in parallel
+    :param overwrite: Recompute every requested stage, ignoring existing output files
+    :return: (profile file or None, arrival file or None)
     """
     from data_assimilation_routine import RunDataAssimilationRoutine
     from init_sir import initialise_cme_parameter_ensemble_dict
@@ -2179,144 +1923,529 @@ def compute_elongation_profiles_per_obs(
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
     par_file = os.path.join(run_dir, "cme_pars.nc")
     elon_file = os.path.join(run_dir, "ens_elongations.nc")
-    # Short file name (output_names.py); a file under the old name, ens_elongation_profiles_per_obs.nc, is reused
-    existing_file = read_path(run_dir, "profiles_per_obs")
-    if os.path.isfile(existing_file) and not overwrite:
-        print(f"compute_elongation_profiles_per_obs: using existing {existing_file}")
-        return existing_file
-    out_file = write_path(run_dir, "profiles_per_obs")
-    # Check now, before the model runs, that the result can be written (Windows path limit)
-    check_path_length(out_file, what="per-observation elongation profile file")
-    for f in [par_file, elon_file]:
-        if not os.path.isfile(f):
-            print(f"compute_elongation_profiles_per_obs: {f} not found")
-            return None
-
+    if not os.path.isfile(par_file):
+        print(f"compute_profiles_and_arrivals_per_obs: {par_file} not found")
+        return None, None
     par_ds = xr.load_dataset(par_file)
-    elon_ds = xr.load_dataset(elon_file)
     n_stage = par_ds.sizes["n_obs"]  # prior + one row per observation
     n_ens = par_ds.sizes["n_ens"]
-    assimilated = elon_ds["assimilated"].values.astype(bool)
-    obs_time = pd.to_datetime(elon_ds["obs_time"].values)
-
-    run_da = RunDataAssimilationRoutine()
-    if run_da.n_members != n_ens:
-        raise ValueError(
-            f"da_surf_setup.py has n_members = {run_da.n_members} but the run has {n_ens} members; "
-            f"set da_surf_setup.py to the run's settings before computing its profiles."
+    elon_ds = xr.load_dataset(elon_file) if os.path.isfile(elon_file) else None
+    if elon_ds is not None:
+        assimilated = elon_ds["assimilated"].values.astype(bool)
+        obs_time = pd.to_datetime(elon_ds["obs_time"].values)
+    else:
+        # Older runs: every observation stage, no observation times
+        assimilated = np.ones(n_stage - 1, dtype=bool)
+        obs_time = pd.to_datetime([pd.NaT] * (n_stage - 1))
+    if want_profiles and elon_ds is None:
+        print(
+            f"compute_profiles_and_arrivals_per_obs: {elon_file} not found; no profiles"
         )
+        want_profiles = False
+    if use_model is None:
+        use_model = (
+            str(elon_ds.attrs.get("use_model", "compress_surf3d"))
+            if elon_ds is not None
+            else "compress_surf3d"
+        )
+    stage_list = _stage_list(stages, n_stage, assimilated)
     model_init_time = pd.to_datetime(
         np.ravel(par_ds["model_init_time"].values)[0]
     ).to_pydatetime()
-    if abs((model_init_time - run_da.surf_init_time).total_seconds()) > 1.0:
-        print(
-            f"Warning: run model start {model_init_time} differs from da_surf_setup.py "
-            f"({run_da.surf_init_time}); profiles use the setup's model start."
+    log_weight = np.asarray(par_ds["log_weight"].values, dtype=float)
+    par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
+
+    def stage_pars(st):
+        return np.array(
+            [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
         )
 
-    if stages == "all":
-        stage_list = list(range(n_stage))
-    else:
-        stage_list = [0] + [
-            k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]
-        ]
+    keys = {st: np.round(stage_pars(st), 6).tobytes() for st in range(n_stage)}
 
-    profile_times = run_da.get_profile_times()
-    n_prof = len(profile_times)
-    elon = np.full((n_stage, n_ens, n_prof), np.nan)
-    extrap = np.zeros((n_stage, n_ens, n_prof), dtype=np.int8)
-    computed = np.zeros(n_stage, dtype=np.int8)
-    reused_from = np.full(n_stage, -1, dtype=int)
-    log_weight = np.asarray(par_ds["log_weight"].values, dtype=float)
+    prof_out = write_path(run_dir, "profiles_per_obs")
+    arr_out = write_path(run_dir, "arrivals_per_obs")
+    # Check now, before the model runs, that the results can be written (Windows path limit)
+    if want_profiles:
+        check_path_length(prof_out, what="per-observation elongation profile file")
+    if want_arrivals:
+        check_path_length(arr_out, what="per-observation arrival-time file")
 
-    par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
-    cache = {}
-    try:
-        for st in stage_list:
-            pars = np.array(
-                [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
+    # Results so far: existing output files
+    prof = None  # dict(elon, extrap, computed, reused_from, times)
+    prof_read = read_path(run_dir, "profiles_per_obs")
+    if want_profiles and os.path.isfile(prof_read) and not overwrite:
+        with xr.load_dataset(prof_read) as p_ds:
+            prof = dict(
+                elon=np.asarray(p_ds["elon_profile"].values, dtype=float),
+                extrap=np.asarray(p_ds["extrapolated"].values).astype(np.int8),
+                computed=np.asarray(p_ds["computed"].values).astype(np.int8),
+                reused_from=np.asarray(p_ds["reused_from"].values).astype(int),
+                times=pd.to_datetime(p_ds["profile_time"].values)
+                .to_pydatetime()
+                .tolist(),
             )
-            key = np.round(pars, 6).tobytes()
-            if key in cache:
-                src = cache[key]
-                elon[st], extrap[st] = elon[src], extrap[src]
-                reused_from[st] = src
-                computed[st] = 1
+    arr = dict(
+        sec=np.full((n_stage, n_ens), np.nan),
+        speed=np.full((n_stage, n_ens), np.nan),
+        computed=np.zeros(n_stage, dtype=np.int8),
+        reused_from=np.full(n_stage, -1, dtype=int),
+    )
+    arr_read = read_path(run_dir, "arrivals_per_obs")
+    if want_arrivals and os.path.isfile(arr_read) and not overwrite:
+        with xr.load_dataset(arr_read) as a_ds:
+            same_target = str(
+                a_ds.attrs.get("cme_hit_object", cme_hit_object)
+            ).upper() == str(cme_hit_object).upper() and np.isclose(
+                float(a_ds.attrs.get("sim_time_days", sim_time_days)),
+                float(sim_time_days),
+            )
+            if same_target and a_ds.sizes.get("stage") == n_stage:
+                times = a_ds["arrival_time"].values
+                arr["sec"] = np.where(
+                    np.isnat(times),
+                    np.nan,
+                    (times - np.datetime64(model_init_time)) / np.timedelta64(1, "s"),
+                ).astype(float)
+                arr["speed"] = np.asarray(a_ds["arrival_speed"].values, dtype=float)
+                arr["computed"] = np.asarray(a_ds["computed"].values).astype(np.int8)
+                arr["reused_from"] = np.asarray(a_ds["reused_from"].values).astype(int)
+            else:
                 print(
-                    f"Stage {st}: particles unchanged since stage {src}, reusing its profiles"
+                    f"{arr_read} was computed for another body or run length; recomputing the arrivals"
                 )
+
+    def prof_done(st):
+        return prof is not None and bool(prof["computed"][st])
+
+    need_prof = [st for st in stage_list if want_profiles and not prof_done(st)]
+    need_arr = [st for st in stage_list if want_arrivals and not arr["computed"][st]]
+    if not need_prof and not need_arr:
+        print(
+            f"compute_profiles_and_arrivals_per_obs: run {runNo}: all requested stages already computed"
+        )
+        return (prof_read if want_profiles else None), (
+            arr_read if want_arrivals else None
+        )
+    changed_prof = changed_arr = False
+
+    def init_prof(times):
+        nonlocal prof
+        prof = dict(
+            elon=np.full((n_stage, n_ens, len(times)), np.nan),
+            extrap=np.zeros((n_stage, n_ens, len(times)), dtype=np.int8),
+            computed=np.zeros(n_stage, dtype=np.int8),
+            reused_from=np.full(n_stage, -1, dtype=int),
+            times=list(times),
+        )
+
+    def same_times(times):
+        return (
+            prof is not None
+            and len(prof["times"]) == len(times)
+            and all(
+                abs((a - b).total_seconds()) < 1.0 for a, b in zip(prof["times"], times)
+            )
+        )
+
+    # 1. Ensembles identical to a stage already computed
+    for st in list(need_prof):
+        src = next(
+            (
+                s
+                for s in range(n_stage)
+                if s != st and keys[s] == keys[st] and prof_done(s)
+            ),
+            None,
+        )
+        if src is not None:
+            prof["elon"][st], prof["extrap"][st] = (
+                prof["elon"][src],
+                prof["extrap"][src],
+            )
+            prof["computed"][st], prof["reused_from"][st] = 1, src
+            need_prof.remove(st)
+            changed_prof = True
+    for st in list(need_arr):
+        src = next(
+            (
+                s
+                for s in range(n_stage)
+                if s != st and keys[s] == keys[st] and arr["computed"][s]
+            ),
+            None,
+        )
+        if src is not None:
+            arr["sec"][st], arr["speed"][st] = arr["sec"][src], arr["speed"][src]
+            arr["computed"][st], arr["reused_from"][st] = 1, src
+            need_arr.remove(st)
+            changed_arr = True
+
+    # 2. The prior and posterior ensembles run by the data assimilation (ens_elongations.nc)
+    if elon_ds is not None:
+        last_assim = np.flatnonzero(assimilated)
+        da_stage = {
+            "prior": int(elon_ds.attrs.get("prior_profile_stage", 0)),
+            "posterior": int(
+                elon_ds.attrs.get(
+                    "posterior_profile_stage",
+                    int(last_assim[-1]) + 1 if last_assim.size else 0,
+                )
+            ),
+        }
+        arrivals_match = str(
+            elon_ds.attrs.get("profile_arrival_object", "")
+        ).upper() == str(cme_hit_object).upper() and np.isclose(
+            float(elon_ds.attrs.get("profile_sim_time_days", np.nan)),
+            float(sim_time_days),
+        )
+        for name, st_da in da_stage.items():
+            if f"{name}_profile_elon" not in elon_ds or not 0 <= st_da < n_stage:
                 continue
-
-            cme_par_dict = initialise_cme_parameter_ensemble_dict(
-                n_ensemble=n_ens, surf_init_time=run_da.surf_init_time
+            same = [s for s in set(need_prof) | set(need_arr) if keys[s] == keys[st_da]]
+            if not same:
+                continue
+            da_times = (
+                pd.to_datetime(elon_ds["profile_time"].values).to_pydatetime().tolist()
             )
-            cme_par_dict["t_init"] = [
-                model_init_time + datetime.timedelta(seconds=float(s)) for s in pars[0]
-            ]
-            cme_par_dict["v"] = list(pars[1]) * u.km / u.s
-            cme_par_dict["width"] = list(pars[2]) * u.deg
-            cme_par_dict["lon"] = list(pars[3]) * u.deg
-            cme_par_dict["lat"] = list(pars[4]) * u.deg
-            cme_par_dict["thick"] = list(pars[5]) * u.solRad
-            # Observation-bias coefficients of this ensemble. The profiles are the tracked CME flank
-            #  (get_cme_flanks), which does not include the bias term, so they do not depend on beta and
-            #  the cache key above rightly ignores it; the bias is added when plotting (load_profile_bias).
-            if "bias" in par_ds:
-                cme_par_dict["bias"] = [
-                    float(b) for b in np.asarray(par_ds["bias"].values[st], dtype=float)
+            if prof is None and want_profiles:
+                init_prof(da_times)
+            for st in same:
+                if st in need_prof and same_times(da_times):
+                    prof["elon"][st] = np.asarray(
+                        elon_ds[f"{name}_profile_elon"].values, dtype=float
+                    )
+                    prof["extrap"][st] = np.asarray(
+                        elon_ds[f"{name}_profile_extrapolated"].values
+                    ).astype(np.int8)
+                    prof["computed"][st], prof["reused_from"][st] = 1, -2
+                    need_prof.remove(st)
+                    changed_prof = True
+                if (
+                    st in need_arr
+                    and arrivals_match
+                    and f"{name}_profile_arrival_time" in elon_ds
+                    and np.all(elon_ds[f"{name}_profile_arrival_available"].values == 1)
+                ):
+                    times = elon_ds[f"{name}_profile_arrival_time"].values
+                    arr["sec"][st] = np.where(
+                        np.isnat(times),
+                        np.nan,
+                        (times - np.datetime64(model_init_time))
+                        / np.timedelta64(1, "s"),
+                    ).astype(float)
+                    arr["speed"][st] = np.asarray(
+                        elon_ds[f"{name}_profile_arrival_speed"].values, dtype=float
+                    )
+                    arr["computed"][st], arr["reused_from"][st] = 1, -2
+                    need_arr.remove(st)
+                    changed_arr = True
+            if same:
+                print(
+                    f"Stage(s) {sorted(same)}: from the data assimilation run's own {name} runs"
+                )
+
+    # 3. Run the remaining ensembles, one model run per member for both outputs
+    groups: dict[bytes, list[int]] = {}
+    for st in sorted(set(need_prof) | set(need_arr)):
+        groups.setdefault(keys[st], []).append(st)
+    n_obsop_runs = n_separate_runs = 0
+    run_da = None
+    setup_matches = False
+    arrival_model = None
+    pool = None
+    try:
+        if groups:
+            try:
+                run_da = RunDataAssimilationRoutine()
+            except Exception as err:
+                if need_prof:
+                    raise
+                print(
+                    f"Could not set up the data assimilation routine from da_surf_setup.py ({err}); "
+                    f"the arrivals come from separate model runs"
+                )
+            setup_matches = run_da is not None and (
+                run_da.n_members == n_ens
+                and abs((model_init_time - run_da.surf_init_time).total_seconds())
+                <= 1.0
+                and str(run_da.use_model).lower() == str(use_model).lower()
+            )
+            if need_prof:
+                if run_da.n_members != n_ens:
+                    raise ValueError(
+                        f"da_surf_setup.py has n_members = {run_da.n_members} but the run has {n_ens} "
+                        f"members; set da_surf_setup.py to the run's settings before computing its profiles."
+                    )
+                if abs((model_init_time - run_da.surf_init_time).total_seconds()) > 1.0:
+                    print(
+                        f"Warning: run model start {model_init_time} differs from da_surf_setup.py "
+                        f"({run_da.surf_init_time}); profiles use the setup's model start."
+                    )
+            if need_arr and not setup_matches:
+                print(
+                    "da_surf_setup.py does not match this run (members, model start or model): the "
+                    "arrivals come from separate model runs"
+                )
+        for key, sts in groups.items():
+            rep = sts[0]
+            pars = stage_pars(rep)
+            do_prof = any(st in need_prof for st in sts)
+            arr_sts = [st for st in sts if st in need_arr]
+            do_arr_obsop = bool(arr_sts) and setup_matches
+            sec_row = np.full(n_ens, np.nan)
+            speed_row = np.full(n_ens, np.nan)
+            missing = list(range(n_ens)) if arr_sts else []
+            if do_prof or do_arr_obsop:
+                cme_par_dict = initialise_cme_parameter_ensemble_dict(
+                    n_ensemble=n_ens, surf_init_time=run_da.surf_init_time
+                )
+                cme_par_dict["t_init"] = [
+                    model_init_time + datetime.timedelta(seconds=float(s))
+                    for s in pars[0]
                 ]
-            lw = log_weight[st]
-            lw = np.where(np.isfinite(lw), lw, -1e31)
-            cme_par_dict["log_weight"] = list(lw)
-            cme_par_dict["weight"] = list(np.exp(lw - np.max(lw)))
-
-            label = (
-                "prior"
-                if st == 0
-                else f"after observation {st - 1} ({obs_time[st - 1]})"
-            )
-            print(f"Stage {st}: computing elongation profiles for the ensemble {label}")
-            prof = run_da.calculate_elongation_profiles(
-                cme_par_dict, obs_index=max(st - 1, 0)
-            )
-            elon[st] = prof["elon"]
-            extrap[st] = np.asarray(prof["extrapolated"]).astype(np.int8)
-            computed[st] = 1
-            cache[key] = st
+                cme_par_dict["v"] = list(pars[1]) * u.km / u.s
+                cme_par_dict["width"] = list(pars[2]) * u.deg
+                cme_par_dict["lon"] = list(pars[3]) * u.deg
+                cme_par_dict["lat"] = list(pars[4]) * u.deg
+                cme_par_dict["thick"] = list(pars[5]) * u.solRad
+                # The profiles are the tracked CME flank, without the bias term (added when plotting),
+                #  so they do not depend on the bias coefficients (and the stage keys ignore them)
+                if "bias" in par_ds:
+                    cme_par_dict["bias"] = [
+                        float(b)
+                        for b in np.asarray(par_ds["bias"].values[rep], dtype=float)
+                    ]
+                lw = np.where(np.isfinite(log_weight[rep]), log_weight[rep], -1e31)
+                cme_par_dict["log_weight"] = list(lw)
+                cme_par_dict["weight"] = list(np.exp(lw - np.max(lw)))
+                label = (
+                    "prior"
+                    if rep == 0
+                    else f"after observation {rep - 1} ({obs_time[rep - 1]})"
+                )
+                what = " and ".join(
+                    w
+                    for w, on in (("profiles", do_prof), ("arrivals", do_arr_obsop))
+                    if on
+                )
+                print(f"Stage(s) {sts}: computing {what} for the ensemble {label}")
+                res = run_da.calculate_elongation_profiles(
+                    cme_par_dict,
+                    obs_index=max(rep - 1, 0),
+                    arrival_object=cme_hit_object if do_arr_obsop else None,
+                    model_sim_time=sim_time_days * u.day if do_arr_obsop else None,
+                )
+                n_obsop_runs += n_ens
+                if do_prof:
+                    times = run_da.get_profile_times()
+                    if prof is None:
+                        init_prof(times)
+                    elif not same_times(times):
+                        raise ValueError(
+                            f"The profile times of {prof_read} differ from the current setup's; "
+                            f"recompute with overwrite=True"
+                        )
+                    for st in sts:
+                        if st in need_prof:
+                            prof["elon"][st] = res["elon"]
+                            prof["extrap"][st] = np.asarray(res["extrapolated"]).astype(
+                                np.int8
+                            )
+                            prof["computed"][st] = 1
+                            prof["reused_from"][st] = -1 if st == rep else rep
+                    changed_prof = True
+                if do_arr_obsop:
+                    available = np.asarray(res["arrival_available"], dtype=bool)
+                    for i in np.flatnonzero(available):
+                        t = res["arrival_time"][i]
+                        if isinstance(t, datetime.datetime):
+                            sec_row[i] = (t - model_init_time).total_seconds()
+                            speed_row[i] = res["arrival_speed"][i]
+                    missing = [int(i) for i in np.flatnonzero(~available)]
+            if arr_sts and missing:
+                if arrival_model is None:
+                    arrival_model = make_arrival_model(
+                        par_ds, use_model, sim_time=sim_time_days * u.day
+                    )
+                    if parallel:
+                        pool = Pool(
+                            processes=max(1, min(int((os.cpu_count() or 2) - 1), n_ens))
+                        )
+                print(
+                    f"Stage(s) {arr_sts}: separate arrival runs for {len(missing)} member(s)"
+                    + (
+                        ""
+                        if not do_arr_obsop
+                        else " (body outside the model's latitude grid)"
+                    )
+                )
+                for i, (sec, spd) in _separate_arrivals(
+                    par_ds,
+                    use_model,
+                    pars,
+                    missing,
+                    cme_hit_object,
+                    sim_time_days,
+                    arrival_model,
+                    pool,
+                ).items():
+                    sec_row[i], speed_row[i] = sec, spd
+                n_separate_runs += len(missing)
+            for st in arr_sts:
+                arr["sec"][st], arr["speed"][st] = sec_row, speed_row
+                arr["computed"][st] = 1
+                arr["reused_from"][st] = -1 if st == rep else rep
+                changed_arr = True
     finally:
-        run_da.worker_pool.shutdown()
+        if run_da is not None:
+            run_da.worker_pool.shutdown()
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     stage_obs_time = np.array(
         [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[: n_stage - 1]],
         dtype="datetime64[ns]",
     )
-    out_ds = xr.Dataset(
-        data_vars=dict(
-            elon_profile=(["stage", "ens_no", "n_profile"], elon),
-            extrapolated=(["stage", "ens_no", "n_profile"], extrap),
-            log_weight=(["stage", "ens_no"], log_weight),
-            computed=(["stage"], computed),
-            reused_from=(["stage"], reused_from),
-            stage_obs_no=(["stage"], np.arange(n_stage) - 1),
-        ),
-        coords=dict(
-            stage=("stage", np.arange(n_stage)),
-            ens_no=("ens_no", np.arange(n_ens)),
-            profile_time=("n_profile", np.array(profile_times, dtype="datetime64[ns]")),
-            stage_obs_time=("stage", stage_obs_time),
-        ),
-        attrs=dict(
-            description="Full elongation profiles of the ensemble at each observation; stage 0 = prior, "
-            "stage k+1 = ensemble after observation k",
-            elongation_units="deg",
-        ),
+    common = dict(
+        log_weight=(["stage", "ens_no"], log_weight),
+        stage_obs_no=(["stage"], np.arange(n_stage) - 1),
     )
-    out_ds.to_netcdf(out_file, mode="w")
+    prof_file = prof_read if (want_profiles and os.path.isfile(prof_read)) else None
+    if want_profiles and prof is not None and changed_prof:
+        out_ds = xr.Dataset(
+            data_vars=dict(
+                elon_profile=(["stage", "ens_no", "n_profile"], prof["elon"]),
+                extrapolated=(["stage", "ens_no", "n_profile"], prof["extrap"]),
+                computed=(["stage"], prof["computed"]),
+                reused_from=(["stage"], prof["reused_from"]),
+                **common,
+            ),
+            coords=dict(
+                stage=("stage", np.arange(n_stage)),
+                ens_no=("ens_no", np.arange(n_ens)),
+                profile_time=(
+                    "n_profile",
+                    np.array(prof["times"], dtype="datetime64[ns]"),
+                ),
+                stage_obs_time=("stage", stage_obs_time),
+            ),
+            attrs=dict(
+                description="Full elongation profiles of the ensemble at each observation; stage 0 = prior, "
+                "stage k+1 = ensemble after observation k",
+                elongation_units="deg",
+            ),
+        )
+        out_ds.to_netcdf(prof_out, mode="w")
+        prof_file = prof_out
+    arr_file = arr_read if (want_arrivals and os.path.isfile(arr_read)) else None
+    if want_arrivals and changed_arr:
+        arrival_time = np.array(
+            [
+                [
+                    (
+                        np.datetime64(
+                            model_init_time + datetime.timedelta(seconds=float(s))
+                        )
+                        if np.isfinite(s)
+                        else np.datetime64("NaT")
+                    )
+                    for s in row
+                ]
+                for row in arr["sec"]
+            ],
+            dtype="datetime64[ns]",
+        )
+        out_ds = xr.Dataset(
+            data_vars=dict(
+                arrival_time=(["stage", "ens_no"], arrival_time),
+                arrival_speed=(["stage", "ens_no"], arr["speed"]),
+                computed=(["stage"], arr["computed"]),
+                reused_from=(["stage"], arr["reused_from"]),
+                **common,
+            ),
+            coords=dict(
+                stage=("stage", np.arange(n_stage)),
+                ens_no=("ens_no", np.arange(n_ens)),
+                stage_obs_time=("stage", stage_obs_time),
+            ),
+            attrs=dict(
+                description="CME arrival time and speed of each member for the ensemble at each observation; "
+                "stage 0 = prior, stage k+1 = ensemble after observation k",
+                cme_hit_object=cme_hit_object,
+                sim_time_days=sim_time_days,
+                model_init_time=str(model_init_time),
+            ),
+        )
+        out_ds.to_netcdf(arr_out, mode="w")
+        arr_file = arr_out
     print(
-        f"Saved per-observation elongation profiles to {out_file} "
-        f"({int(computed.sum())} stages, {len(cache)} ensembles run)"
+        f"compute_profiles_and_arrivals_per_obs: run {runNo}: {n_obsop_runs} observation-operator model "
+        f"runs, {n_separate_runs} separate arrival runs"
     )
-    return out_file
+    return prof_file, arr_file
+
+
+def compute_elongation_profiles_per_obs(
+    base_file_path,
+    runNo=-1,
+    stages="assimilated",
+    overwrite=False,
+    use_model=None,
+    cme_hit_object="EARTH",
+    sim_time_days=4.0,
+    with_arrivals=True,
+):
+    """
+    Full (3-day) modelled CME flank elongation profile of every member for the ensemble at each
+    observation, in <run dir>/elon_prof_obs.nc: see compute_profiles_and_arrivals_per_obs, which also
+    computes the arrival times (arr_obs.nc) from the same model runs when with_arrivals is True, so
+    compute_arrival_times_per_obs then has nothing left to run.
+    :return: Path of the profile file, or None if the inputs are missing
+    """
+    prof_file, _ = compute_profiles_and_arrivals_per_obs(
+        base_file_path,
+        runNo=runNo,
+        use_model=use_model,
+        stages=stages,
+        cme_hit_object=cme_hit_object,
+        sim_time_days=sim_time_days,
+        want_profiles=True,
+        want_arrivals=with_arrivals,
+        overwrite=overwrite,
+    )
+    return prof_file
+
+
+def compute_arrival_times_per_obs(
+    base_file_path,
+    runNo=-1,
+    use_model="compress_surf3d",
+    stages="assimilated",
+    cme_hit_object="EARTH",
+    sim_time_days=4.0,
+    parallel=True,
+    overwrite=False,
+):
+    """
+    CME arrival time and speed at cme_hit_object of every member for the ensemble at each observation,
+    in <run dir>/arr_obs.nc: see compute_profiles_and_arrivals_per_obs (only stages not yet computed
+    are run).
+    :return: Path of the arrival file, or None if the inputs are missing
+    """
+    _, arr_file = compute_profiles_and_arrivals_per_obs(
+        base_file_path,
+        runNo=runNo,
+        use_model=use_model,
+        stages=stages,
+        cme_hit_object=cme_hit_object,
+        sim_time_days=sim_time_days,
+        want_profiles=False,
+        want_arrivals=True,
+        parallel=parallel,
+        overwrite=overwrite,
+    )
+    return arr_file
 
 
 def _weighted_profile_summary(
@@ -2705,196 +2834,6 @@ def _arrival_for_cme(model, use_model, cme, cme_hit_object="EARTH"):
     if not hit:
         return None, np.nan
     return arr_time, float(arr_speed)
-
-
-def compute_arrival_times_per_obs(
-    base_file_path,
-    runNo=-1,
-    use_model="compress_surf3d",
-    stages="assimilated",
-    cme_hit_object="EARTH",
-    sim_time_days=4.0,
-    parallel=True,
-    overwrite=False,
-):
-    """
-    Compute every ensemble member's CME arrival time and speed at cme_hit_object for the ensemble at
-    each observation: the prior (stage 0) and the ensemble after observation k (stage k+1), rebuilt from
-    <run dir>/cme_pars.nc. The model set-up matches get_cme_arrival_time (make_arrival_model), with a
-    run length of sim_time_days. Each CME is launched at r_min at t_init + (r_min - cme_init_rad) / v.
-    An ensemble whose particles are identical to one already computed (only its weights differ, e.g. an
-    observation where the filter did not resample) reuses those arrival times.
-
-    Output: <run dir>/arr_obs.nc (formerly cme_arrival_per_obs.nc, which is still read) with
-        arrival_time (n_stage, n_ens): arrival time (NaT if the CME does not arrive within the run)
-        arrival_speed (n_stage, n_ens): arrival speed (km/s)
-        log_weight (n_stage, n_ens): normalised log-weight of each member at that stage
-        computed (n_stage), reused_from (n_stage), stage_obs_no (n_stage)
-        coords: stage, ens_no, stage_obs_time
-
-    :param base_file_path: Directory containing the run_<runNo> output folders
-    :param runNo: Run number
-    :param use_model: Model used in the run
-    :param stages: "assimilated" (prior + after each assimilated observation) or "all"
-    :param cme_hit_object: Body to compute the arrival at
-    :param sim_time_days: Model run length in days from the model start
-    :param parallel: Solve the ensemble members in parallel
-    :param overwrite: If False and the output file exists, return it without recomputing
-    :return: Path of the output file, or None if the inputs are missing
-    """
-    run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
-    par_file = os.path.join(run_dir, "cme_pars.nc")
-    elon_file = os.path.join(run_dir, "ens_elongations.nc")
-    # Short file name (output_names.py); a file under the old name, cme_arrival_per_obs.nc, is reused
-    existing_file = read_path(run_dir, "arrivals_per_obs")
-    if os.path.isfile(existing_file) and not overwrite:
-        print(f"compute_arrival_times_per_obs: using existing {existing_file}")
-        return existing_file
-    out_file = write_path(run_dir, "arrivals_per_obs")
-    # Check now, before the model runs, that the result can be written (Windows path limit)
-    check_path_length(out_file, what="per-observation arrival-time file")
-    if not os.path.isfile(par_file):
-        print(f"compute_arrival_times_per_obs: {par_file} not found")
-        return None
-
-    par_ds = xr.load_dataset(par_file)
-    n_stage = par_ds.sizes["n_obs"]
-    n_ens = par_ds.sizes["n_ens"]
-    if os.path.isfile(elon_file):
-        elon_ds = xr.load_dataset(elon_file)
-        assimilated = elon_ds["assimilated"].values.astype(bool)
-        obs_time = pd.to_datetime(elon_ds["obs_time"].values)
-    else:
-        # Older runs: every observation stage, no observation times
-        assimilated = np.ones(n_stage - 1, dtype=bool)
-        obs_time = pd.to_datetime([pd.NaT] * (n_stage - 1))
-
-    if stages == "all":
-        stage_list = list(range(n_stage))
-    else:
-        stage_list = [0] + [
-            k + 1 for k in range(min(len(assimilated), n_stage - 1)) if assimilated[k]
-        ]
-
-    model, start_time = make_arrival_model(
-        par_ds, use_model, sim_time=sim_time_days * u.day
-    )
-
-    arr_sec = np.full((n_stage, n_ens), np.nan)  # seconds after model start
-    arr_speed = np.full((n_stage, n_ens), np.nan)
-    computed = np.zeros(n_stage, dtype=np.int8)
-    reused_from = np.full(n_stage, -1, dtype=int)
-    log_weight = np.asarray(par_ds["log_weight"].values, dtype=float)
-    par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
-    cache = {}
-
-    pool = None
-    if parallel:
-        n_proc = max(1, min(int((os.cpu_count() or 2) - 1), n_ens))
-        pool = Pool(processes=n_proc)
-    try:
-        for st in stage_list:
-            pars = np.array(
-                [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
-            )
-            key = np.round(pars, 6).tobytes()
-            if key in cache:
-                src = cache[key]
-                arr_sec[st], arr_speed[st] = arr_sec[src], arr_speed[src]
-                reused_from[st] = src
-                computed[st] = 1
-                print(
-                    f"Stage {st}: particles unchanged since stage {src}, reusing its arrival times"
-                )
-                continue
-
-            v = pars[1] * u.km / u.s
-            t_launch = (pars[0] * u.s) + get_transit_time_to_r_min(par_ds, v)
-            cme_cls = H.ConeCME if use_model in ["huxt"] else S.ConeCME
-            cmes = [
-                cme_cls(
-                    t_launch=t_launch[i],
-                    v=v[i],
-                    width=pars[2][i] * u.deg,
-                    longitude=pars[3][i] * u.deg,
-                    latitude=pars[4][i] * u.deg,
-                    thickness=pars[5][i] * u.solRad,
-                    cme_fixed_duration=True,
-                    fixed_duration=12 * 3600 * u.s,
-                )
-                for i in range(n_ens)
-            ]
-            label = "prior" if st == 0 else f"after observation {st - 1}"
-            print(f"Stage {st}: computing arrival times for the ensemble {label}")
-            if pool is not None:
-                jobs = [
-                    pool.apply_async(
-                        _arrival_for_cme, (model, use_model, c, cme_hit_object)
-                    )
-                    for c in cmes
-                ]
-                results = [j.get() for j in jobs]
-            else:
-                results = [
-                    _arrival_for_cme(model, use_model, c, cme_hit_object) for c in cmes
-                ]
-            for i, (t_arr, v_arr) in enumerate(results):
-                if t_arr is not None:
-                    arr_sec[st, i] = (t_arr - start_time).total_seconds()
-                    arr_speed[st, i] = v_arr
-            computed[st] = 1
-            cache[key] = st
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
-
-    arrival_time = np.array(
-        [
-            [
-                (
-                    np.datetime64(start_time + datetime.timedelta(seconds=s))
-                    if np.isfinite(s)
-                    else np.datetime64("NaT")
-                )
-                for s in row
-            ]
-            for row in arr_sec
-        ],
-        dtype="datetime64[ns]",
-    )
-    stage_obs_time = np.array(
-        [np.datetime64("NaT")] + [np.datetime64(t) for t in obs_time[: n_stage - 1]],
-        dtype="datetime64[ns]",
-    )
-    out_ds = xr.Dataset(
-        data_vars=dict(
-            arrival_time=(["stage", "ens_no"], arrival_time),
-            arrival_speed=(["stage", "ens_no"], arr_speed),
-            log_weight=(["stage", "ens_no"], log_weight),
-            computed=(["stage"], computed),
-            reused_from=(["stage"], reused_from),
-            stage_obs_no=(["stage"], np.arange(n_stage) - 1),
-        ),
-        coords=dict(
-            stage=("stage", np.arange(n_stage)),
-            ens_no=("ens_no", np.arange(n_ens)),
-            stage_obs_time=("stage", stage_obs_time),
-        ),
-        attrs=dict(
-            description="CME arrival time and speed of each member for the ensemble at each observation; "
-            "stage 0 = prior, stage k+1 = ensemble after observation k",
-            cme_hit_object=cme_hit_object,
-            sim_time_days=sim_time_days,
-            model_init_time=str(start_time),
-        ),
-    )
-    out_ds.to_netcdf(out_file, mode="w")
-    print(
-        f"Saved per-observation arrival times to {out_file} "
-        f"({int(computed.sum())} stages, {len(cache)} ensembles run)"
-    )
-    return out_file
 
 
 def plot_arrival_time_histograms_per_obs(
@@ -3506,8 +3445,8 @@ def main():
     obs_dir = os.getenv("OBS_DIR")
     # indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
-    event_list = ["13B"]
-    craft_list = ["sta"]  # , "stb"]
+    event_list = ["twin"]
+    craft_list = ["twin"]  # , "stb"]
     img_list = ["diff"]  # ["norm", "diff"]
     par_type = "donki"
     use_model = "compress_surf3d"
@@ -3524,8 +3463,33 @@ def main():
     # Evolution of the observation-bias coefficient through the assimilation window (runs with an
     #  estimated bias term only)
     make_bias_plot = True
-    bias_folder_name = "bias5_2.5_bias21_2.5"
     n_ens = 50
+    delta_aux_pf = 0.98  # initialise_da_parameters: delta_aux_pf
+    # Twin experiments: folder with the run_NNN folders of the run to analyse, e.g.
+    #  r"C:\Users\ss905122\PycharmProjects\SIR_HUXt\output\comp_surf\bias_cl3_WSA_v\ens_50_uncorr\model_COMPRESS_SURF3D\truth_495.0_37.4_0.0_0.0_0.0\ob_est_lin_0.00_2.00_prior_525.0_37.4_0.0_0.0_0.0_0.98"
+    #  The truth plotted is the run's own (read_twin_truth), not necessarily the current events.yaml.
+    #  None = the folder a run made with the current settings would be in: OUT_BASE_DIR (.env), the
+    #  twin's entry in events.yaml and the da_surf_setup.Setup settings below
+    twin_results_dir = os.path.join(
+        "C:\\",
+        "Users",
+        "ss905122",
+        "PycharmProjects",
+        "SIR_HUXt",
+        "output",
+        "comp_surf",
+        "bias_cl3_WSA_v",
+        f"ens_{n_ens}_uncorr",
+        f"model_{use_model.upper()}",
+        "truth_495.0_37.4_0.0_0.0_0.0",
+        f"ob_est_lin_0.00_2.00_prior_550.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
+    )
+
+    # Observation-bias term (get_bias_settings: mode, predictor_type, prior_mean, prior_sd);
+    #  None for runs with bias mode "off"
+    twin_bias_folder = bias_dir_name("estimate", "linear", 0.0, 2.0)
+    # Bias injected into the synthetic observations (get_bias_settings: true_bias)
+    twin_true_bias = 0.0
 
     all_comb_list = [
         (x, y, z) for x in event_list for y in craft_list for z in img_list
@@ -3540,474 +3504,125 @@ def main():
         elif craft == "stb":
             craft_name = "STEREO-B"
 
-        if event == "ssw_007":
-            if par_type == "donki":
-                prior_dir = "prior_1498_150_-63_-15_0"
-            else:
-                prior_dir = "prior_1010_66_-30_0_0"
-            real_arrival_time = datetime.datetime(2012, 9, 3, 11, 23, 0)
-            real_arr_str = real_arrival_time.strftime("%Y/%m/%d %H:%M")
-            cme_hit_object = "EARTH"
-            fig_title = f"CME-1: {craft_name} data assimilated"
-            if craft == "sta":
-                obs_times = [
-                    datetime.datetime(2012, 9, 1, 0, 9, 1),
-                    datetime.datetime(2012, 9, 1, 0, 49, 1),
-                    datetime.datetime(2012, 9, 1, 1, 29, 1),
-                    datetime.datetime(2012, 9, 1, 2, 9, 1),
-                    datetime.datetime(2012, 9, 1, 2, 49, 1),
-                    datetime.datetime(2012, 9, 1, 3, 29, 1),
-                    datetime.datetime(2012, 9, 1, 4, 9, 1),
-                    datetime.datetime(2012, 9, 1, 4, 49, 1),
-                    datetime.datetime(2012, 9, 1, 5, 29, 1),
-                    datetime.datetime(2012, 9, 1, 6, 9, 1),
-                    datetime.datetime(2012, 9, 1, 6, 49, 1),
-                    datetime.datetime(2012, 9, 1, 7, 29, 1),
-                    datetime.datetime(2012, 9, 1, 8, 9, 1),
-                    datetime.datetime(2012, 9, 1, 8, 49, 1),
-                    datetime.datetime(2012, 9, 1, 9, 29, 1),
-                    datetime.datetime(2012, 9, 1, 10, 9, 1),
-                    datetime.datetime(2012, 9, 1, 10, 49, 1),
-                    datetime.datetime(2012, 9, 1, 11, 29, 1),
-                    datetime.datetime(2012, 9, 1, 12, 9, 1),
-                    datetime.datetime(2012, 9, 1, 12, 49, 1),
-                    datetime.datetime(2012, 9, 1, 13, 29, 1),
-                    datetime.datetime(2012, 9, 1, 14, 9, 1),
-                    datetime.datetime(2012, 9, 1, 14, 49, 1),
-                    datetime.datetime(2012, 9, 1, 15, 29, 1),
-                    datetime.datetime(2012, 9, 1, 16, 9, 1),
-                    datetime.datetime(2012, 9, 1, 16, 49, 1),
-                    datetime.datetime(2012, 9, 1, 17, 29, 1),
-                    datetime.datetime(2012, 9, 1, 18, 9, 1),
-                    datetime.datetime(2012, 9, 1, 18, 49, 1),
-                    datetime.datetime(2012, 9, 1, 19, 29, 1),
-                ]
-            elif craft == "stb":
-                obs_times = [
-                    datetime.datetime(2012, 8, 31, 23, 29, 1),
-                    datetime.datetime(2012, 9, 1, 0, 9, 1),
-                    datetime.datetime(2012, 9, 1, 0, 49, 1),
-                    datetime.datetime(2012, 9, 1, 1, 29, 1),
-                    datetime.datetime(2012, 9, 1, 2, 9, 1),
-                    datetime.datetime(2012, 9, 1, 2, 49, 1),
-                    datetime.datetime(2012, 9, 1, 3, 29, 1),
-                    datetime.datetime(2012, 9, 1, 4, 9, 1),
-                    datetime.datetime(2012, 9, 1, 4, 49, 1),
-                    datetime.datetime(2012, 9, 1, 5, 29, 1),
-                    datetime.datetime(2012, 9, 1, 6, 9, 1),
-                    datetime.datetime(2012, 9, 1, 6, 49, 1),
-                    datetime.datetime(2012, 9, 1, 7, 29, 1),
-                    datetime.datetime(2012, 9, 1, 8, 9, 1),
-                    datetime.datetime(2012, 9, 1, 8, 49, 1),
-                    datetime.datetime(2012, 9, 1, 9, 29, 1),
-                    datetime.datetime(2012, 9, 1, 10, 9, 1),
-                    datetime.datetime(2012, 9, 1, 10, 49, 1),
-                ]
-
-        elif event == "ssw_008":
-            if par_type == "donki":
-                prior_dir = "prior_1160_170_30_5_0"
-            else:
-                prior_dir = "prior_872_110_20_4_0"
-            real_arrival_time = datetime.datetime(2012, 9, 30, 22, 13, 0)
-            cme_hit_object = "EARTH"
-            fig_title = f"CME-2: {craft_name} data assimilated"
-            if craft == "sta":
-                obs_times = [
-                    datetime.datetime(2012, 9, 28, 3, 29, 1),
-                    datetime.datetime(2012, 9, 28, 4, 9, 1),
-                    datetime.datetime(2012, 9, 28, 4, 49, 1),
-                    datetime.datetime(2012, 9, 28, 5, 29, 1),
-                    datetime.datetime(2012, 9, 28, 6, 9, 1),
-                    datetime.datetime(2012, 9, 28, 6, 49, 1),
-                    datetime.datetime(2012, 9, 28, 7, 29, 1),
-                    datetime.datetime(2012, 9, 28, 8, 9, 1),
-                    datetime.datetime(2012, 9, 28, 8, 49, 1),
-                    datetime.datetime(2012, 9, 28, 9, 29, 1),
-                    datetime.datetime(2012, 9, 28, 10, 9, 1),
-                    datetime.datetime(2012, 9, 28, 10, 49, 1),
-                    datetime.datetime(2012, 9, 28, 11, 29, 1),
-                    datetime.datetime(2012, 9, 28, 12, 9, 1),
-                    datetime.datetime(2012, 9, 28, 12, 49, 1),
-                    datetime.datetime(2012, 9, 28, 13, 29, 1),
-                    datetime.datetime(2012, 9, 28, 14, 9, 1),
-                    datetime.datetime(2012, 9, 28, 14, 49, 1),
-                    datetime.datetime(2012, 9, 28, 15, 29, 1),
-                    datetime.datetime(2012, 9, 28, 16, 9, 1),
-                    datetime.datetime(2012, 9, 28, 16, 49, 1),
-                ]
-            elif craft == "stb":
-                obs_times = [
-                    datetime.datetime(2012, 9, 28, 8, 9, 1),
-                    datetime.datetime(2012, 9, 28, 8, 49, 1),
-                    datetime.datetime(2012, 9, 28, 9, 29, 1),
-                    datetime.datetime(2012, 9, 28, 10, 9, 1),
-                    datetime.datetime(2012, 9, 28, 10, 49, 1),
-                    datetime.datetime(2012, 9, 28, 11, 29, 1),
-                    datetime.datetime(2012, 9, 28, 12, 9, 1),
-                    datetime.datetime(2012, 9, 28, 12, 49, 1),
-                    datetime.datetime(2012, 9, 28, 13, 29, 1),
-                    datetime.datetime(2012, 9, 28, 14, 9, 1),
-                    datetime.datetime(2012, 9, 28, 14, 49, 1),
-                    datetime.datetime(2012, 9, 28, 15, 29, 1),
-                    datetime.datetime(2012, 9, 28, 16, 9, 1),
-                    datetime.datetime(2012, 9, 28, 16, 49, 1),
-                    datetime.datetime(2012, 9, 28, 17, 29, 1),
-                    datetime.datetime(2012, 9, 28, 18, 9, 1),
-                    datetime.datetime(2012, 9, 28, 18, 49, 1),
-                    datetime.datetime(2012, 9, 28, 19, 29, 1),
-                    datetime.datetime(2012, 9, 28, 20, 9, 1),
-                    datetime.datetime(2012, 9, 28, 20, 49, 1),
-                    datetime.datetime(2012, 9, 28, 21, 29, 1),
-                    datetime.datetime(2012, 9, 28, 22, 9, 1),
-                    datetime.datetime(2012, 9, 28, 22, 49, 1),
-                    datetime.datetime(2012, 9, 28, 23, 29, 1),
-                    datetime.datetime(2012, 9, 29, 0, 9, 1),
-                    datetime.datetime(2012, 9, 29, 0, 49, 1),
-                    datetime.datetime(2012, 9, 29, 1, 29, 1),
-                ]
-
-        elif event == "ssw_009":
-            if par_type == "donki":
-                prior_dir = "prior_650_94_10_-28_0"
-            else:
-                prior_dir = "prior_698_84_9_-24_0"
-            real_arrival_time = datetime.datetime(2012, 10, 8, 4, 31, 0)
-            cme_hit_object = "EARTH"
-            fig_title = f"CME-3: {craft_name} data assimilated"
-            if craft == "sta":
-                obs_times = [
-                    datetime.datetime(2012, 10, 5, 9, 29, 1),
-                    datetime.datetime(2012, 10, 5, 10, 9, 1),
-                    datetime.datetime(2012, 10, 5, 10, 49, 1),
-                    datetime.datetime(2012, 10, 5, 11, 29, 1),
-                    datetime.datetime(2012, 10, 5, 12, 9, 1),
-                    datetime.datetime(2012, 10, 5, 12, 49, 1),
-                    datetime.datetime(2012, 10, 5, 13, 29, 1),
-                    datetime.datetime(2012, 10, 5, 14, 9, 1),
-                    datetime.datetime(2012, 10, 5, 14, 49, 1),
-                    datetime.datetime(2012, 10, 5, 15, 29, 1),
-                    datetime.datetime(2012, 10, 5, 16, 9, 1),
-                    datetime.datetime(2012, 10, 5, 16, 49, 1),
-                    datetime.datetime(2012, 10, 5, 17, 29, 1),
-                    datetime.datetime(2012, 10, 5, 18, 9, 1),
-                    datetime.datetime(2012, 10, 5, 18, 49, 1),
-                    datetime.datetime(2012, 10, 5, 19, 29, 1),
-                    datetime.datetime(2012, 10, 5, 20, 9, 1),
-                    datetime.datetime(2012, 10, 5, 20, 49, 1),
-                    datetime.datetime(2012, 10, 5, 21, 29, 1),
-                    datetime.datetime(2012, 10, 5, 22, 9, 1),
-                    datetime.datetime(2012, 10, 5, 22, 49, 1),
-                    datetime.datetime(2012, 10, 5, 23, 29, 1),
-                    datetime.datetime(2012, 10, 6, 0, 9, 1),
-                    datetime.datetime(2012, 10, 6, 0, 49, 1),
-                    datetime.datetime(2012, 10, 6, 1, 29, 1),
-                    datetime.datetime(2012, 10, 6, 2, 9, 1),
-                    datetime.datetime(2012, 10, 6, 2, 49, 1),
-                ]
-            elif craft == "stb":
-                obs_times = [
-                    datetime.datetime(2012, 10, 5, 10, 49, 1),
-                    datetime.datetime(2012, 10, 5, 11, 29, 1),
-                    datetime.datetime(2012, 10, 5, 12, 9, 1),
-                    datetime.datetime(2012, 10, 5, 12, 49, 1),
-                    datetime.datetime(2012, 10, 5, 13, 29, 1),
-                    datetime.datetime(2012, 10, 5, 14, 9, 1),
-                    datetime.datetime(2012, 10, 5, 14, 49, 1),
-                    datetime.datetime(2012, 10, 5, 15, 29, 1),
-                    datetime.datetime(2012, 10, 5, 16, 9, 1),
-                    datetime.datetime(2012, 10, 5, 16, 49, 1),
-                    datetime.datetime(2012, 10, 5, 17, 29, 1),
-                    datetime.datetime(2012, 10, 5, 18, 9, 1),
-                    datetime.datetime(2012, 10, 5, 18, 49, 1),
-                    datetime.datetime(2012, 10, 5, 19, 29, 1),
-                    datetime.datetime(2012, 10, 5, 20, 9, 1),
-                    datetime.datetime(2012, 10, 5, 20, 49, 1),
-                    datetime.datetime(2012, 10, 5, 21, 29, 1),
-                    datetime.datetime(2012, 10, 5, 22, 9, 1),
-                    datetime.datetime(2012, 10, 5, 22, 49, 1),
-                    datetime.datetime(2012, 10, 5, 23, 29, 1),
-                    datetime.datetime(2012, 10, 6, 0, 9, 1),
-                    datetime.datetime(2012, 10, 6, 0, 49, 1),
-                    datetime.datetime(2012, 10, 6, 1, 29, 1),
-                    datetime.datetime(2012, 10, 6, 2, 9, 1),
-                    datetime.datetime(2012, 10, 6, 3, 29, 1),
-                    datetime.datetime(2012, 10, 6, 4, 9, 1),
-                ]
-
-        elif event == "ssw_012":
-            if par_type == "donki":
-                prior_dir = "prior_725_60_90_5_0"
-                cme_hit_object = "EARTH"
-            else:
-                prior_dir = "prior_664_94_22_20_0"
-                cme_hit_object = "EARTH"
-            real_arrival_time = datetime.datetime(2012, 11, 23, 21, 10, 0)
-            fig_title = f"CME-4: {craft_name} data assimilated"
-
-            if craft == "sta":
-                obs_times = [
-                    datetime.datetime(2012, 11, 20, 16, 49, 1),
-                    datetime.datetime(2012, 11, 20, 17, 29, 1),
-                    datetime.datetime(2012, 11, 20, 18, 9, 1),
-                    datetime.datetime(2012, 11, 20, 18, 49, 1),
-                    datetime.datetime(2012, 11, 20, 19, 29, 1),
-                    datetime.datetime(2012, 11, 20, 20, 9, 1),
-                    datetime.datetime(2012, 11, 20, 20, 49, 1),
-                    datetime.datetime(2012, 11, 20, 21, 29, 1),
-                    datetime.datetime(2012, 11, 20, 22, 9, 1),
-                    datetime.datetime(2012, 11, 20, 22, 49, 1),
-                    datetime.datetime(2012, 11, 20, 23, 29, 1),
-                    datetime.datetime(2012, 11, 21, 0, 9, 1),
-                    datetime.datetime(2012, 11, 21, 0, 49, 1),
-                    datetime.datetime(2012, 11, 21, 1, 29, 1),
-                    datetime.datetime(2012, 11, 21, 2, 9, 1),
-                    datetime.datetime(2012, 11, 21, 2, 49, 1),
-                    datetime.datetime(2012, 11, 21, 3, 29, 1),
-                    datetime.datetime(2012, 11, 21, 4, 9, 1),
-                    datetime.datetime(2012, 11, 21, 4, 49, 1),
-                    datetime.datetime(2012, 11, 21, 5, 29, 1),
-                    datetime.datetime(2012, 11, 21, 6, 9, 1),
-                    datetime.datetime(2012, 11, 21, 6, 49, 1),
-                    datetime.datetime(2012, 11, 21, 7, 29, 1),
-                    datetime.datetime(2012, 11, 21, 8, 9, 1),
-                    datetime.datetime(2012, 11, 21, 8, 49, 1),
-                    datetime.datetime(2012, 11, 21, 9, 29, 1),
-                    datetime.datetime(2012, 11, 21, 10, 9, 1),
-                ]
-            elif craft == "stb":
-                obs_times = [
-                    datetime.datetime(2012, 11, 20, 19, 29, 1),
-                    datetime.datetime(2012, 11, 20, 20, 9, 1),
-                    datetime.datetime(2012, 11, 20, 20, 49, 1),
-                    datetime.datetime(2012, 11, 20, 21, 29, 1),
-                    datetime.datetime(2012, 11, 20, 22, 9, 1),
-                    datetime.datetime(2012, 11, 20, 22, 49, 1),
-                    datetime.datetime(2012, 11, 21, 0, 49, 1),
-                    datetime.datetime(2012, 11, 21, 1, 29, 1),
-                    datetime.datetime(2012, 11, 21, 2, 9, 1),
-                    datetime.datetime(2012, 11, 21, 2, 49, 1),
-                    datetime.datetime(2012, 11, 21, 3, 29, 1),
-                    datetime.datetime(2012, 11, 21, 4, 9, 1),
-                    datetime.datetime(2012, 11, 21, 4, 49, 1),
-                    datetime.datetime(2012, 11, 21, 5, 29, 1),
-                    datetime.datetime(2012, 11, 21, 6, 9, 1),
-                    datetime.datetime(2012, 11, 21, 6, 49, 1),
-                    datetime.datetime(2012, 11, 21, 7, 29, 1),
-                    datetime.datetime(2012, 11, 21, 8, 9, 1),
-                    datetime.datetime(2012, 11, 21, 8, 49, 1),
-                    datetime.datetime(2012, 11, 21, 9, 29, 1),
-                    datetime.datetime(2012, 11, 21, 10, 9, 1),
-                    datetime.datetime(2012, 11, 21, 10, 49, 1),
-                    datetime.datetime(2012, 11, 21, 11, 29, 1),
-                    datetime.datetime(2012, 11, 21, 12, 9, 1),
-                    datetime.datetime(2012, 11, 21, 12, 49, 1),
-                    datetime.datetime(2012, 11, 21, 13, 29, 1),
-                    datetime.datetime(2012, 11, 21, 14, 9, 1),
-                    datetime.datetime(2012, 11, 21, 14, 49, 1),
-                    datetime.datetime(2012, 11, 21, 15, 29, 1),
-                ]
-        elif event == "01B":
-            obs_file_name = "CME_01B__20100407__PA265_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_258.0_50.0_-74.0_18.0_0.0"
-            obs_dir_name = "obs_stb_01B_diff"
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
+        if is_twin_experiment(event):
+            # Truth and first guess of the twin experiment in events.yaml; the run folders are named
+            #  from them as data_assimilation_routine.py names them
+            truth = get_twin_cme(event, "truth")
+            fg = get_twin_cme(event, "first_guess")
+            true_cme_t_init = truth["t_init"]
+            true_cme_speed = truth["speed"]
+            true_cme_width = truth["width"]
+            true_cme_lon = truth["lon"]
+            true_cme_lat = truth["lat"]
+            true_cme_thick = truth["thick"]
+            truth_dir = (
+                f"truth_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}"
+                f"_{true_cme_thick}"
             )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2010, 4, 11, 13, 4, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "02A":
-            obs_file_name = "CME_02A__20201025__PA272_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_159.0_36.0_-15.0_-10.0_0.0"
-            obs_dir_name = "obs_stb_02A_diff"
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
+            prior_dir = (
+                f"prior_{fg['speed']:.1f}_{fg['width']:.1f}_{fg['lon']:.1f}_{fg['lat']:.1f}"
+                f"_{fg['thick']:.1f}"
             )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
+            # Synthetic observations: the run folder is named from the truth
+            obs_dir_name = truth_dir
 
-            real_arrival_time = datetime.datetime(2020, 11, 1, 11, 54, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "03A":
-            obs_file_name = "CME_03A__20211101__PA268_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_1188.0_102.0_5.0_18.0_0.0"
-            obs_dir_name = "obs_sta_03A_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2021, 11, 3, 19, 49, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "04B":
-            obs_file_name = "CME_04B__20100523__PA271_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_542.0_76.0_24.0_1.0_0.0"
-            obs_dir_name = "obs_stb_04B_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-
-            cme_hit_object = "EARTH"
-            real_arrival_time = datetime.datetime(2010, 5, 28, 2, 58, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "05B":
-            obs_file_name = "CME_05B__20091215__PA266_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            obs_dir_name = "obs_stb_05B_diff"
-            prior_dir = "prior_542.0_48.0_-7.0_10.0_0.0"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2009, 12, 19, 10, 0, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "09A":
-            obs_file_name = "CME_09A__20211027__PA268_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_1368.0_100.0_2.0_-23.0_0.0"
-            obs_dir_name = "obs_sta_09A_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2021, 10, 31, 9, 13, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "10A":
-            obs_file_name = "CME_10A__20201206__PA266_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_1436.0_82.0_8.0_-18.0_0.0"
-            obs_dir_name = "obs_sta_10A_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2020, 12, 10, 2, 10, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "13B":
-            obs_file_name = "CME_13B__20110524__PA271_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_598.0_52.0_6.0_-10.0_0.0"
-            obs_dir_name = "obs_stb_13B_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2011, 5, 28, 0, 14, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "14B":
-            obs_file_name = "CME_14B__20110710__PA274_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_552.0_42.0_14.0_-11.0_0.0"
-            obs_dir_name = "obs_stb_14B_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2011, 7, 14, 12, 0, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "15B":
-            obs_file_name = "CME_15B__20111027__PA276_good_hi2.dat"
-            obs_file_path = os.path.join(obs_dir, obs_file_name)
-            prior_dir = "prior_589.0_78.0_-7.0_24.0_0.0"
-            obs_dir_name = "obs_stb_15B_diff"
-
-            obs_class = Observations(
-                use_model=use_model,
-                use_synthetic_obs=False,
-                obs_filenames=obs_file_path,
-            )
-            obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-            cme_hit_object = "EARTH"
-
-            real_arrival_time = datetime.datetime(2011, 11, 1, 8, 9, 0)
-            real_arrival_speed = 0
-            fig_title = f"CME-{event}"
-        elif event == "twin":
-            true_cme_t_init = datetime.datetime(2012, 1, 1, 1, 0, 0, 0)
-            true_cme_speed = 495.0
-            true_cme_width = 37.4
-            true_cme_lon = 0.0
-            true_cme_lat = 0.0
-            true_cme_thick = 0.0
-            truth_dir = "truth_495.0_37.4_0.0_0.0_0.0"
-            prior_dir = "prior_495.0_37.4_0.0_-2.9_0.0"
-
-            vTruth = 495
-            widthTruth = 37.4
-            lonTruth = 0
+            vTruth = true_cme_speed
+            widthTruth = true_cme_width
+            lonTruth = true_cme_lon
 
         else:
-            sys.exit(f"Unknown event {event}.")
-        baseFilePath = os.path.join(
-            "C:\\",
-            "Users",
-            "ss905122",
-            "PycharmProjects",
-            "SIR_HUXt",
-            "output",
-            "comp_surf",
-            "bias_cl3_on_const_WSA_v",
-            f"ens_{n_ens}",
-            "mo_cone",
-            f"model_{use_model.upper()}",
-            obs_dir_name,
-            "ob_est_lin_0.00_2.00",  # "New folder",
-            prior_dir,
-            "0.98",
-        )
+            # The event's values from events.yaml (see da_surf_setup.load_events)
+            event_info: dict = get_event(event)
+            if "arrival_time" not in event_info:
+                sys.exit(f"Event {event}: add its arrival_time to events.yaml")
+            real_arrival_time = event_info["arrival_time"]
+            real_arrival_speed = event_info.get("arrival_speed", 0)
+            cme_hit_object = "EARTH"
+            fig_title = event_info.get("title", "CME-{event}").format(
+                event=event, craft_name=craft_name
+            )
+
+            # Run folder of the prior: given in events.yaml for events whose runs use older folder
+            #  names, otherwise named from the first guess as data_assimilation_routine.py names it
+            use_other: bool = par_type != "donki"
+            prior_dir = event_info.get("prior_dir_other" if use_other else "prior_dir")
+            if prior_dir is None:
+                fg = (
+                    event_info.get("first_guess_other", event_info["first_guess"])
+                    if use_other
+                    else event_info["first_guess"]
+                )
+                prior_dir = (
+                    f"prior_{float(fg['speed']):.1f}_{float(fg['width']):.1f}"
+                    f"_{float(fg['lon']):.1f}_{float(fg['lat']):.1f}_{float(fg['thick']):.1f}"
+                )
+
+            if f"obs_times_{craft}" in event_info:
+                # Observation times given in events.yaml (the ssw events)
+                obs_times = event_info[f"obs_times_{craft}"]
+                obs_dir_name = f"obs_{craft}_{event}_{img}"
+            else:
+                # Observation times from the event's observation file
+                obs_file_path = os.path.join(obs_dir, event_info["obs_file"])
+                obs_class = Observations(
+                    use_model=use_model,
+                    use_synthetic_obs=False,
+                    obs_filenames=obs_file_path,
+                )
+                obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
+                # Run folder of the observations, as data_assimilation_routine.py names it
+                #  (obs_<event's spacecraft>_<event>_<image type>)
+                event_craft: str = "sta" if event[2] == "A" else "stb"
+                obs_dir_name = f"obs_{event_craft}_{event}_{img}"
+
+        if is_twin_experiment(event) and twin_results_dir is not None:
+            baseFilePath = twin_results_dir
+        elif is_twin_experiment(event):
+            # Twin results, in the folders data_assimilation_routine.make_output_dir makes:
+            #  OUT_BASE_DIR/ens_<n>_uncorr/model_<MODEL>/truth_...[_tb<true bias>]/[<bias>_]prior_..._<delta>
+            twin_obs_dir = obs_dir_name + (
+                true_bias_suffix(twin_true_bias) if twin_true_bias != 0 else ""
+            )
+            # Twins whose runs sample the first guess and/or the observation noise (events.yaml)
+            twin_entry = get_event(event)
+            sampling_tag = twin_sampling_dir_name(
+                bool(twin_entry.get("sample_first_guess", False)),
+                bool(twin_entry.get("new_obs_noise_per_run", False)),
+            )
+            twin_prior_dir = (
+                f"{sampling_tag}_{prior_dir}" if sampling_tag else prior_dir
+            )
+            twin_prior_dir = (
+                f"{twin_bias_folder}_{twin_prior_dir}"
+                if twin_bias_folder
+                else twin_prior_dir
+            )
+            baseFilePath = os.path.join(
+                os.getenv("OUT_BASE_DIR"),
+                f"ens_{n_ens}_uncorr",
+                f"model_{use_model.upper()}",
+                twin_obs_dir,
+                f"{twin_prior_dir}_{delta_aux_pf}",
+            )
+        else:
+            baseFilePath = os.path.join(
+                "C:\\",
+                "Users",
+                "ss905122",
+                "PycharmProjects",
+                "SIR_HUXt",
+                "output",
+                "comp_surf",
+                "bias_cl3_on_const_WSA_v",
+                f"ens_{n_ens}",
+                "mo_cone",
+                f"model_{use_model.upper()}",
+                obs_dir_name,
+                "ob_est_lin_0.00_2.00",  # "New folder",
+                prior_dir,
+                "0.98",
+            )
+
         # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
         #  by runs since 31 Oct 2026) or the long name of older runs (obsbias_estimate_constant_prior0.00_2.00):
         #  whichever exists is used. Leave it out for runs without a bias term.
@@ -4039,6 +3654,46 @@ def main():
                 else:
                     ds = xr.concat([ds, dsTemp], "run")
 
+        if is_twin_experiment(event):
+            # Truth of the run being analysed (it may have been made with other settings than the
+            #  current events.yaml)
+            # The experiment's copy of events.yaml, saved by the DA run (runs since 5 Nov 2026)
+            events_copy = experiment_events_file(baseFilePath, start_run)
+            twin_name = str(ds.attrs.get("twin_experiment", event))
+            if events_copy is not None and is_twin_experiment(twin_name, events_copy):
+                print(f"Twin parameters from {events_copy} (entry {twin_name!r})")
+                fallback = dict(
+                    get_twin_cme(twin_name, "truth", events_copy),
+                    model_start=get_event(twin_name, events_copy)["model_start"],
+                )
+            else:
+                fallback = dict(truth, model_start=get_event(event)["model_start"])
+            run_truth, truth_source = read_twin_truth(
+                ds,
+                baseFilePath,
+                fallback,
+                fallback_from_run=events_copy is not None
+                and is_twin_experiment(twin_name, events_copy),
+            )
+            print(f"Truth CME (from {truth_source}): {run_truth}")
+            if truth_source != "events.yaml" and any(
+                not np.isclose(float(run_truth[k]), float(truth[k]))
+                for k in ("speed", "width", "lon", "lat", "thick")
+            ):
+                print(
+                    f"Note: the run's truth differs from the truth of {event!r} in events.yaml"
+                    f" ({truth}); the run's truth is used"
+                )
+            true_cme_t_init = run_truth["t_init"]
+            true_cme_speed = run_truth["speed"]
+            true_cme_width = run_truth["width"]
+            true_cme_lon = run_truth["lon"]
+            true_cme_lat = run_truth["lat"]
+            true_cme_thick = run_truth["thick"]
+            vTruth = true_cme_speed
+            widthTruth = true_cme_width
+            lonTruth = true_cme_lon
+
         print(ds)
         cme_t_init_mean_sec = ds["t_init"].values.mean(axis=1)
         cme_t_init_mean = [
@@ -4068,7 +3723,7 @@ def main():
         )
         print("=========================================================")
 
-        if event == "twin":
+        if is_twin_experiment(event):
             real_arrival_time, real_arrival_speed = get_true_cme_arrival_time(
                 ds=ds,
                 use_model=use_model,
@@ -4083,44 +3738,24 @@ def main():
         print(f"real_arrival_time = {real_arrival_time}")
         print(f"real_arrival_speed = {real_arrival_speed}")
 
-        if nRuns > n_ens:
-            nProc = int(os.cpu_count() - 1)
-            if nProc < 1:
-                nProc = 1
-            pool = Pool(processes=nProc)
-            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-                print("HI")
-                pool.apply_async(
-                    get_cme_arrival_time,
-                    kwds={
-                        "ds": ds,
-                        "runNo": runNo,
-                        "use_model": use_model,
-                        "real_arrival_time": real_arrival_time,
-                        "cme_hit_object": "EARTH",
-                        "base_file_path": baseFilePath,
-                        "parallel_ens": False,
-                    },
-                )
-            pool.close()
-            pool.join()
-        else:
-            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-                print("HI2")
-                get_cme_arrival_time(
-                    ds=ds,
-                    runNo=runNo,
-                    use_model=use_model,
-                    real_arrival_time=real_arrival_time,
-                    cme_hit_object="EARTH",
-                    base_file_path=baseFilePath,
-                    parallel_ens=True,
-                )
+        # Prior and posterior arrival times of each run (read from its arr_obs.nc; only those two
+        #  stages are computed here if missing, with the members in parallel)
+        for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
+            get_cme_arrival_time(
+                ds=ds,
+                runNo=runNo,
+                use_model=use_model,
+                real_arrival_time=real_arrival_time,
+                cme_hit_object="EARTH",
+                base_file_path=baseFilePath,
+                parallel_ens=True,
+                sim_time_days=arrival_sim_time_days,
+            )
 
         n_obs = len(ds["obs_no"][:])
 
         for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-            if event == "twin":
+            if is_twin_experiment(event):
                 fig_title = f"Twin experiment, Run no. = {runNo}"
                 obs_times = None
 
@@ -4234,11 +3869,19 @@ def main():
                 craft=craft,
             )
 
-            # Full elongation profiles of the ensemble at every observation (reruns the model for
-            #  each distinct ensemble; the result is cached in elon_prof_obs.nc)
+            # Full elongation profiles of the ensemble at every observation (one model run per member
+            #  of each distinct ensemble not yet computed; cached in elon_prof_obs.nc)
             if make_profiles_per_obs:
+                # (the same model runs also give the arrival times for arr_obs.nc when
+                #  make_arrivals_per_obs is set, so compute_arrival_times_per_obs below has
+                #  nothing left to run)
                 compute_elongation_profiles_per_obs(
-                    base_file_path=baseFilePath, runNo=runNo
+                    base_file_path=baseFilePath,
+                    runNo=runNo,
+                    use_model=use_model,
+                    cme_hit_object="EARTH",
+                    sim_time_days=arrival_sim_time_days,
+                    with_arrivals=make_arrivals_per_obs,
                 )
                 plot_elongation_profiles_per_obs(
                     base_file_path=baseFilePath,
