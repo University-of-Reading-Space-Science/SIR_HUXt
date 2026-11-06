@@ -56,7 +56,7 @@
 #
 # osse_ana.py reads the same entry (event "twin"); the run folders are named from these values.
 
-twin:
+twin_hi_speed:
   model_start: 2012-01-01 00:00
   lat_min: -20
   lat_max: 20
@@ -69,9 +69,104 @@ twin:
     thick: 0
   first_guess:
     launch_time: 2012-01-01 01:00
-    speed: 550
+    speed: 600
     width: 37.4
     lon: 0
+    lat: 0
+    thick: 0
+
+twin_low_speed:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 390
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+
+twin_hi_width:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 47
+    lon: 0
+    lat: 0
+    thick: 0
+
+twin_low_width:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 27
+    lon: 0
+    lat: 0
+    thick: 0
+
+twin_hi_lon:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 5
+    lat: 0
+    thick: 0
+
+twin_low_lon:
+  model_start: 2012-01-01 00:00
+  lat_min: -20
+  lat_max: 20
+  truth:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: 0
+    lat: 0
+    thick: 0
+  first_guess:
+    launch_time: 2012-01-01 01:00
+    speed: 495
+    width: 37.4
+    lon: -5
     lat: 0
     thick: 0
 

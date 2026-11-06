@@ -295,8 +295,16 @@ class Setup:
 
         return correlation_settings
 
+    def get_ssw_event(self) -> str:
+        """
+        The event to run: an event or a twin experiment in events.yaml. The event given on the command
+        line (data_assimilation_routine.py --event) replaces this one.
+        :return: Event code
+        """
+        return "twin_base"
+
     def get_ssw_event_craft(self) -> tuple[str, str, str]:
-        ssw_event: str = "twin_base"
+        ssw_event: str = self.get_ssw_event()
 
         # Observing spacecraft: from the event code (09A -> STEREO-A, 13B -> STEREO-B, ssw_ events ->
         #  STEREO-A); "twin" for a twin experiment (synthetic observations)

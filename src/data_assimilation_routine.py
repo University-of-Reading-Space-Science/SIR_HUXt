@@ -1,3 +1,5 @@
+import argparse
+
 import numpy as np
 import numpy.typing as npt
 import datetime
@@ -25,7 +27,7 @@ from cme_par_ens import CmeParEns
 from dataclasses import replace
 from typing import Any
 
-from da_surf_setup import Setup, load_environment, events_file
+from da_surf_setup import Setup, load_environment, events_file, load_events
 from aux_pf import PFSettings
 from model_run_reuse import ElongationStore
 from sir_observation_operator import ObservationOperator, ObsOpSettings, WorkerPool
@@ -1546,17 +1548,94 @@ class RunDataAssimilationRoutine:
         return None
 
 
-def main() -> None:
+def command_line_setup(
+    event: str | None = None,
+    run_start: int | None = None,
+    n_runs: int | None = None,
+    base: type[Setup] = Setup,
+) -> type[Setup]:
+    """
+    Setup class with the settings given on the command line in place of those in da_surf_setup.py
+    :param event: Event or twin experiment in events.yaml (None = Setup.get_ssw_event)
+    :param run_start: First run number (None = initialise_da_parameters' run_start)
+    :param n_runs: Number of runs (None = initialise_da_parameters' n_runs)
+    :param base: Setup class to start from
+    :return: Setup class
+    """
+
+    class CommandLineSetup(base):
+        def get_ssw_event(self) -> str:
+            return super().get_ssw_event() if event is None else event
+
+        def initialise_da_parameters(self) -> dict[str, Any]:
+            da_par_dict: dict[str, Any] = super().initialise_da_parameters()
+            if run_start is not None:
+                da_par_dict["run_start"] = run_start
+            if n_runs is not None:
+                da_par_dict["n_runs"] = n_runs
+            return da_par_dict
+
+    return CommandLineSetup
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Command-line options (any left out keep the values in da_surf_setup.py)"""
+    parser = argparse.ArgumentParser(
+        description="Run the data assimilation for an event or twin experiment of events.yaml. "
+        "Settings not given here come from da_surf_setup.Setup."
+    )
+    parser.add_argument(
+        "--event",
+        help="Event or twin experiment in events.yaml, e.g. 12A or twin_base "
+        "(default: Setup.get_ssw_event)",
+    )
+    parser.add_argument(
+        "--run-start",
+        type=int,
+        help="First run number (twin experiments; 0 or more draws each run's first guess from the "
+        "prior). Real observations always use run -1",
+    )
+    parser.add_argument(
+        "--n-runs", type=int, help="Number of runs (run_start, run_start + 1, ...)"
+    )
+    parser.add_argument(
+        "--list-events",
+        action="store_true",
+        help="List the events and twin experiments in events.yaml and exit",
+    )
+    args = parser.parse_args(argv)
+    if args.n_runs is not None and args.n_runs < 1:
+        parser.error("--n-runs must be 1 or more")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args: argparse.Namespace = parse_args(argv)
+    events: dict[str, dict[str, Any]] = load_events()
+    if args.list_events:
+        print("\n".join(events))
+        return None
+    if args.event is not None and args.event not in events:
+        sys.exit(
+            f"Unknown event {args.event!r}: add it to {events_file()} "
+            f"(events there: {', '.join(events)})"
+        )
+
     load_environment()
     print_environment_variables()
 
     # Reuse the Setup instance built by RunDataAssimilationRoutine
     #  (each Setup() re-reads/re-maps the WSA boundary conditions)
-    run_da_class: RunDataAssimilationRoutine = RunDataAssimilationRoutine()
+    run_da_class: RunDataAssimilationRoutine = RunDataAssimilationRoutine(
+        setup_class=command_line_setup(args.event, args.run_start, args.n_runs)
+    )
     setup_class: Setup = run_da_class.setup_class
     da_par_dict: dict[str, Any] = setup_class.da_par_dict
+    print(f"event = {setup_class.get_ssw_event_craft()[0]}")
 
     run_start: int = da_par_dict["run_start"]
+    if args.run_start is not None and not setup_class.get_use_synthetic_obs():
+        print("--run-start is ignored for real observations (run -1)")
 
     try:
         if setup_class.get_use_synthetic_obs():

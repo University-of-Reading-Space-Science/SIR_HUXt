@@ -31,3 +31,5 @@ surf_err_prop/
 WSA_fits_files/
 .mypy_cache/
 .pytest_cache/
+# Slurm job logs (run_da.sbatch)
+logs/

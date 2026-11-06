@@ -30,6 +30,7 @@ import pandas as pd
 from multiprocessing import Pool
 
 from da_surf_setup import load_environment, get_event, get_twin_cme, is_twin_experiment
+from sir_observation_operator import available_cpus
 from cme_arrival import (
     get_arrival_cme,
     get_arrival_speed_from_front,
@@ -2268,9 +2269,7 @@ def compute_profiles_and_arrivals_per_obs(
                         par_ds, use_model, sim_time=sim_time_days * u.day
                     )
                     if parallel:
-                        pool = Pool(
-                            processes=max(1, min(int((os.cpu_count() or 2) - 1), n_ens))
-                        )
+                        pool = Pool(processes=max(1, min(available_cpus() - 1, n_ens)))
                 print(
                     f"Stage(s) {arr_sts}: separate arrival runs for {len(missing)} member(s)"
                     + (

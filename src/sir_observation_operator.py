@@ -38,6 +38,24 @@ import time
 from multiprocessing.pool import AsyncResult, Pool
 
 
+def available_cpus() -> int:
+    """
+    Cores this process may use: SLURM_CPUS_PER_TASK in a Slurm job (os.cpu_count() would give every
+    core of the node, not those allocated to the job), else the cores the process is allowed to run on
+    (Linux), else os.cpu_count()
+    """
+    slurm_cpus: str | None = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            return max(1, int(slurm_cpus))
+        except ValueError:
+            pass
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # (not available on Windows or macOS)
+        return max(1, os.cpu_count() or 1)
+
+
 class WorkerPool:
     """
     Persistent multiprocessing pool for the members' model runs.
@@ -58,12 +76,12 @@ class WorkerPool:
     def get(self, n_proc: int = None) -> Pool:
         """
         Return the pool, creating it on first use.
-        :param n_proc: Number of worker processes (defaults to os.cpu_count() - 1, minimum 1).
+        :param n_proc: Number of worker processes (defaults to available_cpus() - 1, minimum 1).
             If a pool of a different size already exists it is replaced.
         :return: multiprocessing.Pool
         """
         if n_proc is None:
-            n_proc = max(1, int((os.cpu_count() or 2) - 1))
+            n_proc = max(1, available_cpus() - 1)
 
         if (self.pool is not None) and (self.n_proc != n_proc):
             self.shutdown()
@@ -2035,9 +2053,7 @@ class ObservationOperator:
             # Use no more workers than there are ensemble members (extra workers would sit idle),
             #  and leave one core free for the main process. The run-wide worker pool is reused
             #  (and shut down by WorkerPool.shutdown()); without one, a pool is used for this call only.
-            n_proc: int = max(
-                1, min(int((os.cpu_count() or 2) - 1), int(self.n_members))
-            )
+            n_proc: int = max(1, min(available_cpus() - 1, int(self.n_members)))
             worker_pool: WorkerPool = (
                 WorkerPool() if self.worker_pool is None else self.worker_pool
             )
