@@ -7,6 +7,7 @@ import filecmp
 import os
 import shutil
 import sys
+import traceback
 
 import pandas as pd
 import xarray as xr
@@ -863,6 +864,14 @@ class RunDataAssimilationRoutine:
                     ["n_ens"],
                     np.asarray(profiles[stage]["log_weight"], dtype=float),
                 )
+                # Members whose model run or tracking failed (NaN profiles)
+                elon_ds.attrs[f"{stage}_profile_n_failed"] = int(
+                    len(profiles[stage].get("failed_members", []))
+                )
+                if profiles[stage].get("failed_members"):
+                    elon_ds.attrs[f"{stage}_profile_failed_members"] = np.asarray(
+                        profiles[stage]["failed_members"], dtype=int
+                    )
                 # Ensemble stage of the profiles (0 = prior, k + 1 = after observation k)
                 if "stage" in profiles[stage]:
                     elon_ds.attrs[f"{stage}_profile_stage"] = int(
@@ -1001,10 +1010,15 @@ class RunDataAssimilationRoutine:
             compress_sim_time=model_sim_time,
             arrival_object=arrival_object,
         )
+        # A member whose model run or tracking fails gets a NaN profile rather than losing the whole
+        #  ensemble's profiles (compressible SURF models; reported below)
+        obs_op_class.tolerate_member_errors = True
 
         cme_flanks: list[pd.DataFrame] | None = None
+        failed: list[int] = []
         if self.use_model in ["compress_surf", "compress_surf3d"]:
             cme_flanks = obs_op_class.get_cme_flanks()
+            failed = self.report_failed_members(cme_flanks, cme_par_dict)
             elon: npt.NDArray[np.float64] = np.vstack(
                 [np.asarray(f["el"].values, dtype=float) for f in cme_flanks]
             )
@@ -1029,6 +1043,8 @@ class RunDataAssimilationRoutine:
             "elon": elon,
             "extrapolated": extrap,
             "log_weight": np.asarray(cme_par_dict["log_weight"], dtype=float),
+            # Members whose model run or tracking failed (NaN profiles)
+            "failed_members": failed,
         }
         if arrival_object is not None:
             arrivals: list[dict[str, Any]] = [
@@ -1042,6 +1058,56 @@ class RunDataAssimilationRoutine:
                 [a["available"] for a in arrivals], dtype=bool
             )
         return out
+
+    @staticmethod
+    def report_failed_members(
+        cme_flanks: list[pd.DataFrame], cme_par_dict: CmeParEns
+    ) -> list[int]:
+        """
+        Print the members whose model run or tracking failed in an elongation-profile ensemble (their
+         flanks carry "member_error"; see ObservationOperator.tolerate_member_errors): each one's CME
+         parameters and error, and the full traceback of each distinct error. Raises if every member
+         failed, as there is then nothing to save.
+        :return: Indices of the failed members
+        """
+        failed: list[int] = [
+            i for i, f in enumerate(cme_flanks) if "member_error" in f.attrs
+        ]
+        if not failed:
+            return failed
+
+        def par(key: str, i: int, unit: Any) -> str:
+            try:
+                value = as_value_list(cme_par_dict[key])[i]
+                if key == "t_init":
+                    return str(value)
+                return f"{value_in_unit(value, unit):.1f}"
+            except Exception:
+                return "?"
+
+        print(
+            f"Warning: the model run or tracking failed for {len(failed)} of {len(cme_flanks)} "
+            f"members; their elongation profiles are NaN:"
+        )
+        for i in failed:
+            print(
+                f"  member {i}: t_init {par('t_init', i, None)}, v {par('v', i, u.km / u.s)} km/s, "
+                f"width {par('width', i, u.deg)} deg, lon {par('lon', i, u.deg)} deg, "
+                f"lat {par('lat', i, u.deg)} deg: {cme_flanks[i].attrs['member_error']}"
+            )
+        shown: set[str] = set()
+        for i in failed:
+            if cme_flanks[i].attrs["member_error"] not in shown:
+                shown.add(cme_flanks[i].attrs["member_error"])
+                print(
+                    f"Traceback (member {i}):\n{cme_flanks[i].attrs['member_traceback']}"
+                )
+        if len(failed) == len(cme_flanks):
+            raise RuntimeError(
+                f"the model run or tracking failed for every member "
+                f"(first: {cme_flanks[failed[0]].attrs['member_error']})"
+            )
+        return failed
 
     # Observations must be at least this far (deg) above the smallest elongation the model domain
     #  can show (the inner boundary r_min seen from the observer); see get_min_model_elongation
@@ -1293,7 +1359,8 @@ class RunDataAssimilationRoutine:
                     profiles["prior"]["stage"] = 0
                 except Exception as err:
                     print(
-                        f"Warning: could not compute the prior elongation profiles: {err}"
+                        f"Warning: could not compute the prior elongation profiles: {err}\n"
+                        f"{traceback.format_exc()}"
                     )
 
             for yi, obs in enumerate(self.observations):
@@ -1444,7 +1511,8 @@ class RunDataAssimilationRoutine:
                     )
                 except Exception as err:
                     print(
-                        f"Warning: could not compute the posterior elongation profiles: {err}"
+                        f"Warning: could not compute the posterior elongation profiles: {err}\n"
+                        f"{traceback.format_exc()}"
                     )
                 self.write_elongation_file(
                     output_dir=output_dir,
@@ -1467,6 +1535,28 @@ class RunDataAssimilationRoutine:
             cme_par_ds["bias"] = (["n_obs", "n_ens"], bias_saved)
             cme_par_ds.attrs.update(
                 {
+                    # The event of events.yaml the run was made for, and its spacecraft
+                    "ssw_event": str(self.ssw_event),
+                    "craft": str(self.craft),
+                    # The model and observer set-up, so that osse_ana.py can set up model runs as
+                    #  this run was made, whatever da_surf_setup.py is set to later
+                    "use_model": str(self.use_model),
+                    "model_n_lat_surf": int(self.n_lat_surf),
+                    "model_lat_min_deg": value_in_unit(self.lat_min, u.deg),
+                    "model_lat_max_deg": value_in_unit(self.lat_max, u.deg),
+                    "model_lon_start_deg": value_in_unit(self.lon_start, u.deg),
+                    "model_lon_stop_deg": value_in_unit(self.lon_stop, u.deg),
+                    "model_r_min_rs": value_in_unit(self.r_min, u.solRad),
+                    "model_dt_scale": float(self.dt_scale),
+                    "obs_radius_au": [
+                        value_in_unit(x, u.AU) for x in as_value_list(self.obs_radius)
+                    ],
+                    "obs_lon_deg": [
+                        value_in_unit(x, u.deg) for x in as_value_list(self.obs_lon)
+                    ],
+                    "obs_lat_deg": [
+                        value_in_unit(x, u.deg) for x in as_value_list(self.obs_lat)
+                    ],
                     "bias_mode": self.bias_settings["mode"],
                     "bias_predictor": self.bias_settings["predictor"]["type"],
                     "bias_e_ref_deg": self.bias_settings["predictor"]["e_ref_deg"],
@@ -1607,6 +1697,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.n_runs is not None and args.n_runs < 1:
         parser.error("--n-runs must be 1 or more")
     return args
+
+
+def value_in_unit(value: Any, unit: Any) -> float:
+    """A Quantity as a number in `unit` (a plain number is taken to be in `unit` already)"""
+    return float(value.to(unit).value) if hasattr(value, "to") else float(value)
+
+
+def as_value_list(value: Any) -> list[Any]:
+    """A scalar, list or array (Quantity or not) as a list of its values (Quantity scalars kept)"""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if np.ndim(value) == 0:
+        return [value]
+    return list(value)
 
 
 def main(argv: list[str] | None = None) -> None:

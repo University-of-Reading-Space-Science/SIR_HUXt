@@ -15,6 +15,7 @@ import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 
+import contextlib
 import functools
 from typing import Any
 
@@ -28,22 +29,51 @@ from cme_par_ens import CmeParEns
 from aux_pf import PFSettings
 from sir_observation_operator import ObsOpSettings
 
+# events.yaml used in place of the one next to this file while set (see use_events_file)
+_EVENTS_FILE_OVERRIDE: Path | None = None
+
 
 def events_file() -> Path:
-    """events.yaml next to this file (data_assimilation_routine.py copies it into each experiment)"""
+    """
+    events.yaml next to this file (data_assimilation_routine.py copies it into each experiment), or
+    the file set by use_events_file
+    """
+    if _EVENTS_FILE_OVERRIDE is not None:
+        return _EVENTS_FILE_OVERRIDE
     return Path(__file__).with_name("events.yaml")
 
 
-@functools.cache
+@contextlib.contextmanager
+def use_events_file(path: str | Path | None):
+    """
+    Read events from `path` (e.g. the copy of events.yaml saved with an experiment) instead of the
+    events.yaml next to this file, inside a `with` block; None changes nothing. osse_ana.py uses it to
+    set up a past run as it was made, whatever the current events.yaml holds.
+    """
+    global _EVENTS_FILE_OVERRIDE
+    previous: Path | None = _EVENTS_FILE_OVERRIDE
+    if path is not None:
+        _EVENTS_FILE_OVERRIDE = Path(path)
+    try:
+        yield
+    finally:
+        _EVENTS_FILE_OVERRIDE = previous
+
+
 def load_events(path: str | None = None) -> dict[str, dict[str, Any]]:
     """
     The CME events in events.yaml: model start time, observation file, first guesses and (for
     osse_ana.py) arrival time of each event, and the truth and first-guess CMEs of twin experiments,
     with the times as datetimes
-    :param path: events.yaml to read, e.g. the copy in an experiment folder; None = the one next to
-        this file
+    :param path: events.yaml to read, e.g. the copy in an experiment folder; None = events_file()
     """
-    with open(events_file() if path is None else path) as f:
+    return _load_events_file(str(events_file() if path is None else path))
+
+
+@functools.cache
+def _load_events_file(path: str) -> dict[str, dict[str, Any]]:
+    """load_events for one file (read once)"""
+    with open(path) as f:
         events: dict[str, dict[str, Any]] = {
             str(code): event for code, event in (yaml.safe_load(f) or {}).items()
         }
@@ -117,10 +147,32 @@ def get_twin_cme(code: str, which: str, path: str | None = None) -> dict[str, An
 
 def is_twin_experiment(code: str, path: str | None = None) -> bool:
     """
-    Whether `code` is a twin experiment in events.yaml (an entry with a truth CME, e.g. "twin");
+    Whether `code` is a twin experiment in events.yaml (an entry with a truth CME, e.g. "twin_base");
     path: see load_events
     """
     return "truth" in load_events(path).get(code, {})
+
+
+def event_craft(code: str, path: str | None = None) -> str:
+    """
+    Observing spacecraft of an event, from its code: "twin" for a twin experiment in events.yaml,
+    "sta" for ssw_ events and codes like 09A (STEREO-A), "stb" for codes like 13B (STEREO-B)
+    :param code: Event code
+    :param path: events.yaml to read (see load_events)
+    :return: "twin", "sta" or "stb"
+    """
+    if is_twin_experiment(code, path):
+        return "twin"
+    if code[0:3] == "ssw":
+        return "sta"
+    if code[2:3] == "A":
+        return "sta"
+    if code[2:3] == "B":
+        return "stb"
+    raise ValueError(
+        f"Event {code!r}: not a twin experiment in events.yaml (an entry with a truth) and"
+        f" its spacecraft cannot be told from the code (e.g. 09A -> sta, 13B -> stb)"
+    )
 
 
 def _to_datetime(value: Any) -> datetime.datetime:
@@ -179,12 +231,22 @@ class Setup:
         The twin experiment (entry of events.yaml with the truth and first-guess CMEs) used when
         get_use_synthetic_obs() is True
         """
-        # The event chosen in get_ssw_event_craft if it is a twin experiment, otherwise "twin" (for
-        #  synthetic observations with a real event's code)
+        # The event chosen in get_ssw_event_craft if it is a twin experiment. Otherwise (synthetic
+        #  observations forced on with a real event's code, e.g. twin_bias_test.py) a twin experiment
+        #  of events.yaml: "twin" or "twin_base" if there is one, else the first
         ssw_event: str = self.get_ssw_event_craft()[0]
-        twin_experiment: str = ssw_event if is_twin_experiment(ssw_event) else "twin"
-
-        return twin_experiment
+        if is_twin_experiment(ssw_event):
+            return ssw_event
+        twins: list[str] = [code for code in load_events() if is_twin_experiment(code)]
+        for preferred in ("twin", "twin_base"):
+            if preferred in twins:
+                return preferred
+        if twins:
+            return twins[0]
+        raise KeyError(
+            f"Synthetic observations need a twin experiment (an entry with a truth CME) in "
+            f"{events_file()}, but it has none"
+        )
 
     def get_twin_run_sampling(self) -> dict[str, bool]:
         """
@@ -301,27 +363,14 @@ class Setup:
         line (data_assimilation_routine.py --event) replaces this one.
         :return: Event code
         """
-        return "twin_base"
+        return "twin_hi_speed"
 
     def get_ssw_event_craft(self) -> tuple[str, str, str]:
         ssw_event: str = self.get_ssw_event()
 
         # Observing spacecraft: from the event code (09A -> STEREO-A, 13B -> STEREO-B, ssw_ events ->
         #  STEREO-A); "twin" for a twin experiment (synthetic observations)
-        craft: str
-        if is_twin_experiment(ssw_event):
-            craft = "twin"
-        elif ssw_event[0:3] == "ssw":
-            craft = "sta"
-        elif ssw_event[2:3] == "A":
-            craft = "sta"
-        elif ssw_event[2:3] == "B":
-            craft = "stb"
-        else:
-            raise ValueError(
-                f"Event {ssw_event!r}: not a twin experiment in events.yaml (an entry with a truth) and"
-                f" its spacecraft cannot be told from the code (e.g. 09A -> sta, 13B -> stb)"
-            )
+        craft: str = event_craft(ssw_event)
 
         img: str = "diff"
 
@@ -542,9 +591,23 @@ class Setup:
             1, surf_init_time
         )
 
+        # Real observations have no truth CME: a placeholder (launch at the model start, parameters
+        #  NaN, no bias) so that nothing needs a twin experiment in events.yaml. Nothing in a run with
+        #  real observations uses these values (the observations and their times come from the
+        #  event's observation file)
+        if not self.get_use_synthetic_obs():
+            true_cme_par_dict["t_init"] = surf_init_time
+            true_cme_par_dict["v"] = np.nan * u.km / u.s
+            true_cme_par_dict["width"] = np.nan * u.deg
+            true_cme_par_dict["lon"] = np.nan * u.deg
+            true_cme_par_dict["lat"] = np.nan * u.deg
+            true_cme_par_dict["thick"] = np.nan * u.solRad
+            true_cme_par_dict["bias"] = 0.0
+            return true_cme_par_dict
+
         # Initialise true CME parameters: the truth of the twin experiment in events.yaml. The
         #  launch time is kept relative to the model start (so it is the truth's launch_time in twin
-        #  runs; runs with real observations have no truth CME)
+        #  runs)
         twin_experiment: str = self.get_twin_experiment()
         truth: dict[str, Any] = get_twin_cme(twin_experiment, "truth")
         true_cme_t_init: datetime.datetime = surf_init_time + (
@@ -785,7 +848,7 @@ class Setup:
         n_members: int = 50
 
         run_start: int = 0
-        n_runs: int = 20
+        n_runs: int = 10
 
         delta_aux_pf: float = 0.98
         if self.get_use_synthetic_obs():

@@ -8,6 +8,7 @@ import numpy.typing as npt
 import pandas as pd
 import sys
 import os
+import traceback
 
 import surf.surf as S
 import surf.surf_inputs as Sin
@@ -1302,6 +1303,10 @@ class ObservationOperator:
     n_main_times: int = 1
     extra_obs_index: list[int] = []
     extra_obs_times_used: list[datetime.datetime] = []
+    # If True (set by RunDataAssimilationRoutine.calculate_elongation_profiles), a member whose model
+    #  run or tracking raises gives a NaN flank (the error in its attrs "member_error" and
+    #  "member_traceback") instead of stopping the whole ensemble. Off for the assimilation itself.
+    tolerate_member_errors: bool = False
 
     def __init__(
         self,
@@ -2017,6 +2022,45 @@ class ObservationOperator:
 
         return cme_flank
 
+    def _member_flank_or_nan(
+        self,
+        cme: H.ConeCME | S.ConeCME = None,
+        obs_longitude: Quantity[u.deg] | list[Quantity[u.deg]] = None,
+        ens_no: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        get_cme_flank_single_ens_member, but a member whose model run or tracking raises gives an
+         all-NaN flank (compressible SURF models; see tolerate_member_errors), with the error message
+         and traceback in its attrs "member_error" and "member_traceback" and no arrival
+        """
+        try:
+            return self.get_cme_flank_single_ens_member(
+                cme=cme, obs_longitude=obs_longitude, ens_no=ens_no
+            )
+        except Exception as err:
+            if self.use_model not in ["compress_surf", "compress_surf3d"]:
+                raise
+            times: list[Any] = list(np.atleast_1d(np.array(self.obs_time_in_datetime)))
+            times += list(self.extra_obs_times_used or [])
+            n_times: int = len(times)
+            cme_flank: pd.DataFrame = pd.DataFrame(
+                {
+                    "time": times,
+                    "el": np.nan * np.ones(n_times),
+                    "r": np.nan * np.ones(n_times),
+                    "lon": np.nan * np.ones(n_times),
+                    "extrapolated": np.zeros(n_times, dtype=bool),
+                }
+            )
+            if ens_no is not None:
+                cme_flank.index = [ens_no for _ in range(n_times)]
+            cme_flank.attrs["member_error"] = f"{type(err).__name__}: {err}"
+            cme_flank.attrs["member_traceback"] = traceback.format_exc()
+            print(
+                f"Member {ens_no}: model run or tracking failed: {type(err).__name__}: {err}"
+            )
+            return cme_flank
+
     def get_cme_flanks(self) -> list[pd.DataFrame]:
         """
         Function to retrieve the CME flank dataframes for all ensemble members
@@ -2048,6 +2092,13 @@ class ObservationOperator:
         else:
             obs_lon_member = self.obs_lon
 
+        # Per-member model run and tracking (errors tolerated for e.g. the elongation profiles)
+        member_flank: Callable[..., pd.DataFrame] = (
+            self._member_flank_or_nan
+            if self.tolerate_member_errors
+            else self.get_cme_flank_single_ens_member
+        )
+
         if self.use_parallel:
             print("Using parallel execution")
             # Use no more workers than there are ensemble members (extra workers would sit idle),
@@ -2061,7 +2112,7 @@ class ObservationOperator:
                 pool: Pool = worker_pool.get(n_proc)
                 obj_res: list[AsyncResult] = [
                     pool.apply_async(
-                        self.get_cme_flank_single_ens_member,
+                        member_flank,
                         kwds={
                             "cme": i_cme,
                             "obs_longitude": obs_lon_member,
@@ -2081,9 +2132,7 @@ class ObservationOperator:
         else:
             print("Using serial execution")
             cme_flanks: list[pd.DataFrame] = [
-                self.get_cme_flank_single_ens_member(
-                    cme=i_cme, obs_longitude=obs_lon_member, ens_no=i
-                )
+                member_flank(cme=i_cme, obs_longitude=obs_lon_member, ens_no=i)
                 for i, i_cme in enumerate(cme_objects)
             ]
             print(f"Serial cme_flanks = {cme_flanks}")

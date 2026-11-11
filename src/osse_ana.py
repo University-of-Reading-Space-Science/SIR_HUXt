@@ -1,5 +1,7 @@
 import os
+import argparse
 import sys
+import traceback
 import json
 
 from astropy.time import Time
@@ -29,7 +31,15 @@ import sunpy.coordinates.sun as sn
 import pandas as pd
 from multiprocessing import Pool
 
-from da_surf_setup import load_environment, get_event, get_twin_cme, is_twin_experiment
+from da_surf_setup import (
+    load_environment,
+    get_event,
+    get_twin_cme,
+    is_twin_experiment,
+    event_craft,
+    load_events,
+    events_file,
+)
 from sir_observation_operator import available_cpus
 from cme_arrival import (
     get_arrival_cme,
@@ -145,15 +155,14 @@ def plot_par_values_over_single_run(
     xPlot = ds[xVarName][:].values
 
     yTrue = yTruth
-    try:
-        ds[yVarName][runNo, :, :].values
-        ds["log_weight"][runNo, :, :].values
-    except:
-        yPlot = ds[yVarName][:, :].values
-        weights = np.exp(ds["log_weight"][:, :].values)
+    # ds may hold several runs (run, obs, member): take run runNo, by its run number
+    if "run" in ds[yVarName].dims:
+        run_values = list(np.ravel(ds["run"].values))
+        ds_run = ds.isel(run=run_values.index(runNo) if runNo in run_values else 0)
     else:
-        yPlot = ds[yVarName][runNo, :, :].values
-        weights = np.exp(ds["log_weight"][runNo, :, :].values)
+        ds_run = ds
+    yPlot = ds_run[yVarName].values
+    weights = np.exp(ds_run["log_weight"].values)
 
     if (obs_times is not None) and (tick_cadence is not None):
         if len(obs_times) > tick_cadence:
@@ -452,6 +461,7 @@ def get_cme_arrival_time(
     base_file_path=None,
     parallel_ens=False,
     sim_time_days=4.0,
+    event=None,
 ):
     """
     Prior and posterior CME arrival times at cme_hit_object of run runNo: statistics, a histogram of
@@ -467,6 +477,7 @@ def get_cme_arrival_time(
     :param parallel_ens: Solve the members in parallel where arrivals must be computed
     :param sim_time_days: Model run length (days) of the arrival runs, as for
         compute_arrival_times_per_obs (CMEs arriving later count as misses)
+    :param event: Event or twin experiment of the run (see compute_profiles_and_arrivals_per_obs)
     """
     if base_file_path is None:
         raise ValueError(
@@ -485,6 +496,7 @@ def get_cme_arrival_time(
         cme_hit_object=cme_hit_object,
         sim_time_days=sim_time_days,
         parallel=parallel_ens,
+        event=event,
     )
     if arr_file is None:
         print(f"get_cme_arrival_time: no arrival times for run {runNo}")
@@ -1481,6 +1493,148 @@ def apply_profile_bias(elon, beta_row, pred_kw):
         return np.where(np.isfinite(elon) & (elon > 0), elon + corr, elon)
 
 
+def backfill_da_profiles(
+    base_file_path,
+    runNo=-1,
+    use_model=None,
+    event=None,
+    cme_hit_object="EARTH",
+    sim_time_days=4.0,
+    compute_missing=True,
+):
+    """
+    Fill in the prior and/or posterior elongation profiles missing from a data assimilation run's
+    <run dir>/ens_elongations.nc (the run could not compute them: a member's model run or tracking
+    raised; runs since 10 Nov 2026 give such a member a NaN profile instead), so that
+    plot_full_elongation_profiles has both panels, without rerunning the data assimilation.
+    The profiles of the ensemble at the missing stage (prior = stage 0, posterior = the ensemble
+    after the last assimilated observation) are taken from <run dir>/elon_prof_obs.nc
+    (compute_profiles_and_arrivals_per_obs), computing that stage first if it is not there yet
+    (compute_missing; one ensemble of model runs, set up as the run was made). They are written
+    into ens_elongations.nc as {prior,posterior}_profile_{elon,extrapolated,log_weight}, with the
+    attribute {stage}_profile_source = "osse_ana backfill"; the arrivals of these members are in
+    arr_obs.nc (not added to ens_elongations.nc). A stage that cannot be filled is left out, with a
+    message (and a traceback of any member that failed again).
+    :param base_file_path: Directory containing the run_<runNo> output folders
+    :param runNo: Run number
+    :param use_model: Model used in the run (None = from ens_elongations.nc)
+    :param event: Event of the run (see run_routine; None = the run's own record)
+    :param cme_hit_object: Body for the arrivals computed alongside the profiles
+    :param sim_time_days: Model run length in days (as the data assimilation's profile runs)
+    :param compute_missing: Run the models for a stage not yet in elon_prof_obs.nc
+    :return: List of the stages ("prior", "posterior") added to ens_elongations.nc
+    """
+    run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
+    elon_file = os.path.join(run_dir, "ens_elongations.nc")
+    par_file = os.path.join(run_dir, "cme_pars.nc")
+    if not (os.path.isfile(elon_file) and os.path.isfile(par_file)):
+        return []
+    elon_ds = xr.load_dataset(elon_file)
+    if "profile_time" not in elon_ds.coords:
+        # The run did not compute profiles at all (compute_elongation_profiles off, or older code)
+        return []
+    assimilated = np.flatnonzero(elon_ds["assimilated"].values.astype(bool))
+    stage_no = {
+        "prior": 0,
+        "posterior": int(assimilated[-1]) + 1 if assimilated.size else 0,
+    }
+    missing = [st for st in stage_no if f"{st}_profile_elon" not in elon_ds]
+    if not missing:
+        return []
+    print(
+        f"backfill_da_profiles: run {runNo}: the {' and '.join(missing)} elongation profiles are "
+        f"missing from {elon_file}"
+    )
+
+    def stage_profiles():
+        prof_file = read_path(run_dir, "profiles_per_obs")
+        if not os.path.isfile(prof_file):
+            return None
+        return xr.load_dataset(prof_file)
+
+    prof_ds = stage_profiles()
+    to_compute = [
+        stage_no[st]
+        for st in missing
+        if prof_ds is None
+        or stage_no[st] >= prof_ds.sizes.get("stage", 0)
+        or not bool(prof_ds["computed"].values[stage_no[st]])
+    ]
+    if to_compute and compute_missing:
+        print(f"backfill_da_profiles: computing stage(s) {sorted(set(to_compute))}")
+        try:
+            compute_profiles_and_arrivals_per_obs(
+                base_file_path,
+                runNo=runNo,
+                use_model=use_model,
+                stages=sorted(set(to_compute)),
+                cme_hit_object=cme_hit_object,
+                sim_time_days=sim_time_days,
+                want_profiles=True,
+                want_arrivals=True,
+                event=event,
+            )
+        except Exception as err:
+            print(
+                f"backfill_da_profiles: could not compute the profiles: {err}\n"
+                f"{traceback.format_exc()}"
+            )
+        prof_ds = stage_profiles()
+    if prof_ds is None:
+        print("backfill_da_profiles: no per-observation profiles to fill in from")
+        return []
+
+    prof_times = pd.to_datetime(prof_ds["profile_time"].values)
+    da_times = pd.to_datetime(elon_ds["profile_time"].values)
+    if len(prof_times) != len(da_times) or np.any(
+        np.abs((prof_times - da_times).total_seconds()) > 1.0
+    ):
+        print(
+            "backfill_da_profiles: the per-observation profiles are on other times than "
+            f"{elon_file}'s; not filled in"
+        )
+        return []
+
+    added = []
+    for st in missing:
+        k = stage_no[st]
+        if k >= prof_ds.sizes["stage"] or not bool(prof_ds["computed"].values[k]):
+            print(f"backfill_da_profiles: no {st} profiles (stage {k}) to fill in")
+            continue
+        elon_ds[f"{st}_profile_elon"] = (
+            ["n_ens", "n_profile"],
+            np.asarray(prof_ds["elon_profile"].values[k], dtype=float),
+        )
+        elon_ds[f"{st}_profile_extrapolated"] = (
+            ["n_ens", "n_profile"],
+            np.asarray(prof_ds["extrapolated"].values[k]).astype(np.int8),
+        )
+        elon_ds[f"{st}_profile_log_weight"] = (
+            ["n_ens"],
+            np.asarray(prof_ds["log_weight"].values[k], dtype=float),
+        )
+        elon_ds.attrs[f"{st}_profile_stage"] = int(k)
+        elon_ds.attrs[f"{st}_profile_source"] = (
+            "osse_ana backfill (elon_prof_obs.nc stage " f"{k})"
+        )
+        n_nan = int(
+            np.sum(np.all(~np.isfinite(elon_ds[f"{st}_profile_elon"].values), axis=1))
+        )
+        print(
+            f"backfill_da_profiles: added the {st} profiles (stage {k}"
+            + (f"; {n_nan} member(s) without any elongation" if n_nan else "")
+            + ")"
+        )
+        added.append(st)
+
+    if added:
+        # Write to a temporary file and replace, so an interrupted write leaves the original
+        tmp_file = elon_file + ".tmp"
+        elon_ds.to_netcdf(tmp_file, mode="w")
+        os.replace(tmp_file, elon_file)
+    return added
+
+
 def plot_full_elongation_profiles(
     base_file_path,
     runNo=0,
@@ -1864,6 +2018,151 @@ def _separate_arrivals(
     }
 
 
+def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=None):
+    """
+    A RunDataAssimilationRoutine set up as the run in base_file_path/run_<run_no> was made, for
+    model runs of its ensembles (elongation profiles, arrivals), independent of the event and
+    settings da_surf_setup.py is set to now. From the run's own record where it has one:
+      - the event (event, else cme_pars.nc's ssw_event or twin_experiment), read from the copy of
+        events.yaml saved with the experiment (experiment_events_file) when there is one
+      - the model start (cme_pars.nc model_init_time), the number of members (n_ens) and the model
+        (use_model, else the run's)
+      - the observation times and values (ens_elongations.nc), so no observation file is read and no
+        synthetic truth run is made
+      - the model grid and observer (cme_pars.nc model_* and obs_* attributes, runs since 8 Nov 2026)
+    Anything the run does not record (older runs: the model grid; and the model's fixed constants) is
+    taken from da_surf_setup.Setup.
+    :param par_ds: The run's cme_pars.nc
+    :param elon_ds: The run's ens_elongations.nc, or None
+    :param base_file_path: Directory containing the run_<run_no> folders
+    :param run_no: Run number
+    :param event: Event or twin experiment the run was made for (None = from the run's record, else
+        da_surf_setup.py's event, with a note)
+    :param use_model: Model (None = from the run's record, else da_surf_setup.py's)
+    :return: RunDataAssimilationRoutine
+    """
+    from data_assimilation_routine import RunDataAssimilationRoutine
+    from da_surf_setup import Setup, use_events_file
+
+    attrs = dict(par_ds.attrs)
+    if event is None:
+        event = attrs.get("ssw_event") or attrs.get("twin_experiment")
+    if not event:
+        # Older runs that do not record their event: da_surf_setup.py's event
+        event = Setup.get_ssw_event(object.__new__(Setup))
+        print(
+            f"Note: run {run_no} in {base_file_path} does not record its event; using {event!r} "
+            f"(da_surf_setup.py). Give the event (osse_ana.py --event) if it was another."
+        )
+    event = str(event)
+    events_copy = experiment_events_file(base_file_path, run_no)
+    if use_model is None:
+        use_model = attrs.get("use_model") or (
+            elon_ds.attrs.get("use_model") if elon_ds is not None else None
+        )
+    n_ens = int(par_ds.sizes["n_ens"])
+    model_init_time = pd.to_datetime(
+        np.ravel(par_ds["model_init_time"].values)[0]
+    ).to_pydatetime()
+    obs_times = (
+        [t.to_pydatetime() for t in pd.to_datetime(elon_ds["obs_time"].values)]
+        if elon_ds is not None and "obs_time" in elon_ds
+        else None
+    )
+    observations = (
+        [float(x) for x in np.asarray(elon_ds["observation"].values, dtype=float)]
+        if elon_ds is not None and "observation" in elon_ds
+        else None
+    )
+
+    def recorded(key):
+        """A recorded attribute, or None if absent or NaN"""
+        value = attrs.get(key)
+        if value is None:
+            return None
+        if np.ndim(value) == 0 and not np.isfinite(float(value)):
+            return None
+        return value
+
+    with use_events_file(events_copy):
+        twin: bool = bool(attrs.get("twin_experiment")) or is_twin_experiment(event)
+
+    class RunSetup(Setup):
+        def get_ssw_event(self):
+            return event
+
+        def get_use_synthetic_obs(self):
+            return twin
+
+        def get_surf_init_time(self):
+            return model_init_time
+
+        def get_use_model(self):
+            return str(use_model) if use_model else super().get_use_model()
+
+        def initialise_da_parameters(self):
+            d = super().initialise_da_parameters()
+            d.update(n_members=n_ens, run_start=-1, n_runs=1)
+            return d
+
+        def get_twin_latitude_range(self):
+            lat_min, lat_max = recorded("model_lat_min_deg"), recorded(
+                "model_lat_max_deg"
+            )
+            if lat_min is not None and lat_max is not None:
+                return float(lat_min) * u.deg, float(lat_max) * u.deg
+            return super().get_twin_latitude_range()
+
+        def initialise_surf_parameters(self):
+            d = super().initialise_surf_parameters()
+            for key, attr, unit in (
+                ("n_lat_surf", "model_n_lat_surf", None),
+                ("lon_start", "model_lon_start_deg", u.deg),
+                ("lon_stop", "model_lon_stop_deg", u.deg),
+                ("r_min", "model_r_min_rs", u.solRad),
+                ("dt_scale", "model_dt_scale", None),
+            ):
+                value = recorded(attr)
+                if value is not None:
+                    d[key] = (
+                        float(value) * unit if unit is not None else type(d[key])(value)
+                    )
+            return d
+
+        def initialise_observation_parameters(self):
+            d = super().initialise_observation_parameters()
+            if obs_times is not None:
+                d["n_obs"] = len(obs_times)
+                d["obs_times"] = list(obs_times)
+            for key, attr, unit in (
+                ("obs_radius", "obs_radius_au", u.AU),
+                ("obs_lon", "obs_lon_deg", u.deg),
+                ("obs_lat", "obs_lat_deg", u.deg),
+            ):
+                values = attrs.get(attr)
+                if values is not None:
+                    values = [float(x) * unit for x in np.atleast_1d(values)]
+                    d[key] = values if len(values) > 1 else values[0]
+            return d
+
+    class RunRoutine(RunDataAssimilationRoutine):
+        def get_observations(self):
+            # The run's own observations (no observation file read, no synthetic truth run)
+            if observations is None or obs_times is None:
+                return super().get_observations()
+            if self.use_synthetic_obs:
+                return list(observations)
+            obs_lon = (
+                list(self.obs_lon)
+                if isinstance(self.obs_lon, list)
+                else [self.obs_lon] * len(observations)
+            )
+            return list(obs_times), obs_lon, list(observations), len(observations)
+
+    with use_events_file(events_copy):
+        return RunRoutine(setup_class=RunSetup)
+
+
 def compute_profiles_and_arrivals_per_obs(
     base_file_path,
     runNo=-1,
@@ -1875,6 +2174,7 @@ def compute_profiles_and_arrivals_per_obs(
     want_arrivals=True,
     parallel=True,
     overwrite=False,
+    event=None,
 ):
     """
     Full elongation profiles and/or CME arrival times at cme_hit_object of every member, for the
@@ -1890,10 +2190,10 @@ def compute_profiles_and_arrivals_per_obs(
       - the prior and posterior ensembles' profiles and arrivals saved by the data assimilation run
         in ens_elongations.nc are used (reused_from = -2); its arrivals only if their body and run
         length match cme_hit_object and sim_time_days
-    The arrivals come from separate runs (make_arrival_model, the former set-up) for members whose run
-    does not reach the body (a compress_surf3d latitude grid that misses it), and for every member if
-    the current da_surf_setup.py does not match the run (number of members, model start or model).
-    The profiles need da_surf_setup.py to match the run (as before).
+    The model runs are set up as the run was made (run_routine: its event, model start, members,
+    model, observations and recorded grid), whatever da_surf_setup.py is set to now. The arrivals
+    come from separate runs (make_arrival_model) for members whose run does not reach the body (a
+    compress_surf3d latitude grid that misses it), and for every member if the run cannot be set up.
 
     Output: <run dir>/elon_prof_obs.nc (want_profiles) with
         elon_profile (n_stage, n_ens, n_profile): elongation (deg), NaN where not visible/not computed
@@ -1916,9 +2216,10 @@ def compute_profiles_and_arrivals_per_obs(
     :param want_arrivals: Compute the arrivals
     :param parallel: Solve members in parallel
     :param overwrite: Recompute every requested stage, ignoring existing output files
+    :param event: Event or twin experiment of events.yaml the run was made for (see run_routine;
+        None = the run's own record: cme_pars.nc ssw_event or twin_experiment)
     :return: (profile file or None, arrival file or None)
     """
-    from data_assimilation_routine import RunDataAssimilationRoutine
     from init_sir import initialise_cme_parameter_ensemble_dict
 
     run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
@@ -2156,14 +2457,22 @@ def compute_profiles_and_arrivals_per_obs(
     pool = None
     try:
         if groups:
+            # Set up as the run was made, not as da_surf_setup.py is set now
             try:
-                run_da = RunDataAssimilationRoutine()
+                run_da = run_routine(
+                    par_ds,
+                    elon_ds,
+                    base_file_path,
+                    runNo,
+                    event=event,
+                    use_model=use_model,
+                )
             except Exception as err:
                 if need_prof:
                     raise
                 print(
-                    f"Could not set up the data assimilation routine from da_surf_setup.py ({err}); "
-                    f"the arrivals come from separate model runs"
+                    f"Could not set up the run's model runs ({err}); the arrivals come from "
+                    f"separate model runs"
                 )
             setup_matches = run_da is not None and (
                 run_da.n_members == n_ens
@@ -2171,20 +2480,16 @@ def compute_profiles_and_arrivals_per_obs(
                 <= 1.0
                 and str(run_da.use_model).lower() == str(use_model).lower()
             )
-            if need_prof:
-                if run_da.n_members != n_ens:
-                    raise ValueError(
-                        f"da_surf_setup.py has n_members = {run_da.n_members} but the run has {n_ens} "
-                        f"members; set da_surf_setup.py to the run's settings before computing its profiles."
-                    )
-                if abs((model_init_time - run_da.surf_init_time).total_seconds()) > 1.0:
-                    print(
-                        f"Warning: run model start {model_init_time} differs from da_surf_setup.py "
-                        f"({run_da.surf_init_time}); profiles use the setup's model start."
-                    )
+            # (run_routine sets these from the run, so they match unless the set-up failed)
+            if need_prof and not setup_matches:
+                raise ValueError(
+                    f"Could not set up run {runNo} as it was made (members {run_da.n_members} vs "
+                    f"{n_ens}, model start {run_da.surf_init_time} vs {model_init_time}, model "
+                    f"{run_da.use_model} vs {use_model})"
+                )
             if need_arr and not setup_matches:
                 print(
-                    "da_surf_setup.py does not match this run (members, model start or model): the "
+                    "The run's set-up could not be reproduced (members, model start or model): the "
                     "arrivals come from separate model runs"
                 )
         for key, sts in groups.items():
@@ -2394,6 +2699,7 @@ def compute_elongation_profiles_per_obs(
     cme_hit_object="EARTH",
     sim_time_days=4.0,
     with_arrivals=True,
+    event=None,
 ):
     """
     Full (3-day) modelled CME flank elongation profile of every member for the ensemble at each
@@ -2412,6 +2718,7 @@ def compute_elongation_profiles_per_obs(
         want_profiles=True,
         want_arrivals=with_arrivals,
         overwrite=overwrite,
+        event=event,
     )
     return prof_file
 
@@ -2425,6 +2732,7 @@ def compute_arrival_times_per_obs(
     sim_time_days=4.0,
     parallel=True,
     overwrite=False,
+    event=None,
 ):
     """
     CME arrival time and speed at cme_hit_object of every member for the ensemble at each observation,
@@ -2443,6 +2751,7 @@ def compute_arrival_times_per_obs(
         want_arrivals=True,
         parallel=parallel,
         overwrite=overwrite,
+        event=event,
     )
     return arr_file
 
@@ -2748,7 +3057,14 @@ def plot_elongation_profiles_per_obs(
     return saved
 
 
-def make_arrival_model(ds, use_model, sim_time=4.0 * u.day, dt_scale=20):
+def make_arrival_model(
+    ds,
+    use_model,
+    sim_time=4.0 * u.day,
+    dt_scale=20,
+    latitude_min=-15 * u.deg,
+    latitude_max=15 * u.deg,
+):
     """
     Build the model used to compute CME arrival times, with the same set-up as get_cme_arrival_time
     (longitudes 300-420 deg, SURF3d latitudes -15 to +15 deg, dt_scale 20) but a configurable run
@@ -2757,6 +3073,7 @@ def make_arrival_model(ds, use_model, sim_time=4.0 * u.day, dt_scale=20):
     :param use_model: "surf", "compress_surf", "compress_surf3d" or "huxt"
     :param sim_time: Model run length (CMEs arriving after the end of the run count as misses)
     :param dt_scale: Model output time step scale
+    :param latitude_min, latitude_max: SURF3d latitude range (compress_surf3d)
     :return: (model, model start datetime)
     """
     start_time = pd.to_datetime(
@@ -2796,8 +3113,8 @@ def make_arrival_model(ds, use_model, sim_time=4.0 * u.day, dt_scale=20):
             v_map_lat=ds["vr_lats"].values * u.deg,
             cr_num=cr_num,
             cr_lon_init=ert.lon_c.to(u.deg),
-            latitude_min=-15 * u.deg,
-            latitude_max=15 * u.deg,
+            latitude_min=latitude_min,
+            latitude_max=latitude_max,
             lon_start=lon_start.to(u.rad),
             lon_stop=lon_end.to(u.rad),
             simtime=sim_time,
@@ -2833,6 +3150,290 @@ def _arrival_for_cme(model, use_model, cme, cme_hit_object="EARTH"):
     if not hit:
         return None, np.nan
     return arr_time, float(arr_speed)
+
+
+def _animation_cme(par_ds, use_model, stage, member):
+    """
+    The cone CME to animate: an ensemble member at a stage, the ensemble's weighted mean, or the twin
+    experiment's truth
+    :param par_ds: The run's cme_pars.nc
+    :param use_model: Model
+    :param stage: Stage (0 = prior, k = after the k-th observation)
+    :param member: Member index, "mean" (weighted mean of the parameters at the stage; longitude as
+        a circular mean) or "truth"
+    :return: (cone CME object, label for titles and file names, parameter values)
+    """
+    cme_cls = H.ConeCME if use_model in ["huxt"] else S.ConeCME
+    model_init_time = pd.to_datetime(
+        np.ravel(par_ds["model_init_time"].values)[0]
+    ).to_pydatetime()
+    par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
+    if member == "truth":
+        attrs = par_ds.attrs
+        if "true_v" not in attrs:
+            raise ValueError(
+                "member='truth' needs a twin run whose cme_pars.nc records its truth (true_* "
+                "attributes, runs since 5 Nov 2026)"
+            )
+        t_init_s = (
+            datetime.datetime.fromisoformat(str(attrs["true_t_init"])) - model_init_time
+        ).total_seconds()
+        values = [
+            t_init_s,
+            float(attrs["true_v"]),
+            float(attrs["true_width"]),
+            float(attrs["true_lon"]),
+            float(attrs["true_lat"]),
+            float(attrs["true_thick"]),
+        ]
+        label = "truth"
+    elif member == "mean":
+        lw = np.asarray(par_ds["log_weight"].values[stage], dtype=float)
+        w = np.exp(lw - np.nanmax(lw))
+        w = np.where(np.isfinite(w), w, 0.0)
+        w = w / w.sum()
+        values = []
+        for p in par_names:
+            x = np.asarray(par_ds[p].values[stage], dtype=float)
+            if p == "lon":
+                rad = np.deg2rad(x)
+                values.append(
+                    float(
+                        np.rad2deg(
+                            np.arctan2(np.sum(w * np.sin(rad)), np.sum(w * np.cos(rad)))
+                        )
+                    )
+                )
+            else:
+                values.append(float(np.sum(w * x)))
+        label = f"stage{stage:02d}_mean"
+    else:
+        values = [
+            float(np.asarray(par_ds[p].values[stage], dtype=float)[member])
+            for p in par_names
+        ]
+        label = f"stage{stage:02d}_member{member:03d}"
+    v = values[1] * u.km / u.s
+    cme = cme_cls(
+        t_launch=values[0] * u.s + get_transit_time_to_r_min(par_ds, v),
+        v=v,
+        width=values[2] * u.deg,
+        longitude=values[3] * u.deg,
+        latitude=values[4] * u.deg,
+        thickness=values[5] * u.solRad,
+        cme_fixed_duration=True,
+        fixed_duration=12 * 3600 * u.s,
+    )
+    return cme, label, tuple(np.round(values, 6))
+
+
+def animate_surf_solution(
+    base_file_path,
+    runNo=-1,
+    stage="final",
+    member="best",
+    kind="auto",
+    use_model=None,
+    sim_time_days=4.0,
+    duration=10,
+    fps=20,
+    lon=0.0 * u.deg,
+    lat=None,
+    plot_rmax=None,
+    dt_scale=20,
+    out_dir=None,
+):
+    """
+    Animate the model solar wind solution with the CME of ensemble members, the ensemble mean or the
+    twin truth, using the animation functions of SURF (surf.surf_analysis.animate, animate_with_ts
+    and animate_3d) or, for HUXt, huxt_analysis.animate. Each CME is solved again in the run's
+    ambient solar wind (its cme_pars.nc), with the arrival-time set-up (make_arrival_model:
+    longitudes 300-420 deg and, for compress_surf3d, the run's latitude range when recorded, else
+    -15 to 15 deg). The model is solved ONCE per distinct CME: all the kinds of animation of that CME
+    are made from the same solution, and a stage whose CME is the same as another's (e.g. the prior
+    and final means when no observation changed the ensemble) reuses that solution.
+    :param base_file_path: Directory containing the run_<runNo> folders
+    :param runNo: Run number
+    :param stage: "prior" (0), "final" (after the last observation), a stage number, or a list
+    :param member: "best" (largest weight at the stage), "mean" (weighted mean of the parameters at
+        the stage), "truth" (twin runs), a member index, or a list of these
+    :param kind: "slice" (one latitude: animate, compressible solutions shown as speed, density and
+        temperature), "with_ts" (one latitude with the time series at Earth: animate_with_ts),
+        "3d" (compress_surf3d: radial-latitude and radial-longitude slices, animate_3d), "auto"
+        (3d for compress_surf3d when ffmpeg is available, else slice), or a list of these
+    :param use_model: Model (None = the run's, from cme_pars.nc or ens_elongations.nc)
+    :param sim_time_days: Model run length (days from the model start)
+    :param duration: Animation length (s)
+    :param fps: Frames per second
+    :param lon: Longitude of the radial-latitude slice ("3d")
+    :param lat: Latitude of the slice ("slice", "with_ts": the nearest SURF3d latitude) and of the
+        radial-longitude slice ("3d"); None = Earth's latitude at the model start
+    :param plot_rmax: Outer radius of the plots (solar radii, no units; None = the model's)
+    :param dt_scale: Model output time step scale (more frames for smaller values)
+    :param out_dir: Folder for the animations (None = <run dir>/animations)
+    :return: List of the files written
+    """
+    from matplotlib.animation import writers
+    import surf.surf_analysis as SA
+
+    run_dir = os.path.join(base_file_path, f"run_{runNo:03d}")
+    par_file = os.path.join(run_dir, "cme_pars.nc")
+    if not os.path.isfile(par_file):
+        print(f"animate_surf_solution: {par_file} not found")
+        return []
+    par_ds = xr.load_dataset(par_file)
+    n_stage = par_ds.sizes["n_obs"]
+    n_ens = par_ds.sizes["n_ens"]
+    elon_file = os.path.join(run_dir, "ens_elongations.nc")
+    if use_model is None:
+        use_model = str(par_ds.attrs.get("use_model", ""))
+        if not use_model and os.path.isfile(elon_file):
+            with xr.load_dataset(elon_file) as e_ds:
+                use_model = str(e_ds.attrs.get("use_model", ""))
+        use_model = use_model or "compress_surf3d"
+    ffmpeg = writers.is_available("ffmpeg")
+
+    # Stages
+    stages = []
+    for st in stage if isinstance(stage, (list, tuple)) else [stage]:
+        st = 0 if st == "prior" else (n_stage - 1 if st == "final" else int(st))
+        if not 0 <= st < n_stage:
+            raise ValueError(f"stage {st} not in 0..{n_stage - 1}")
+        if st not in stages:
+            stages.append(st)
+
+    # Kinds of animation
+    kinds = []
+    for k in kind if isinstance(kind, (list, tuple)) else [kind]:
+        if k == "auto":
+            k = "3d" if use_model == "compress_surf3d" and ffmpeg else "slice"
+        if k not in ("slice", "with_ts", "3d"):
+            raise ValueError(f"kind {k!r}: expected auto, slice, with_ts or 3d")
+        if k == "3d" and use_model != "compress_surf3d":
+            raise ValueError("kind='3d' needs compress_surf3d")
+        if k == "3d" and not ffmpeg:
+            print(
+                "animate_surf_solution: SURF's animate_3d needs ffmpeg; animating a slice "
+                "instead"
+            )
+            k = "slice"
+        if k not in kinds:
+            kinds.append(k)
+
+    # Members
+    members = member if isinstance(member, (list, tuple)) else [member]
+    for m in members:
+        if m not in ("best", "mean", "truth") and not (
+            isinstance(m, (int, np.integer)) and 0 <= m < n_ens
+        ):
+            raise ValueError(
+                f"member {m!r}: expected 'best', 'mean', 'truth' or a member number "
+                f"0..{n_ens - 1}"
+            )
+
+    # The run's SURF3d latitude range when it records one
+    lat_min = par_ds.attrs.get("model_lat_min_deg")
+    lat_max = par_ds.attrs.get("model_lat_max_deg")
+    lat_range = (
+        (float(lat_min) * u.deg, float(lat_max) * u.deg)
+        if lat_min is not None
+        and lat_max is not None
+        and np.isfinite(float(lat_min))
+        and np.isfinite(float(lat_max))
+        else (-15 * u.deg, 15 * u.deg)
+    )
+    out_dir = out_dir or os.path.join(run_dir, "animations")
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = ".mp4" if ffmpeg else ".gif"
+
+    # The CMEs to animate (the truth once, whatever the stage)
+    jobs = []
+    for st in stages:
+        log_weight = np.asarray(par_ds["log_weight"].values[st], dtype=float)
+        for m in members:
+            if m == "truth" and any(j[1] == "truth" for j in jobs):
+                continue
+            m_st = int(np.nanargmax(log_weight)) if m == "best" else m
+            jobs.append((st, m_st))
+
+    written = []
+    solved = {}  # CME parameters -> solved model (one model run per distinct CME)
+    for st, m in jobs:
+        cme, label, key = _animation_cme(par_ds, use_model, st, m)
+        if key in solved:
+            model, start_time = solved[key]
+            print(
+                f"Animating run {runNo} {label}: same CME as an earlier one, no new model run"
+            )
+        else:
+            model, start_time = make_arrival_model(
+                par_ds,
+                use_model,
+                sim_time=sim_time_days * u.day,
+                dt_scale=dt_scale,
+                latitude_min=lat_range[0],
+                latitude_max=lat_range[1],
+            )
+            print(f"Animating run {runNo} {label} ({use_model}): solving the model")
+            model.solve([cme])
+            solved[key] = (model, start_time)
+        lat_plot = lat
+        if lat_plot is None:
+            lat_plot = S.Observer("EARTH", Time(start_time, format="datetime")).lat.to(
+                u.deg
+            )
+        tag = f"run{runNo}_{label}"
+        if use_model == "huxt":
+            import huxt.huxt_analysis as HA
+
+            HA.animate(model, tag)
+            print("HUXt saves its animation in its own figures folder")
+            continue
+        # One latitude: the nearest SURF3d slice, or the 2-D model itself
+        if use_model == "compress_surf3d":
+            k_lat = int(np.argmin(np.abs(model.lat.to(u.deg) - lat_plot)))
+            slice_model = model.SURFlat[k_lat]
+        else:
+            slice_model = model
+        for kd in kinds:
+            out_path = os.path.join(out_dir, f"{use_model}_{label}_{kd}{suffix}")
+            check_path_length(out_path, what="animation")
+            if kd == "3d":
+                SA.animate_3d(
+                    model,
+                    lon=lon,
+                    lat=lat_plot,
+                    tag=tag,
+                    duration=duration,
+                    fps=fps,
+                    outputfilepath=out_path,
+                )
+                written.append(out_path)
+            elif kd == "with_ts":
+                path = SA.animate_with_ts(
+                    slice_model,
+                    tag=tag,
+                    duration=duration,
+                    fps=fps,
+                    outputfilepath=out_path,
+                    plot_rmax=plot_rmax,
+                )
+                written.append(str(path))
+            else:
+                path = SA.animate(
+                    slice_model,
+                    tag,
+                    duration=duration,
+                    fps=fps,
+                    outputfilepath=out_path,
+                    plot_rmax=plot_rmax,
+                )
+                written.append(str(path))
+    print(
+        f"animate_surf_solution: {len(written)} animation(s), {len(solved)} model run(s) for run "
+        f"{runNo}"
+    )
+    return written
 
 
 def plot_arrival_time_histograms_per_obs(
@@ -3431,7 +4032,69 @@ def plot_rank_histograms_per_obs(
     return res
 
 
-def main():
+class SkipEvent(Exception):
+    """An event that cannot be analysed (e.g. no results folder); main() reports it and goes on"""
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Command-line options of osse_ana.py (any left out keep the values set in main())"""
+    parser = argparse.ArgumentParser(
+        description="Analyse data assimilation runs of one or more events or twin experiments "
+        "(events.yaml), one after another. Settings not given here are set in main()."
+    )
+    parser.add_argument(
+        "--event",
+        nargs="+",
+        metavar="EVENT",
+        help="Events or twin experiments to analyse, in order, e.g. 09A 12A 13B "
+        "(default: event_list in main())",
+    )
+    parser.add_argument(
+        "--img", nargs="+", help="Image types, e.g. diff (default: img_list in main())"
+    )
+    parser.add_argument(
+        "--start-run", type=int, help="First run number (default: start_run in main())"
+    )
+    parser.add_argument(
+        "--n-runs", type=int, help="Number of runs (default: nRuns in main())"
+    )
+    parser.add_argument(
+        "--animate",
+        action="store_true",
+        help="Make the SURF animations of each run (animate_surf_solution), even if "
+        "make_surf_animation is off in main()",
+    )
+    parser.add_argument(
+        "--animate-member",
+        nargs="+",
+        metavar="MEMBER",
+        help="Members to animate: mean, best, truth (twin runs) or member numbers "
+        "(default: animation_member in main())",
+    )
+    parser.add_argument(
+        "--animate-stage",
+        nargs="+",
+        help="Stages to animate: prior, final or numbers (default: animation_stage in main())",
+    )
+    parser.add_argument(
+        "--animate-kind",
+        nargs="+",
+        choices=["auto", "slice", "with_ts", "3d"],
+        help="Animations: auto, slice, with_ts and/or 3d (default: animation_kind in main())",
+    )
+    parser.add_argument(
+        "--no-animate",
+        action="store_true",
+        help="Do not make the SURF animations (make_surf_animation in main())",
+    )
+    args = parser.parse_args(argv)
+    if args.n_runs is not None and args.n_runs < 1:
+        parser.error("--n-runs must be 1 or more")
+    return args
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
     load_environment()
     nRuns = 1
     start_run = -1
@@ -3444,8 +4107,21 @@ def main():
     obs_dir = os.getenv("OBS_DIR")
     # indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
 
-    event_list = ["twin"]
-    craft_list = ["twin"]  # , "stb"]
+    # Events and twin experiments of events.yaml to analyse, one after another (or give them on the
+    #  command line: python osse_ana.py --event 09A 12A 13B). Each event's spacecraft comes from its
+    #  code (09A -> STEREO-A, 13B -> STEREO-B, ssw_ -> STEREO-A, twin experiments -> twin).
+    event_list = ["14B"]
+    """
+        "09A",
+        "03A",
+        "10A",
+        "04B",
+        "06B",
+        "08B",
+        "13B",
+        "14B",
+        "15B",
+    ]  """  # ["twin"]
     img_list = ["diff"]  # ["norm", "diff"]
     par_type = "donki"
     use_model = "compress_surf3d"
@@ -3457,14 +4133,30 @@ def main():
     #  arriving later count as misses (4 days covers arrivals up to ~4 days after the model start).
     make_arrivals_per_obs = True
     arrival_sim_time_days = 4.0
+    # Fill in the prior/posterior elongation profiles a data assimilation run could not compute
+    #  (backfill_da_profiles: from elon_prof_obs.nc, computing that ensemble first if needed)
+    backfill_missing_profiles = True
     # Rank (Talagrand) histograms of the observations within the forecast ensemble
-    make_rank_histograms = True
+    make_rank_histograms = False
     # Evolution of the observation-bias coefficient through the assimilation window (runs with an
     #  estimated bias term only)
     make_bias_plot = True
+    # Animations of the SURF solution (animate_surf_solution, using SURF's own animate_3d and
+    #  animate_with_ts): by default the ensemble-mean CME of the prior and of the final (posterior)
+    #  ensemble, each as a 3-D slice movie and as a slice with the time series at Earth. One model
+    #  run per distinct CME (2 per run here, 1 if the ensemble never changed); both kinds of movie
+    #  come from the same run. Stages: "prior", "final" or numbers; members: "mean", "best",
+    #  "truth" (twin runs) or numbers; kinds: "3d", "with_ts", "slice" or "auto".
+    make_surf_animation = False
+    animation_stage = ["prior", "final"]
+    animation_member = "mean"
+    animation_kind = ["3d", "with_ts"]
+    animation_duration = 10
+    animation_fps = 20
     n_ens = 50
     delta_aux_pf = 0.98  # initialise_da_parameters: delta_aux_pf
-    # Twin experiments: folder with the run_NNN folders of the run to analyse, e.g.
+    # Twin experiments: folder with the run_NNN folders of the run to analyse (a folder, used when
+    #  event_list holds one twin experiment, or {twin experiment: folder} for several), e.g.
     #  r"C:\Users\ss905122\PycharmProjects\SIR_HUXt\output\comp_surf\bias_cl3_WSA_v\ens_50_uncorr\model_COMPRESS_SURF3D\truth_495.0_37.4_0.0_0.0_0.0\ob_est_lin_0.00_2.00_prior_525.0_37.4_0.0_0.0_0.0_0.98"
     #  The truth plotted is the run's own (read_twin_truth), not necessarily the current events.yaml.
     #  None = the folder a run made with the current settings would be in: OUT_BASE_DIR (.env), the
@@ -3477,11 +4169,11 @@ def main():
         "SIR_HUXt",
         "output",
         "comp_surf",
-        "bias_cl3_WSA_v",
+        "bias_WSA_v",
         f"ens_{n_ens}_uncorr",
         f"model_{use_model.upper()}",
         "truth_495.0_37.4_0.0_0.0_0.0",
-        f"ob_est_lin_0.00_2.00_prior_550.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
+        f"ob_est_lin_0.00_2.00_fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
     )
 
     # Observation-bias term (get_bias_settings: mode, predictor_type, prior_mean, prior_sd);
@@ -3490,399 +4182,456 @@ def main():
     # Bias injected into the synthetic observations (get_bias_settings: true_bias)
     twin_true_bias = 0.0
 
-    all_comb_list = [
-        (x, y, z) for x in event_list for y in craft_list for z in img_list
-    ]
+    # Settings given on the command line
+    if args.event:
+        event_list = list(args.event)
+    if args.img:
+        img_list = list(args.img)
+    if args.start_run is not None:
+        start_run = args.start_run
+    if args.n_runs is not None:
+        nRuns = args.n_runs
+    if args.animate:
+        make_surf_animation = True
+    if args.no_animate:
+        make_surf_animation = False
+    if args.animate_member:
+        animation_member = [
+            int(m) if m.lstrip("-").isdigit() else m for m in args.animate_member
+        ]
+        animation_member = (
+            animation_member[0] if len(animation_member) == 1 else animation_member
+        )
+    if args.animate_stage:
+        animation_stage = [int(x) if x.isdigit() else x for x in args.animate_stage]
+    if args.animate_kind:
+        animation_kind = list(args.animate_kind)
+
+    known_events = load_events()
+    unknown = [e for e in event_list if e not in known_events]
+    if unknown:
+        sys.exit(
+            f"Unknown event(s) {unknown}: add them to {events_file()} "
+            f"(events there: {', '.join(known_events)})"
+        )
+    twin_events = [e for e in event_list if is_twin_experiment(e)]
+    if isinstance(twin_results_dir, str) and len(twin_events) > 1:
+        print(
+            f"Note: twin_results_dir is one folder but there are {len(twin_events)} twin experiments "
+            f"({', '.join(twin_events)}); their folders are built from OUT_BASE_DIR instead. Give "
+            f"twin_results_dir as {{twin experiment: folder}} to set each one."
+        )
+
+    all_comb_list = [(x, z) for x in event_list for z in img_list]
     assert use_model in ["surf", "compress_surf", "compress_surf3d", "huxt"]
 
-    for event, craft, img in all_comb_list:
+    done: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for event, img in all_comb_list:
+        # Observing spacecraft, from the event code
+        craft = event_craft(event)
+        craft_name = {"sta": "STEREO-A", "stb": "STEREO-B"}.get(craft, "twin")
         print(f"\nevent: {event}, craft: {craft}, img: {img}")
+        # (no truth carried over from a previous event)
+        t_initTruth = vTruth = widthTruth = lonTruth = latTruth = None
+        try:
 
-        if craft == "sta":
-            craft_name = "STEREO-A"
-        elif craft == "stb":
-            craft_name = "STEREO-B"
-
-        if is_twin_experiment(event):
-            # Truth and first guess of the twin experiment in events.yaml; the run folders are named
-            #  from them as data_assimilation_routine.py names them
-            truth = get_twin_cme(event, "truth")
-            fg = get_twin_cme(event, "first_guess")
-            true_cme_t_init = truth["t_init"]
-            true_cme_speed = truth["speed"]
-            true_cme_width = truth["width"]
-            true_cme_lon = truth["lon"]
-            true_cme_lat = truth["lat"]
-            true_cme_thick = truth["thick"]
-            truth_dir = (
-                f"truth_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}"
-                f"_{true_cme_thick}"
-            )
-            prior_dir = (
-                f"prior_{fg['speed']:.1f}_{fg['width']:.1f}_{fg['lon']:.1f}_{fg['lat']:.1f}"
-                f"_{fg['thick']:.1f}"
-            )
-            # Synthetic observations: the run folder is named from the truth
-            obs_dir_name = truth_dir
-
-            vTruth = true_cme_speed
-            widthTruth = true_cme_width
-            lonTruth = true_cme_lon
-
-        else:
-            # The event's values from events.yaml (see da_surf_setup.load_events)
-            event_info: dict = get_event(event)
-            if "arrival_time" not in event_info:
-                sys.exit(f"Event {event}: add its arrival_time to events.yaml")
-            real_arrival_time = event_info["arrival_time"]
-            real_arrival_speed = event_info.get("arrival_speed", 0)
-            cme_hit_object = "EARTH"
-            fig_title = event_info.get("title", "CME-{event}").format(
-                event=event, craft_name=craft_name
-            )
-
-            # Run folder of the prior: given in events.yaml for events whose runs use older folder
-            #  names, otherwise named from the first guess as data_assimilation_routine.py names it
-            use_other: bool = par_type != "donki"
-            prior_dir = event_info.get("prior_dir_other" if use_other else "prior_dir")
-            if prior_dir is None:
-                fg = (
-                    event_info.get("first_guess_other", event_info["first_guess"])
-                    if use_other
-                    else event_info["first_guess"]
+            if is_twin_experiment(event):
+                # Truth and first guess of the twin experiment in events.yaml; the run folders are named
+                #  from them as data_assimilation_routine.py names them
+                truth = get_twin_cme(event, "truth")
+                fg = get_twin_cme(event, "first_guess")
+                true_cme_t_init = truth["t_init"]
+                true_cme_speed = truth["speed"]
+                true_cme_width = truth["width"]
+                true_cme_lon = truth["lon"]
+                true_cme_lat = truth["lat"]
+                true_cme_thick = truth["thick"]
+                truth_dir = (
+                    f"truth_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}"
+                    f"_{true_cme_thick}"
                 )
                 prior_dir = (
-                    f"prior_{float(fg['speed']):.1f}_{float(fg['width']):.1f}"
-                    f"_{float(fg['lon']):.1f}_{float(fg['lat']):.1f}_{float(fg['thick']):.1f}"
+                    f"prior_{fg['speed']:.1f}_{fg['width']:.1f}_{fg['lon']:.1f}_{fg['lat']:.1f}"
+                    f"_{fg['thick']:.1f}"
                 )
+                # Synthetic observations: the run folder is named from the truth
+                obs_dir_name = truth_dir
 
-            if f"obs_times_{craft}" in event_info:
-                # Observation times given in events.yaml (the ssw events)
-                obs_times = event_info[f"obs_times_{craft}"]
-                obs_dir_name = f"obs_{craft}_{event}_{img}"
+                vTruth = true_cme_speed
+                widthTruth = true_cme_width
+                lonTruth = true_cme_lon
+
             else:
-                # Observation times from the event's observation file
-                obs_file_path = os.path.join(obs_dir, event_info["obs_file"])
-                obs_class = Observations(
-                    use_model=use_model,
-                    use_synthetic_obs=False,
-                    obs_filenames=obs_file_path,
+                # The event's values from events.yaml (see da_surf_setup.load_events)
+                event_info: dict = get_event(event)
+                if "arrival_time" not in event_info:
+                    raise SkipEvent("no arrival_time in events.yaml")
+                real_arrival_time = event_info["arrival_time"]
+                real_arrival_speed = event_info.get("arrival_speed", 0)
+                cme_hit_object = "EARTH"
+                fig_title = event_info.get("title", "CME-{event}").format(
+                    event=event, craft_name=craft_name
                 )
-                obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
-                # Run folder of the observations, as data_assimilation_routine.py names it
-                #  (obs_<event's spacecraft>_<event>_<image type>)
-                event_craft: str = "sta" if event[2] == "A" else "stb"
-                obs_dir_name = f"obs_{event_craft}_{event}_{img}"
 
-        if is_twin_experiment(event) and twin_results_dir is not None:
-            baseFilePath = twin_results_dir
-        elif is_twin_experiment(event):
-            # Twin results, in the folders data_assimilation_routine.make_output_dir makes:
-            #  OUT_BASE_DIR/ens_<n>_uncorr/model_<MODEL>/truth_...[_tb<true bias>]/[<bias>_]prior_..._<delta>
-            twin_obs_dir = obs_dir_name + (
-                true_bias_suffix(twin_true_bias) if twin_true_bias != 0 else ""
-            )
-            # Twins whose runs sample the first guess and/or the observation noise (events.yaml)
-            twin_entry = get_event(event)
-            sampling_tag = twin_sampling_dir_name(
-                bool(twin_entry.get("sample_first_guess", False)),
-                bool(twin_entry.get("new_obs_noise_per_run", False)),
-            )
-            twin_prior_dir = (
-                f"{sampling_tag}_{prior_dir}" if sampling_tag else prior_dir
-            )
-            twin_prior_dir = (
-                f"{twin_bias_folder}_{twin_prior_dir}"
-                if twin_bias_folder
-                else twin_prior_dir
-            )
-            baseFilePath = os.path.join(
-                os.getenv("OUT_BASE_DIR"),
-                f"ens_{n_ens}_uncorr",
-                f"model_{use_model.upper()}",
-                twin_obs_dir,
-                f"{twin_prior_dir}_{delta_aux_pf}",
-            )
-        else:
-            baseFilePath = os.path.join(
-                "C:\\",
-                "Users",
-                "ss905122",
-                "PycharmProjects",
-                "SIR_HUXt",
-                "output",
-                "comp_surf",
-                "bias_cl3_on_const_WSA_v",
-                f"ens_{n_ens}",
-                "mo_cone",
-                f"model_{use_model.upper()}",
-                obs_dir_name,
-                "ob_est_lin_0.00_2.00",  # "New folder",
-                prior_dir,
-                "0.98",
-            )
+                # Run folder of the prior: given in events.yaml for events whose runs use older folder
+                #  names, otherwise named from the first guess as data_assimilation_routine.py names it
+                use_other: bool = par_type != "donki"
+                prior_dir = event_info.get(
+                    "prior_dir_other" if use_other else "prior_dir"
+                )
+                if prior_dir is None:
+                    fg = (
+                        event_info.get("first_guess_other", event_info["first_guess"])
+                        if use_other
+                        else event_info["first_guess"]
+                    )
+                    prior_dir = (
+                        f"prior_{float(fg['speed']):.1f}_{float(fg['width']):.1f}"
+                        f"_{float(fg['lon']):.1f}_{float(fg['lat']):.1f}_{float(fg['thick']):.1f}"
+                    )
 
-        # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
-        #  by runs since 31 Oct 2026) or the long name of older runs (obsbias_estimate_constant_prior0.00_2.00):
-        #  whichever exists is used. Leave it out for runs without a bias term.
-        baseFilePath = resolve_output_path(baseFilePath)
-        print(f"baseFilePath = {baseFilePath}")
-        if not os.path.isdir(baseFilePath):
-            sys.exit(f"baseFilePath not found: {baseFilePath}")
-        # Warn if files written into the run folders would exceed the Windows path limit
-        if path_too_long(
-            os.path.join(baseFilePath, f"run_{start_run:03d}"), allowance=46
-        ):
-            print(
-                f"Warning: the run folders under {baseFilePath} leave fewer than 46 characters for file "
-                f"names before the Windows path limit ({PathLimits.MAX_PATH}); some figures or netCDF files may not "
-                f"be saved. Shorten the folder names (e.g. the bias folder to its ob_... name) or OUT_BASE_DIR."
-            )
-
-        # Read in all nc files and concatenate them into a single xarray object
-        for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-            print(runNo)
-
-            filePath = os.path.join(baseFilePath, f"run_{runNo:03d}", "cme_pars.nc")
-            with xr.load_dataset(filePath) as dsTemp:
-                dsTemp.expand_dims(dim={"run": 1})
-                dsTemp["run"] = (("run",), [runNo])
-
-                if ir == 0:
-                    ds = dsTemp.copy()
+                if f"obs_times_{craft}" in event_info:
+                    # Observation times given in events.yaml (the ssw events)
+                    obs_times = event_info[f"obs_times_{craft}"]
+                    obs_dir_name = f"obs_{craft}_{event}_{img}"
                 else:
-                    ds = xr.concat([ds, dsTemp], "run")
+                    # Observation times from the event's observation file
+                    obs_file_path = os.path.join(obs_dir, event_info["obs_file"])
+                    obs_class = Observations(
+                        use_model=use_model,
+                        use_synthetic_obs=False,
+                        obs_filenames=obs_file_path,
+                    )
+                    obs_times, obs_lon, obs_lat, obs = obs_class.l5_read_obs_from_file()
+                    # Run folder of the observations, as data_assimilation_routine.py names it
+                    #  (obs_<event's spacecraft>_<event>_<image type>)
+                    obs_dir_name = f"obs_{craft}_{event}_{img}"
 
-        if is_twin_experiment(event):
-            # Truth of the run being analysed (it may have been made with other settings than the
-            #  current events.yaml)
-            # The experiment's copy of events.yaml, saved by the DA run (runs since 5 Nov 2026)
-            events_copy = experiment_events_file(baseFilePath, start_run)
-            twin_name = str(ds.attrs.get("twin_experiment", event))
-            if events_copy is not None and is_twin_experiment(twin_name, events_copy):
-                print(f"Twin parameters from {events_copy} (entry {twin_name!r})")
-                fallback = dict(
-                    get_twin_cme(twin_name, "truth", events_copy),
-                    model_start=get_event(twin_name, events_copy)["model_start"],
+            # Folder given for this twin experiment (twin_results_dir), if any
+            twin_dir_given = (
+                twin_results_dir.get(event)
+                if isinstance(twin_results_dir, dict)
+                else (twin_results_dir if len(twin_events) == 1 else None)
+            )
+            if is_twin_experiment(event) and twin_dir_given is not None:
+                baseFilePath = twin_dir_given
+            elif is_twin_experiment(event):
+                # Twin results, in the folders data_assimilation_routine.make_output_dir makes:
+                #  OUT_BASE_DIR/ens_<n>_uncorr/model_<MODEL>/truth_...[_tb<true bias>]/[<bias>_]prior_..._<delta>
+                twin_obs_dir = obs_dir_name + (
+                    true_bias_suffix(twin_true_bias) if twin_true_bias != 0 else ""
+                )
+                # Twins whose runs sample the first guess and/or the observation noise (events.yaml)
+                twin_entry = get_event(event)
+                sampling_tag = twin_sampling_dir_name(
+                    bool(twin_entry.get("sample_first_guess", False)),
+                    bool(twin_entry.get("new_obs_noise_per_run", False)),
+                )
+                twin_prior_dir = (
+                    f"{sampling_tag}_{prior_dir}" if sampling_tag else prior_dir
+                )
+                twin_prior_dir = (
+                    f"{twin_bias_folder}_{twin_prior_dir}"
+                    if twin_bias_folder
+                    else twin_prior_dir
+                )
+                baseFilePath = os.path.join(
+                    os.getenv("OUT_BASE_DIR"),
+                    f"ens_{n_ens}_uncorr",
+                    f"model_{use_model.upper()}",
+                    twin_obs_dir,
+                    f"{twin_prior_dir}_{delta_aux_pf}",
                 )
             else:
-                fallback = dict(truth, model_start=get_event(event)["model_start"])
-            run_truth, truth_source = read_twin_truth(
-                ds,
-                baseFilePath,
-                fallback,
-                fallback_from_run=events_copy is not None
-                and is_twin_experiment(twin_name, events_copy),
-            )
-            print(f"Truth CME (from {truth_source}): {run_truth}")
-            if truth_source != "events.yaml" and any(
-                not np.isclose(float(run_truth[k]), float(truth[k]))
-                for k in ("speed", "width", "lon", "lat", "thick")
+                baseFilePath = os.path.join(
+                    "C:\\",
+                    "Users",
+                    "ss905122",
+                    "PycharmProjects",
+                    "SIR_HUXt",
+                    "output",
+                    "comp_surf",
+                    "bias_WSA_v",
+                    f"ens_{n_ens}_mo_cone",
+                    f"model_{use_model.upper()}",
+                    obs_dir_name,
+                    f"ob_est_lin_0.00_2.00_{prior_dir}_0.98",  # "New folder",
+                )
+
+            # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
+            #  by runs since 31 Oct 2026) or the long name of older runs (obsbias_estimate_constant_prior0.00_2.00):
+            #  whichever exists is used. Leave it out for runs without a bias term.
+            baseFilePath = resolve_output_path(baseFilePath)
+            print(f"baseFilePath = {baseFilePath}")
+            if not os.path.isdir(baseFilePath):
+                raise SkipEvent(f"results folder not found: {baseFilePath}")
+            missing_runs = [
+                r
+                for r in range(start_run, start_run + nRuns)
+                if not os.path.isfile(
+                    os.path.join(baseFilePath, f"run_{r:03d}", "cme_pars.nc")
+                )
+            ]
+            if missing_runs:
+                raise SkipEvent(
+                    f"no cme_pars.nc for run(s) {missing_runs} in {baseFilePath}"
+                )
+            # Warn if files written into the run folders would exceed the Windows path limit
+            if path_too_long(
+                os.path.join(baseFilePath, f"run_{start_run:03d}"), allowance=46
             ):
                 print(
-                    f"Note: the run's truth differs from the truth of {event!r} in events.yaml"
-                    f" ({truth}); the run's truth is used"
+                    f"Warning: the run folders under {baseFilePath} leave fewer than 46 characters for file "
+                    f"names before the Windows path limit ({PathLimits.MAX_PATH}); some figures or netCDF files may not "
+                    f"be saved. Shorten the folder names (e.g. the bias folder to its ob_... name) or OUT_BASE_DIR."
                 )
-            true_cme_t_init = run_truth["t_init"]
-            true_cme_speed = run_truth["speed"]
-            true_cme_width = run_truth["width"]
-            true_cme_lon = run_truth["lon"]
-            true_cme_lat = run_truth["lat"]
-            true_cme_thick = run_truth["thick"]
-            vTruth = true_cme_speed
-            widthTruth = true_cme_width
-            lonTruth = true_cme_lon
 
-        print(ds)
-        cme_t_init_mean_sec = ds["t_init"].values.mean(axis=1)
-        cme_t_init_mean = [
-            pd.to_datetime(ds["model_init_time"].values) + datetime.timedelta(seconds=i)
-            for i in cme_t_init_mean_sec
-        ]
-        cme_speed_mean = ds["v"].values.mean(axis=1)
-        cme_width_mean = ds["width"].values.mean(axis=1)
-        cme_lon_mean = ds["lon"].values.mean(axis=1)
-        cme_lat_mean = ds["lat"].values.mean(axis=1)
+            # Read in all nc files and concatenate them into a single xarray object
+            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
+                print(runNo)
 
-        print("=======================================================")
-        print(
-            f"Mean CME launch time = Prior: {cme_t_init_mean[0]} - Post: {cme_t_init_mean[-1]}"
-        )
-        print(
-            f"Mean CME speed = Prior: {cme_speed_mean[0]:.2f} - Post: {cme_speed_mean[-1]:.2f}"
-        )
-        print(
-            f"Mean CME width = Prior: {cme_width_mean[0]:.2f} - Post: {cme_width_mean[-1]:.2f}"
-        )
-        print(
-            f"Mean CME lon = Prior: {cme_lon_mean[0]:.2f} - Post: {cme_lon_mean[-1]:.2f}"
-        )
-        print(
-            f"Mean CME lat = Prior: {cme_lat_mean[0]:.2f} - Post: {cme_lat_mean[-1]:.2f}"
-        )
-        print("=========================================================")
+                filePath = os.path.join(baseFilePath, f"run_{runNo:03d}", "cme_pars.nc")
+                with xr.load_dataset(filePath) as dsTemp:
+                    dsTemp.expand_dims(dim={"run": 1})
+                    dsTemp["run"] = (("run",), [runNo])
 
-        if is_twin_experiment(event):
-            real_arrival_time, real_arrival_speed = get_true_cme_arrival_time(
-                ds=ds,
-                use_model=use_model,
-                true_cme_t_init=true_cme_t_init,
-                true_cme_speed=true_cme_speed,
-                true_cme_width=true_cme_width,
-                true_cme_lat=true_cme_lat,
-                true_cme_lon=true_cme_lon,
-                true_cme_thick=true_cme_thick,
-                cme_hit_object="EARTH",
-            )
-        print(f"real_arrival_time = {real_arrival_time}")
-        print(f"real_arrival_speed = {real_arrival_speed}")
+                    if ir == 0:
+                        ds = dsTemp.copy()
+                    else:
+                        ds = xr.concat([ds, dsTemp], "run")
 
-        # Prior and posterior arrival times of each run (read from its arr_obs.nc; only those two
-        #  stages are computed here if missing, with the members in parallel)
-        for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
-            get_cme_arrival_time(
-                ds=ds,
-                runNo=runNo,
-                use_model=use_model,
-                real_arrival_time=real_arrival_time,
-                cme_hit_object="EARTH",
-                base_file_path=baseFilePath,
-                parallel_ens=True,
-                sim_time_days=arrival_sim_time_days,
-            )
-
-        n_obs = len(ds["obs_no"][:])
-
-        for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
             if is_twin_experiment(event):
-                fig_title = f"Twin experiment, Run no. = {runNo}"
-                obs_times = None
+                # Truth of the run being analysed (it may have been made with other settings than the
+                #  current events.yaml)
+                # The experiment's copy of events.yaml, saved by the DA run (runs since 5 Nov 2026)
+                events_copy = experiment_events_file(baseFilePath, start_run)
+                twin_name = str(ds.attrs.get("twin_experiment", event))
+                if events_copy is not None and is_twin_experiment(
+                    twin_name, events_copy
+                ):
+                    print(f"Twin parameters from {events_copy} (entry {twin_name!r})")
+                    fallback = dict(
+                        get_twin_cme(twin_name, "truth", events_copy),
+                        model_start=get_event(twin_name, events_copy)["model_start"],
+                    )
+                else:
+                    fallback = dict(truth, model_start=get_event(event)["model_start"])
+                run_truth, truth_source = read_twin_truth(
+                    ds,
+                    baseFilePath,
+                    fallback,
+                    fallback_from_run=events_copy is not None
+                    and is_twin_experiment(twin_name, events_copy),
+                )
+                print(f"Truth CME (from {truth_source}): {run_truth}")
+                if truth_source != "events.yaml" and any(
+                    not np.isclose(float(run_truth[k]), float(truth[k]))
+                    for k in ("speed", "width", "lon", "lat", "thick")
+                ):
+                    print(
+                        f"Note: the run's truth differs from the truth of {event!r} in events.yaml"
+                        f" ({truth}); the run's truth is used"
+                    )
+                true_cme_t_init = run_truth["t_init"]
+                true_cme_speed = run_truth["speed"]
+                true_cme_width = run_truth["width"]
+                true_cme_lon = run_truth["lon"]
+                true_cme_lat = run_truth["lat"]
+                true_cme_thick = run_truth["thick"]
+                vTruth = true_cme_speed
+                widthTruth = true_cme_width
+                lonTruth = true_cme_lon
 
-            plot_par_values_over_single_run(
-                ds,
-                xVarName="obs_no",
-                yVarName="t_init",
-                xLabel="Time",
-                obs_times=obs_times,
-                tick_cadence=3,
-                fig_title=fig_title,
-                parNameLegend="CME initial time",
-                yTruth=t_initTruth,
-                runNo=runNo,
-                parUnits="",
-                n_obs=n_obs,
-                base_file_path=baseFilePath,
-                craft=craft,
-            )
+            print(ds)
 
-            plot_par_values_over_single_run(
-                ds,
-                xVarName="obs_no",
-                yVarName="v",
-                xLabel="Time",
-                obs_times=obs_times,
-                tick_cadence=3,
-                fig_title=fig_title,
-                parNameLegend="CME speed",
-                yTruth=vTruth,
-                runNo=runNo,
-                parUnits="km/s",
-                n_obs=n_obs,
-                base_file_path=baseFilePath,
-                craft=craft,
-            )
-            plot_par_values_over_single_run(
-                ds,
-                xVarName="obs_no",
-                yVarName="width",
-                xLabel="Time",
-                parNameLegend="CME Width",
-                obs_times=obs_times,
-                tick_cadence=3,
-                fig_title=fig_title,
-                yTruth=widthTruth,
-                runNo=runNo,
-                parUnits=r"$^\circ$",
-                n_obs=n_obs,
-                base_file_path=baseFilePath,
-                craft=craft,
-            )
-            plot_par_values_over_single_run(
-                ds,
-                xVarName="obs_no",
-                yVarName="lon",
-                xLabel="Time",
-                fig_title=fig_title,
-                parNameLegend="CME Longitude",
-                obs_times=obs_times,
-                tick_cadence=3,
-                yTruth=lonTruth,
-                runNo=runNo,
-                parUnits=r"$^\circ$",
-                n_obs=n_obs,
-                base_file_path=baseFilePath,
-                craft=craft,
-            )
-            plot_par_values_over_single_run(
-                ds,
-                xVarName="obs_no",
-                yVarName="lat",
-                xLabel="Time",
-                fig_title=fig_title,
-                parNameLegend="CME Latitude",
-                obs_times=obs_times,
-                tick_cadence=3,
-                yTruth=latTruth,
-                runNo=runNo,
-                parUnits=r"$^\circ$",
-                n_obs=n_obs,
-                base_file_path=baseFilePath,
-                craft=craft,
-            )
+            def stage_mean(name):
+                """Mean over the members (and over the runs, when ds holds several) per stage"""
+                values = np.asarray(ds[name].values, dtype=float)
+                return (
+                    values.mean(axis=(0, 2))
+                    if values.ndim == 3
+                    else values.mean(axis=1)
+                )
 
-            # Observation-bias coefficient through the assimilation window
-            if make_bias_plot:
-                plot_bias_evolution(
-                    base_file_path=baseFilePath,
+            n_runs_in_ds = int(ds.sizes["run"]) if "run" in ds["t_init"].dims else 1
+            if n_runs_in_ds > 1:
+                print(f"(means over the members of all {n_runs_in_ds} runs)")
+            model_init = pd.to_datetime(
+                np.ravel(ds["model_init_time"].values)[0]
+            ).to_pydatetime()
+            cme_t_init_mean = [
+                model_init + datetime.timedelta(seconds=float(i))
+                for i in stage_mean("t_init")
+            ]
+            cme_speed_mean = stage_mean("v")
+            cme_width_mean = stage_mean("width")
+            cme_lon_mean = stage_mean("lon")
+            cme_lat_mean = stage_mean("lat")
+
+            print("=======================================================")
+            print(
+                f"Mean CME launch time = Prior: {cme_t_init_mean[0]} - Post: {cme_t_init_mean[-1]}"
+            )
+            print(
+                f"Mean CME speed = Prior: {cme_speed_mean[0]:.2f} - Post: {cme_speed_mean[-1]:.2f}"
+            )
+            print(
+                f"Mean CME width = Prior: {cme_width_mean[0]:.2f} - Post: {cme_width_mean[-1]:.2f}"
+            )
+            print(
+                f"Mean CME lon = Prior: {cme_lon_mean[0]:.2f} - Post: {cme_lon_mean[-1]:.2f}"
+            )
+            print(
+                f"Mean CME lat = Prior: {cme_lat_mean[0]:.2f} - Post: {cme_lat_mean[-1]:.2f}"
+            )
+            print("=========================================================")
+
+            if is_twin_experiment(event):
+                real_arrival_time, real_arrival_speed = get_true_cme_arrival_time(
+                    ds=ds,
+                    use_model=use_model,
+                    true_cme_t_init=true_cme_t_init,
+                    true_cme_speed=true_cme_speed,
+                    true_cme_width=true_cme_width,
+                    true_cme_lat=true_cme_lat,
+                    true_cme_lon=true_cme_lon,
+                    true_cme_thick=true_cme_thick,
+                    cme_hit_object="EARTH",
+                )
+            print(f"real_arrival_time = {real_arrival_time}")
+            print(f"real_arrival_speed = {real_arrival_speed}")
+
+            # Prior and posterior arrival times of each run (read from its arr_obs.nc; only those two
+            #  stages are computed here if missing, with the members in parallel)
+            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
+                get_cme_arrival_time(
+                    ds=ds,
                     runNo=runNo,
+                    use_model=use_model,
+                    real_arrival_time=real_arrival_time,
+                    cme_hit_object="EARTH",
+                    base_file_path=baseFilePath,
+                    parallel_ens=True,
+                    sim_time_days=arrival_sim_time_days,
+                    event=event,
+                )
+
+            n_obs = len(ds["obs_no"][:])
+
+            for ir, runNo in enumerate(range(start_run, start_run + nRuns)):
+                if is_twin_experiment(event):
+                    fig_title = f"Twin experiment, Run no. = {runNo}"
+                    obs_times = None
+
+                plot_par_values_over_single_run(
+                    ds,
+                    xVarName="obs_no",
+                    yVarName="t_init",
+                    xLabel="Time",
+                    obs_times=obs_times,
+                    tick_cadence=3,
                     fig_title=fig_title,
+                    parNameLegend="CME initial time",
+                    yTruth=t_initTruth,
+                    runNo=runNo,
+                    parUnits="",
+                    n_obs=n_obs,
+                    base_file_path=baseFilePath,
                     craft=craft,
                 )
 
-            # Prior/posterior ensemble elongation profiles against the observations
-            #  (obs_sd = sqrt(obs_cov); obs_cov = [0.5] deg^2 in da_surf_setup)
-            plot_elongation_profiles(
-                base_file_path=baseFilePath,
-                runNo=runNo,
-                obs_sd=np.sqrt(0.5),
-                fig_title=fig_title,
-                craft=craft,
-            )
-
-            # Full 3-day prior/posterior ensemble elongation profiles against the observations
-            plot_full_elongation_profiles(
-                base_file_path=baseFilePath,
-                runNo=runNo,
-                obs_sd=np.sqrt(0.5),
-                fig_title=fig_title,
-                craft=craft,
-            )
-
-            # Full elongation profiles of the ensemble at every observation (one model run per member
-            #  of each distinct ensemble not yet computed; cached in elon_prof_obs.nc)
-            if make_profiles_per_obs:
-                # (the same model runs also give the arrival times for arr_obs.nc when
-                #  make_arrivals_per_obs is set, so compute_arrival_times_per_obs below has
-                #  nothing left to run)
-                compute_elongation_profiles_per_obs(
-                    base_file_path=baseFilePath,
+                plot_par_values_over_single_run(
+                    ds,
+                    xVarName="obs_no",
+                    yVarName="v",
+                    xLabel="Time",
+                    obs_times=obs_times,
+                    tick_cadence=3,
+                    fig_title=fig_title,
+                    parNameLegend="CME speed",
+                    yTruth=vTruth,
                     runNo=runNo,
-                    use_model=use_model,
-                    cme_hit_object="EARTH",
-                    sim_time_days=arrival_sim_time_days,
-                    with_arrivals=make_arrivals_per_obs,
+                    parUnits="km/s",
+                    n_obs=n_obs,
+                    base_file_path=baseFilePath,
+                    craft=craft,
                 )
-                plot_elongation_profiles_per_obs(
+                plot_par_values_over_single_run(
+                    ds,
+                    xVarName="obs_no",
+                    yVarName="width",
+                    xLabel="Time",
+                    parNameLegend="CME Width",
+                    obs_times=obs_times,
+                    tick_cadence=3,
+                    fig_title=fig_title,
+                    yTruth=widthTruth,
+                    runNo=runNo,
+                    parUnits=r"$^\circ$",
+                    n_obs=n_obs,
+                    base_file_path=baseFilePath,
+                    craft=craft,
+                )
+                plot_par_values_over_single_run(
+                    ds,
+                    xVarName="obs_no",
+                    yVarName="lon",
+                    xLabel="Time",
+                    fig_title=fig_title,
+                    parNameLegend="CME Longitude",
+                    obs_times=obs_times,
+                    tick_cadence=3,
+                    yTruth=lonTruth,
+                    runNo=runNo,
+                    parUnits=r"$^\circ$",
+                    n_obs=n_obs,
+                    base_file_path=baseFilePath,
+                    craft=craft,
+                )
+                plot_par_values_over_single_run(
+                    ds,
+                    xVarName="obs_no",
+                    yVarName="lat",
+                    xLabel="Time",
+                    fig_title=fig_title,
+                    parNameLegend="CME Latitude",
+                    obs_times=obs_times,
+                    tick_cadence=3,
+                    yTruth=latTruth,
+                    runNo=runNo,
+                    parUnits=r"$^\circ$",
+                    n_obs=n_obs,
+                    base_file_path=baseFilePath,
+                    craft=craft,
+                )
+
+                # Observation-bias coefficient through the assimilation window
+                if make_bias_plot:
+                    plot_bias_evolution(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        fig_title=fig_title,
+                        craft=craft,
+                    )
+
+                # Animation of the SURF solution with a member's CME (SURF's animation functions)
+                if make_surf_animation:
+                    animate_surf_solution(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        stage=animation_stage,
+                        member=animation_member,
+                        kind=animation_kind,
+                        use_model=use_model,
+                        sim_time_days=arrival_sim_time_days,
+                        duration=animation_duration,
+                        fps=animation_fps,
+                    )
+
+                # Prior/posterior ensemble elongation profiles against the observations
+                #  (obs_sd = sqrt(obs_cov); obs_cov = [0.5] deg^2 in da_surf_setup)
+                plot_elongation_profiles(
                     base_file_path=baseFilePath,
                     runNo=runNo,
                     obs_sd=np.sqrt(0.5),
@@ -3890,34 +4639,92 @@ def main():
                     craft=craft,
                 )
 
-            # CME arrival times of the ensemble at every observation, collated into histograms
-            #  (one ensemble of model runs per distinct ensemble; cached in arr_obs.nc)
-            if make_arrivals_per_obs:
-                compute_arrival_times_per_obs(
+                # Full 3-day prior/posterior ensemble elongation profiles against the observations
+                #  (first filling in any the data assimilation run could not compute)
+                if backfill_missing_profiles:
+                    backfill_da_profiles(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        use_model=use_model,
+                        event=event,
+                        cme_hit_object="EARTH",
+                        sim_time_days=arrival_sim_time_days,
+                    )
+                plot_full_elongation_profiles(
                     base_file_path=baseFilePath,
                     runNo=runNo,
-                    use_model=use_model,
-                    cme_hit_object="EARTH",
-                    sim_time_days=arrival_sim_time_days,
-                )
-                plot_arrival_time_histograms_per_obs(
-                    base_file_path=baseFilePath,
-                    runNo=runNo,
-                    real_arrival_time=real_arrival_time,
+                    obs_sd=np.sqrt(0.5),
                     fig_title=fig_title,
                     craft=craft,
                 )
 
-        # Rank histograms of the observations within the forecast ensemble, at each observation time
-        #  (over all runs) and pooled
-        if make_rank_histograms:
-            plot_rank_histograms_per_obs(
-                base_file_path=baseFilePath,
-                run_nos=list(range(start_run, start_run + nRuns)),
-                obs_sd=np.sqrt(0.5),
-                fig_title=fig_title,
-                craft=craft,
-            )
+                # Full elongation profiles of the ensemble at every observation (one model run per member
+                #  of each distinct ensemble not yet computed; cached in elon_prof_obs.nc)
+                if make_profiles_per_obs:
+                    # (the same model runs also give the arrival times for arr_obs.nc when
+                    #  make_arrivals_per_obs is set, so compute_arrival_times_per_obs below has
+                    #  nothing left to run)
+                    compute_elongation_profiles_per_obs(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        use_model=use_model,
+                        cme_hit_object="EARTH",
+                        sim_time_days=arrival_sim_time_days,
+                        with_arrivals=make_arrivals_per_obs,
+                        event=event,
+                    )
+                    plot_elongation_profiles_per_obs(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        obs_sd=np.sqrt(0.5),
+                        fig_title=fig_title,
+                        craft=craft,
+                    )
+
+                # CME arrival times of the ensemble at every observation, collated into histograms
+                #  (one ensemble of model runs per distinct ensemble; cached in arr_obs.nc)
+                if make_arrivals_per_obs:
+                    compute_arrival_times_per_obs(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        use_model=use_model,
+                        cme_hit_object="EARTH",
+                        sim_time_days=arrival_sim_time_days,
+                        event=event,
+                    )
+                    plot_arrival_time_histograms_per_obs(
+                        base_file_path=baseFilePath,
+                        runNo=runNo,
+                        real_arrival_time=real_arrival_time,
+                        fig_title=fig_title,
+                        craft=craft,
+                    )
+
+            # Rank histograms of the observations within the forecast ensemble, at each observation time
+            #  (over all runs) and pooled
+            if make_rank_histograms:
+                plot_rank_histograms_per_obs(
+                    base_file_path=baseFilePath,
+                    run_nos=list(range(start_run, start_run + nRuns)),
+                    obs_sd=np.sqrt(0.5),
+                    fig_title=fig_title,
+                    craft=craft,
+                )
+        except SkipEvent as reason:
+            print(f"Skipping {event} ({img}): {reason}")
+            skipped.append((f"{event} ({img})", str(reason)))
+            continue
+        except Exception as err:  # (one failing event does not stop the others)
+            traceback.print_exc()
+            print(f"Skipping {event} ({img}) after an error: {err!r}")
+            skipped.append((f"{event} ({img})", f"error: {err!r}"))
+            continue
+        done.append(f"{event} ({img})")
+
+    print("\n=======================================================")
+    print(f"Analysed: {', '.join(done) if done else 'none'}")
+    for name, reason in skipped:
+        print(f"Skipped: {name}: {reason}")
 
     return None
 

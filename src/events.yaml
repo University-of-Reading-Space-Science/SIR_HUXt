@@ -408,6 +408,7 @@ twin_base:
 "06B":
   model_start: 2011-06-14 04:00
   obs_file: CME_06B__20110614__PA270_good_hi2.dat
+  arrival_time: 2011-06-17 02:41
   first_guess:
     time_at_21rs: 2011-06-14 14:13
     speed: 672
@@ -419,6 +420,7 @@ twin_base:
 "07B":
   model_start: 2010-03-19 11:00
   obs_file: CME_07B__20100318__PA264_good_hi2.dat
+  arrival_time: 2010-03-23 22:33
   first_guess:
     time_at_21rs: 2010-03-20 03:05
     speed: 239
@@ -430,6 +432,7 @@ twin_base:
 "08B":
   model_start: 2010-04-03 03:00
   obs_file: CME_08B__20100402__PA265_good_hi2.dat
+  arrival_time: 2010-04-05 08:26
   first_guess:
     time_at_21rs: 2010-04-03 14:36
     speed: 740
@@ -465,6 +468,7 @@ twin_base:
 "11A":
   model_start: 2020-09-30 07:00
   obs_file: CME_11A__20200930__PA277_good_hi2.dat
+  arrival_time: 2020-10-05 06:52
   first_guess:
     time_at_21rs: 2020-10-01 08:49
     speed: 126
@@ -476,6 +480,7 @@ twin_base:
 "12A":
   model_start: 2021-02-10 16:00
   obs_file: CME_12A__20210210__PA263_good_hi2.dat
+  arrival_time: 2021-02-15 18:58
   first_guess:
     time_at_21rs: 2021-02-10 23:12
     speed: 262
