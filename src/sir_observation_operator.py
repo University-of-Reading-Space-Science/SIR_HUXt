@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 import os
 import traceback
+import warnings
 
 import surf.surf as S
 import surf.surf_inputs as Sin
@@ -25,6 +26,14 @@ from typing import Any, Callable
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
+
+# ERFA's "dubious year" warning (dtf2d) for times outside the range of its leap-second table:
+#  harmless here, so not shown (set at import, so also in the worker processes)
+try:
+    from erfa import ErfaWarning
+except ImportError:  # older astropy
+    from astropy.utils.exceptions import ErfaWarning
+warnings.filterwarnings("ignore", message=r".*dubious year", category=ErfaWarning)
 import matplotlib.pyplot as plt
 from matplotlib.colors import Colormap
 
@@ -35,7 +44,9 @@ from obs_bias import apply_bias, BiasPredictor
 from cme_arrival import member_arrival
 
 import atexit
+import multiprocessing
 import time
+from tqdm import tqdm
 from multiprocessing.pool import AsyncResult, Pool
 
 
@@ -57,6 +68,23 @@ def available_cpus() -> int:
         return max(1, os.cpu_count() or 1)
 
 
+class NoElongationError(Exception):
+    """
+    Raised by ObservationOperator.get_cme_flanks (with stop_on_no_elongation) as soon as a member's
+    CME produces no elongation at the observation time(s): the ensemble's remaining model runs are not
+    made, as the observation will not be assimilated (PFSettings.skip_update_if_any_member_nan)
+    """
+
+    def __init__(self, ens_no: int, n_done: int, n_members: int) -> None:
+        self.ens_no: int = int(ens_no)
+        self.n_done: int = int(n_done)
+        self.n_members: int = int(n_members)
+        super().__init__(
+            f"member {ens_no} produced no elongation; the model runs stopped after {n_done} of "
+            f"{n_members} members"
+        )
+
+
 class WorkerPool:
     """
     Persistent multiprocessing pool for the members' model runs.
@@ -72,7 +100,19 @@ class WorkerPool:
     def __init__(self) -> None:
         self.pool: Pool | None = None
         self.n_proc: int | None = None
+        # Manager process for the cancel flags of stopped ensembles (cancel_event), started on first use
+        self.manager: Any = None
         atexit.register(self.shutdown)
+
+    def cancel_event(self) -> Any:
+        """
+        A new flag (multiprocessing.Manager().Event()) the workers check before each member's model
+        run, so an ensemble's model runs not yet started are skipped once it is set (see
+        ObservationOperator.get_cme_flanks, stop_on_no_elongation). The manager is started on first use.
+        """
+        if self.manager is None:
+            self.manager = multiprocessing.Manager()
+        return self.manager.Event()
 
     def get(self, n_proc: int = None) -> Pool:
         """
@@ -103,11 +143,17 @@ class WorkerPool:
             self.pool.join()
             self.pool = None
             self.n_proc = None
+        if self.manager is not None:
+            try:
+                self.manager.shutdown()
+            except Exception:
+                pass
+            self.manager = None
 
         return None
 
     def __getstate__(self) -> dict[str, None]:
-        return {"pool": None, "n_proc": None}
+        return {"pool": None, "n_proc": None, "manager": None}
 
 
 @dataclass
@@ -1307,6 +1353,10 @@ class ObservationOperator:
     #  run or tracking raises gives a NaN flank (the error in its attrs "member_error" and
     #  "member_traceback") instead of stopping the whole ensemble. Off for the assimilation itself.
     tolerate_member_errors: bool = False
+    # If True (set by AuxPF when PFSettings.skip_update_if_any_member_nan is on), get_cme_flanks stops
+    #  at the first member whose CME produces no elongation at the observation time(s) and raises
+    #  NoElongationError: the observation will not be assimilated, so the remaining runs are not made
+    stop_on_no_elongation: bool = False
 
     def __init__(
         self,
@@ -1371,7 +1421,9 @@ class ObservationOperator:
         :param sim_time: How long the SURF simulation will run for
         :param dt_scale: Frequency with which the model will output
         :param r_min: Minimum radius of SURF simulation
-        :param cme_init_rad: Initial radius the CME is observed at
+        :param cme_init_rad: Initial radius the CME is observed at (where t_init is defined); used for
+            every member unless cme_par_dict has a per-member "cme_init_rad" (e.g. when it is in
+            the DA state vector; see extract_cme_init_rad)
         :param cme_fixed_duration: Boolean to determine whether CMEs will be input with fixed duration
         :param fixed_duration: If CME is fixed duration, this variable defines that fixed duration in seconds
         :param plot_surf_output: Boolean to determine whether to plot SURF output at observation time
@@ -1400,7 +1452,6 @@ class ObservationOperator:
         :TODO: CHANGED SUCH THAT MULTIPLE LONGITUDES AND RADII CAN BE
                INPUT AND TIMES OF OBSERVATIONS ARE TAKEN FROM INPUT FILE
                IN CASE OF REAL OBS
-        :TODO: CHANGE cme_init_rad SUCH THAT IT CAN BE VARIED BETWEEN ENSEMBLE MEMBERS
         """
 
         self.settings: ObsOpSettings = ObsOpSettings() if settings is None else settings
@@ -1589,7 +1640,7 @@ class ObservationOperator:
 
                 # Setup a SyntheticImager3D class instance to get the min and max latitudes
                 # TODO: Remove hard-coded values for min and max elongations and buff_lat
-                print(f"psi_ert_avg = {self.psi_ert_avg}")
+                # print(f"psi_ert_avg = {self.psi_ert_avg}")
 
                 imgr: Sim.SyntheticImager3DOrig = Sim.SyntheticImager3DOrig(
                     craft_observer,  # _class,
@@ -1603,7 +1654,7 @@ class ObservationOperator:
                 imgr._compute_fov_geometry(0)
                 self.lat_min = imgr.lat_grid.min().to(u.deg) - buff_lat
                 self.lat_max = imgr.lat_grid.max().to(u.deg) + buff_lat
-                print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
+                # print(f"lat_min: {self.lat_min}, lat_max: {self.lat_max}")
 
         # SURF3d needs a finite latitude range; fall back to setup_surf3d's defaults
         if self.use_model in ["compress_surf3d"]:
@@ -1660,13 +1711,38 @@ class ObservationOperator:
         except TypeError:
             return [self.cme_par_dict[key]]
 
-    def extract_cme_launch_time_and_speed(
-        self,
-    ) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
+
+    def extract_cme_init_rad(self) -> list[Quantity[u.solRad]]:
+        """
+        Function to extract the radius at which each member's t_init is defined: cme_par_dict["cme_init_rad"]
+         when given (e.g. when cme_init_rad is in the DA state vector), otherwise self.cme_init_rad for
+         every member (also used for a member with a non-finite value)
+        :return: cme_init_rad: CME initial radius of each member in solar radii
+        """
+        default: float = self.cme_init_rad.to(u.solRad).value
+        if "cme_init_rad" not in self.cme_par_dict:
+            return [default] * self.n_members * u.solRad
+        cme_init_rad: list[float] = [
+            u.Quantity(r, u.solRad).value for r in self.member_values("cme_init_rad")
+        ]
+        if len(cme_init_rad) == 1:
+            cme_init_rad = cme_init_rad * self.n_members
+        return [r if np.isfinite(r) else default for r in cme_init_rad] * u.solRad
+
+    def extract_cme_speed(self) -> list[Quantity[u.km / u.s]]:
+        """
+        Function to extract the CME speed at r_min
+        :return cme_speed: CME launch speed at r_min
+        """
+        cme_speed: list[float] = [
+            v.to(u.km / u.s).value for v in self.member_values("v")
+        ]
+        return cme_speed * u.km / u.s
+
+    def extract_cme_launch_time(self) -> list[Quantity[u.s]]:
         """
         Function to extract the CME launch time and speed at r_min
         :return: cme_launch_time: CME launch time at r_min in seconds from start of SURF model run
-        :return cme_speed: CME launch speed at r_min
         """
         seconds_to_cme: list[float] = [
             (t - self.cme_par_dict["surf_init_time"]).total_seconds()
@@ -1676,18 +1752,34 @@ class ObservationOperator:
             v.to(u.km / u.s).value for v in self.member_values("v")
         ]
 
-        # t_init is when the CME is at cme_init_rad: add the time it takes to reach SURF/HUXt's inner
-        #  boundary r_min at the CME speed
-        dist_to_inner_rad: float = (
-            (self.r_min.to(u.solRad) - self.cme_init_rad.to(u.solRad)).to(u.km).value
-        )
-        cme_time_to_rmin: list[float] = [(dist_to_inner_rad / v) for v in cme_speed]
+        # t_init is when the CME is at cme_init_rad (each member's own, see extract_cme_init_rad): add
+        #  the time it takes to reach SURF/HUXt's inner boundary r_min at the CME speed
+        cme_init_rad: list[float] = self.extract_cme_init_rad().to(u.solRad).value
+        dist_to_inner_rad: list[float] = [
+            ((self.r_min.to(u.solRad).value - r) * u.solRad).to(u.km).value
+            for r in cme_init_rad
+        ]
+        cme_time_to_rmin: list[float] = [
+            (dist_to_inner_rad[i] / cme_speed[i]) for i in range(self.n_members)
+        ]
 
         cme_launch_time: list[Quantity[u.s]] = [
-            cme_time_to_rmin[i] + seconds_to_cme[i] for i in range(self.n_members)
-        ] * u.s
+            cme_time_to_rmin[i] + seconds_to_cme[i]
+            for i in range(self.n_members)
+       ] * u.s
 
-        return cme_launch_time, cme_speed * u.km / u.s
+        return cme_launch_time
+
+
+    def extract_cme_launch_time_and_speed(
+        self,
+    ) -> tuple[list[Quantity[u.s]], list[Quantity[u.km / u.s]]]:
+        """
+        Function to extract the CME launch time and speed at r_min
+        :return: cme_launch_time: CME launch time at r_min in seconds from start of SURF model run
+        :return cme_speed: CME launch speed at r_min
+        """
+        return self.extract_cme_launch_time(), self.extract_cme_speed()
 
     def extract_cme_width(self) -> list[Quantity[u.deg]]:
         """
@@ -1744,9 +1836,8 @@ class ObservationOperator:
         :return: cme_lat: CME launch latitude at r_min in deg
         :return: cme_thickness: CME launch thickness at r_min in solar radii
         """
-        cme_launch_time: list[Quantity]
-        cme_speed: list[Quantity]
-        cme_launch_time, cme_speed = self.extract_cme_launch_time_and_speed()
+        cme_launch_time: list[Quantity] = self.extract_cme_launch_time()
+        cme_speed: list[Quantity] = self.extract_cme_speed()
         cme_width: list[Quantity] = self.extract_cme_width()
         cme_lon: list[Quantity] = self.extract_cme_lon()
         cme_lat: list[Quantity] = self.extract_cme_lat()
@@ -1936,9 +2027,9 @@ class ObservationOperator:
                 f"'surf', 'compress_surf', 'compress_surf3d' or 'huxt'"
             )
 
-        if ens_no is not None:
-            if np.mod(ens_no, 10) == 0:
-                print(f"Model solved cme_flank_ens_no: {ens_no}")
+        # if ens_no is not None:
+            # if np.mod(ens_no, 10) == 0:
+                # print(f"Model solved cme_flank_ens_no: {ens_no}")
 
         # Calculate CME flank
         if self.use_model in ["huxt", "surf"]:
@@ -2061,6 +2152,49 @@ class ObservationOperator:
             )
             return cme_flank
 
+    def _member_flank_unless_cancelled(
+        self, cancel: Any = None, **kwargs: Any
+    ) -> pd.DataFrame | None:
+        """
+        get_cme_flank_single_ens_member in a worker, unless the ensemble's model runs have been
+        stopped (cancel set; see stop_on_no_elongation): then None, without a model run
+        """
+        if cancel is not None:
+            try:
+                if cancel.is_set():
+                    return None
+            except Exception:
+                # The flag's manager has gone (the run is ending): run the member
+                pass
+        return self.get_cme_flank_single_ens_member(**kwargs)
+
+    def member_has_elongation(self, cme_flank: pd.DataFrame | None) -> bool:
+        """
+        True if a member's flank gives a finite elongation at every observation time of this operator
+        (as make_obs_op picks it; later observations evaluated from the same runs are not checked)
+        """
+        if cme_flank is None:
+            return True
+        el: npt.NDArray[np.float64] = np.asarray(cme_flank["el"].values, dtype=float)
+        if self.use_model in ["compress_surf", "compress_surf3d"]:
+            n_main: int = (
+                1
+                if isinstance(self.obs_time_in_datetime, datetime.datetime)
+                else int(self.n_main_times)
+            )
+            return bool(np.all(np.isfinite(el[:n_main])))
+        # SURF/HUXt: the elongation at the model output time nearest each observation time
+        obs_jd: npt.NDArray[np.float64] = np.atleast_1d(
+            Time(self.obs_time_in_datetime).jd
+        )
+        flank_jd: npt.NDArray[np.float64] = np.asarray(
+            cme_flank["time"].values, dtype=float
+        )
+        if flank_jd.size == 0:
+            return False
+        inds: list[int] = [int(np.argmin(abs(flank_jd - t))) for t in obs_jd]
+        return bool(np.all(np.isfinite(el[inds])))
+
     def get_cme_flanks(self) -> list[pd.DataFrame]:
         """
         Function to retrieve the CME flank dataframes for all ensemble members
@@ -2099,8 +2233,25 @@ class ObservationOperator:
             else self.get_cme_flank_single_ens_member
         )
 
+        # Progress through the model runs of the observation being assimilated, on the console the
+        #  DA routine's progress bar uses (while that runs, sys.stdout is a tqdm DummyTqdmFile wrapping
+        #  the console as _wrapped; see RunDataAssimilationRoutine.run_data_assimilation)
+        obs_t: Any = self.obs_time_in_datetime
+        member_bar: tqdm = tqdm(
+            total=len(cme_objects),
+            desc=(
+                f"Obs {obs_t:%Y-%m-%d %H:%M}: model runs"
+                if isinstance(obs_t, datetime.datetime)
+                else "Model runs"
+            ),
+            unit="run",
+            leave=False,
+            dynamic_ncols=True,
+            file=getattr(sys.stdout, "_wrapped", sys.stdout),
+        )
+
         if self.use_parallel:
-            print("Using parallel execution")
+            # print("Using parallel execution")
             # Use no more workers than there are ensemble members (extra workers would sit idle),
             #  and leave one core free for the main process. The run-wide worker pool is reused
             #  (and shut down by WorkerPool.shutdown()); without one, a pool is used for this call only.
@@ -2110,32 +2261,83 @@ class ObservationOperator:
             )
             try:
                 pool: Pool = worker_pool.get(n_proc)
-                obj_res: list[AsyncResult] = [
-                    pool.apply_async(
-                        member_flank,
-                        kwds={
-                            "cme": i_cme,
-                            "obs_longitude": obs_lon_member,
-                            "ens_no": i,
-                        },
-                    )
-                    for i, i_cme in enumerate(cme_objects)
-                ]
-                cme_flanks: list[pd.DataFrame] = [res.get() for res in obj_res]
+                if self.stop_on_no_elongation:
+                    # Stop at the first member without an elongation: runs not yet started are
+                    #  skipped (cancel flag), those already running finish in the background and
+                    #  their results are not used
+                    cancel: Any = worker_pool.cancel_event()
+                    obj_res: list[AsyncResult] = [
+                        pool.apply_async(
+                            self._member_flank_unless_cancelled,
+                            kwds={
+                                "cancel": cancel,
+                                "cme": i_cme,
+                                "obs_longitude": obs_lon_member,
+                                "ens_no": i,
+                            },
+                            callback=lambda _: member_bar.update(),
+                            error_callback=lambda _: member_bar.update(),
+                        )
+                        for i, i_cme in enumerate(cme_objects)
+                    ]
+                    results: dict[int, pd.DataFrame] = {}
+                    while len(results) < len(obj_res):
+                        progressed: bool = False
+                        for i, res in enumerate(obj_res):
+                            if i in results or not res.ready():
+                                continue
+                            progressed = True
+                            results[i] = res.get()
+                            if not self.member_has_elongation(results[i]):
+                                cancel.set()
+                                member_bar.close()
+                                raise NoElongationError(
+                                    i, len(results), len(obj_res)
+                                )
+                        if not progressed:
+                            time.sleep(0.05)
+                    cme_flanks: list[pd.DataFrame] = [
+                        results[i] for i in range(len(obj_res))
+                    ]
+                else:
+                    obj_res = [
+                        pool.apply_async(
+                            member_flank,
+                            kwds={
+                                "cme": i_cme,
+                                "obs_longitude": obs_lon_member,
+                                "ens_no": i,
+                            },
+                            callback=lambda _: member_bar.update(),
+                            error_callback=lambda _: member_bar.update(),
+                        )
+                        for i, i_cme in enumerate(cme_objects)
+                    ]
+                    cme_flanks = [res.get() for res in obj_res]
             finally:
                 if self.worker_pool is None:
                     worker_pool.shutdown()
 
-            if self.obs is not None:
-                print(f"Obs = {self.obs}")
-            print(f"Parallel cme_flanks={cme_flanks}")
+            # if self.obs is not None:
+                # print(f"Obs = {self.obs}")
+            # print(f"Parallel cme_flanks={cme_flanks}")
         else:
-            print("Using serial execution")
-            cme_flanks: list[pd.DataFrame] = [
-                member_flank(cme=i_cme, obs_longitude=obs_lon_member, ens_no=i)
-                for i, i_cme in enumerate(cme_objects)
-            ]
-            print(f"Serial cme_flanks = {cme_flanks}")
+            # print("Using serial execution")
+            cme_flanks: list[pd.DataFrame] = []
+            for i, i_cme in enumerate(cme_objects):
+                cme_flanks.append(
+                    member_flank(cme=i_cme, obs_longitude=obs_lon_member, ens_no=i)
+                )
+                member_bar.update()
+                # Stop at the first member without an elongation (see stop_on_no_elongation)
+                if self.stop_on_no_elongation and not self.member_has_elongation(
+                    cme_flanks[-1]
+                ):
+                    member_bar.close()
+                    raise NoElongationError(i, i + 1, len(cme_objects))
+            # print(f"Serial cme_flanks = {cme_flanks}")
+
+        member_bar.close()
 
         end_time: float = time.time()
         time_taken: float = end_time - start_time
@@ -2143,10 +2345,10 @@ class ObservationOperator:
         time_taken_minutes: int = int(time_taken / 60.0)
         time_taken_rem_seconds: float = time_taken - (time_taken_minutes * 60.0)
 
-        print(
-            f"Time taken to complete get_cme_flanks:"
-            f" {time_taken_minutes} minutes and {time_taken_rem_seconds} seconds"
-        )
+        # print(
+            # f"Time taken to complete get_cme_flanks:"
+            # f" {time_taken_minutes} minutes and {time_taken_rem_seconds} seconds"
+        # )
 
         return cme_flanks
 

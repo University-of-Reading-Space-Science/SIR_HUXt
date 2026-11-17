@@ -33,7 +33,10 @@ _MEMBER_KEYS: tuple[tuple[str, str | None], ...] = (
     ("lon", "deg"),
     ("lat", "deg"),
     ("thick", "solRad"),
+    ("cme_init_rad", "solRad"),  # optional (else the model's single cme_init_rad)
 )
+# Keys of _MEMBER_KEYS that cme_par_dict need not have
+_OPTIONAL_MEMBER_KEYS: frozenset[str] = frozenset({"cme_init_rad"})
 
 
 def _as_key_value(x: Any, unit: str | None) -> Any:
@@ -69,6 +72,7 @@ def member_keys(cme_par_dict: CmeParEns) -> list[tuple]:
     columns: list[list] = [
         [_as_key_value(x, unit) for x in _member_values(cme_par_dict, key, n)]
         for key, unit in _MEMBER_KEYS
+        if key in cme_par_dict or key not in _OPTIONAL_MEMBER_KEYS
     ]
     return [tuple(col[i] for col in columns) for i in range(n)]
 

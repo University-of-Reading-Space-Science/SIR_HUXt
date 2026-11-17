@@ -36,7 +36,7 @@ class ReadWSAFiles:
         year_req = self.date_required.year
         month_req = self.date_required.month
 
-        print(f"year_req={year_req:04d}, month_req={month_req:02d}")
+        # print(f"year_req={year_req:04d}, month_req={month_req:02d}")
         wsa_url = f"{self.base_url}/{year_req:04d}/{month_req:02d}"
 
         # Previous month, wrapping January back to December of the previous year
@@ -45,7 +45,7 @@ class ReadWSAFiles:
         else:
             prev_year, prev_month = year_req, month_req - 1
         wsa_url_prev_month = f"{self.base_url}/{prev_year:04d}/{prev_month:02d}"
-        print(f"wsa_url={wsa_url}")
+        # print(f"wsa_url={wsa_url}")
 
         return wsa_url, wsa_url_prev_month
 

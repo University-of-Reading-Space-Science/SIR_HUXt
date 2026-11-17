@@ -163,6 +163,27 @@ class ToStateVector:
             np.broadcast_to(bias, (self.n_ensemble,)).copy() if bias.size == 1 else bias
         )
 
+    def convert_cme_init_rad_dict_to_array(self) -> npt.NDArray[np.float64]:
+        """
+        Function to convert each member's CME initial radius (the radius at which t_init is defined)
+         to solar radii and place in an array. Optional key: a dictionary without "cme_init_rad" gives
+         NaN (the model's single cme_init_rad is then used), and a single value is used for every member.
+        :return: cme_init_rad_arr: Array of CME initial radii in solar radii
+        """
+        if "cme_init_rad" not in self.cme_par_dict:
+            return np.full(self.n_ensemble, np.nan)
+        cme_init_rad_arr: npt.NDArray[np.float64] = np.atleast_1d(
+            np.asarray(
+                u.Quantity(self.cme_par_dict["cme_init_rad"], u.solRad).value,
+                dtype=float,
+            )
+        )
+        return (
+            np.broadcast_to(cme_init_rad_arr, (self.n_ensemble,)).copy()
+            if cme_init_rad_arr.size == 1
+            else cme_init_rad_arr
+        )
+
     def cme_par_dict_to_cme_par_array(self) -> npt.NDArray[np.float64]:
         """
         Extract the relevant cme parameters from the cme parameter dictionary, remove the units
@@ -177,6 +198,7 @@ class ToStateVector:
                 cme_par_array[:, 4] = cme_par_dict["lat"] in deg
                 cme_par_array[:, 5] = cme_par_dict["thick"] in solar radii
                 cme_par_array[:, 6] = cme_par_dict["bias"] (observation-bias coefficient, deg; 0 if absent)
+                cme_par_array[:, 7] = cme_par_dict["cme_init_rad"] in solar radii (NaN if absent)
         """
         req_keys: set[str] = required_dict_keys() | {"surf_init_time", "n_members"}
         assert all(p in self.cme_par_dict.keys() for p in req_keys)
@@ -201,5 +223,14 @@ class ToStateVector:
 
         for i, ip in enumerate(self.pars_in_state_vector):
             self.state_ens[:, i] = getattr(self, f"convert_{ip}_dict_to_array")()
+
+        # cme_init_rad is optional in cme_par_dict, but must be given for every member to be estimated
+        if "cme_init_rad" in self.pars_in_state_vector:
+            i_r: int = self.pars_in_state_vector.index("cme_init_rad")
+            if not np.all(np.isfinite(self.state_ens[:, i_r])):
+                raise ValueError(
+                    "cme_init_rad is in the state vector but cme_par_dict has no finite "
+                    "'cme_init_rad' for every member"
+                )
 
         return self.state_ens

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 
 import numpy as np
 import numpy.typing as npt
@@ -8,9 +9,12 @@ import os
 import shutil
 import sys
 import traceback
+import warnings
 
 import pandas as pd
 import xarray as xr
+from tqdm import tqdm
+from tqdm.contrib import DummyTqdmFile
 
 import surf.surf as S
 
@@ -18,12 +22,21 @@ import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
 
+# ERFA's "dubious year" warning (dtf2d) for times outside the range of its leap-second table:
+#  harmless here, so not shown (set at import, so also in the worker processes)
+try:
+    from erfa import ErfaWarning
+except ImportError:  # older astropy
+    from astropy.utils.exceptions import ErfaWarning
+warnings.filterwarnings("ignore", message=r".*dubious year", category=ErfaWarning)
+
 import make_prior_covariance_mat as mp_cov
 
 from init_sir import initialise_cme_parameter_ensemble_dict
 from sir_observations import Observations
 from aux_pf import AuxPF
 from cme_par_ens import CmeParEns
+from cme_par_dict_structure import cme_par_keys_ordered
 
 from dataclasses import replace
 from typing import Any
@@ -56,7 +69,7 @@ def print_environment_variables() -> None:
     print(f"donki_cov_dir = {os.getenv('DONKI_COV_DIR')}")
     print(f"mo_cme_cone_file_dir = {os.getenv('MO_CME_CONE_FILE_DIR')}")
     print(f"out_base_dir = {os.getenv('OUT_BASE_DIR')}")
-    print(f"wsa_dir = {os.getenv('WSA_DIR')}")
+    # print(f"wsa_dir = {os.getenv('WSA_DIR')}")
 
     return None
 
@@ -100,7 +113,10 @@ class RunDataAssimilationRoutine:
         self.sim_time: Quantity[u.days] = surf_par_dict["sim_time"]
         self.dt_scale: int | float = surf_par_dict["dt_scale"]
         self.r_min: Quantity[u.solRad] = surf_par_dict["r_min"]
-        self.cme_init_rad: Quantity[u.solRad] = surf_par_dict["cme_init_rad"]
+        # Default radius at which t_init is defined (Setup.initialise_fg_cme_parameters)
+        self.cme_init_rad: Quantity[u.solRad] = self.setup_class.fg_cme_par_dict[
+            "cme_init_rad"
+        ]
         self.cme_fixed_duration: bool = surf_par_dict["cme_fixed_duration"]
         self.fixed_duration: Quantity[u.s] = surf_par_dict["fixed_duration"]
 
@@ -198,6 +214,17 @@ class RunDataAssimilationRoutine:
         self.fg_sd_cme_lon: float = fg_cme_par_dict["sd_cme_lon"]
         self.fg_sd_cme_lat: float = fg_cme_par_dict["sd_cme_lat"]
         self.fg_sd_cme_thick: float = fg_cme_par_dict["sd_cme_thick"]
+        # Radius (solar radii) at which the first guess's t_init is defined: the twin experiment's if
+        #  it gives one, otherwise the model's cme_init_rad
+        self.fg_cme_init_rad_given: bool = (
+            fg_cme_par_dict.get("fg_cme_init_rad") is not None
+        )
+        self.fg_mean_cme_init_rad: float = (
+            float(fg_cme_par_dict["fg_cme_init_rad"])
+            if self.fg_cme_init_rad_given
+            else float(self.cme_init_rad.to(u.solRad).value)
+        )
+        self.fg_sd_cme_init_rad: float = fg_cme_par_dict.get("sd_cme_init_rad", 0.0)
 
         # Get prior CME parameters
         #  (in case of OSSE, may be perturbed from the first-guess parameters)
@@ -211,6 +238,9 @@ class RunDataAssimilationRoutine:
         self.prior_sd_lon: float = prior_cme_par_dict["sd_lon"]
         self.prior_sd_lat: float = prior_cme_par_dict["sd_lat"]
         self.prior_sd_thick: float = prior_cme_par_dict["sd_thick"]
+        self.prior_sd_cme_init_rad: float = prior_cme_par_dict.get(
+            "sd_cme_init_rad", 0.0
+        )
 
         # Get DA parameters
         self.n_members: int = da_par_dict["n_members"]
@@ -324,6 +354,11 @@ class RunDataAssimilationRoutine:
                 f"_{self.true_cme_par_dict['lon'].value}_{self.true_cme_par_dict['lat'].value}"
                 f"_{self.true_cme_par_dict['thick'].value}"
             )
+            # Twin experiments that give the truth's cme_init_rad
+            if "cme_init_rad" in self.true_cme_par_dict:
+                obs_dir = (
+                    f"{obs_dir}_r0_{self.true_cme_par_dict['cme_init_rad'].to(u.solRad).value}"
+                )
         else:
             obs_dir = f"obs_{self.craft}_{self.ssw_event}_{self.img}"
 
@@ -332,6 +367,9 @@ class RunDataAssimilationRoutine:
             f"_{self.fg_mean_cme_lon:.1f}_{self.fg_mean_cme_lat:.1f}"
             f"_{self.fg_mean_cme_thick:.1f}"
         )
+        # Twin experiments that give the first guess's cme_init_rad
+        if self.fg_cme_init_rad_given:
+            prior_dir = f"{prior_dir}_r0_{self.fg_mean_cme_init_rad:.1f}"
         run_dir: str = f"run_{run_no:03d}"
 
         # Separate folders for twin runs that sample the first guess and/or the observation noise
@@ -551,6 +589,13 @@ class RunDataAssimilationRoutine:
             mean_cme_lon: float = float(fg_array[3])
             mean_cme_lat: float = float(fg_array[4])
             mean_cme_thick: float = float(fg_array[5])
+            # cme_init_rad (if in the state vector): drawn so that the truth is a uniform draw from the
+            #  prior around the first guess, as for the uncorr prior of the other parameters
+            mean_cme_init_rad: float = self.fg_mean_cme_init_rad
+            if self.perturb_first_guess and "cme_init_rad" in self.pars_in_state:
+                mean_cme_init_rad += float(self.prior_sd_cme_init_rad) * float(
+                    rng.uniform(low=-1, high=1)
+                )
         elif self.setup_class.get_use_synthetic_obs():
             # Initialise CME parameters
             mean_cme_t_init = self.fg_mean_cme_t_init
@@ -565,6 +610,9 @@ class RunDataAssimilationRoutine:
             )
             mean_cme_lat = self.fg_mean_cme_lat
             mean_cme_thick = self.fg_mean_cme_thick
+            mean_cme_init_rad = self.fg_mean_cme_init_rad
+            if "cme_init_rad" in self.pars_in_state:
+                mean_cme_init_rad += self.fg_sd_cme_init_rad * rng.uniform(low=-1, high=1)
         else:
             # Initialise CME parameters
             mean_cme_t_init = self.fg_mean_cme_t_init + datetime.timedelta(
@@ -586,6 +634,9 @@ class RunDataAssimilationRoutine:
             mean_cme_thick = self.fg_mean_cme_thick + (
                 self.fg_sd_cme_thick * rng.uniform(low=-1, high=1)
             )
+            mean_cme_init_rad = self.fg_mean_cme_init_rad
+            if "cme_init_rad" in self.pars_in_state:
+                mean_cme_init_rad += self.fg_sd_cme_init_rad * rng.uniform(low=-1, high=1)
 
         mean_cme_par_dict: dict[str, Any] = {
             "mean_cme_t_init": mean_cme_t_init,
@@ -594,6 +645,7 @@ class RunDataAssimilationRoutine:
             "mean_cme_lon": mean_cme_lon,
             "mean_cme_lat": mean_cme_lat,
             "mean_cme_thick": mean_cme_thick,
+            "mean_cme_init_rad": mean_cme_init_rad,
         }
 
         return mean_cme_par_dict
@@ -613,7 +665,7 @@ class RunDataAssimilationRoutine:
         :return: samples (6, n_ens), rows as mean_cme_par_array
         """
         if self.cme_cov_type == "uncorr":
-            print(mean_cme_par_array)
+            # print(mean_cme_par_array)
             samples: npt.NDArray[np.float64] = mp_cov.make_uncorr_uniform_samples(
                 n_ens=n_ens,
                 mean_cme_pars=mean_cme_par_array,
@@ -638,7 +690,9 @@ class RunDataAssimilationRoutine:
                 start_time=start_time_donki,
                 end_time=end_time_donki,
                 scale_corr=self.scale_corr,
-                vars_req=np.array([p for p in self.pars_in_state if p != "bias"]),
+                vars_req=np.array(
+                    [p for p in self.pars_in_state if p in cme_par_keys_ordered()]
+                ),
                 sd_t_init=self.prior_sd_t_init,
                 sd_v=self.prior_sd_speed,
                 sd_width=self.prior_sd_width,
@@ -675,7 +729,9 @@ class RunDataAssimilationRoutine:
                 overwrite_cov=False,
                 mo_cone_cov_dir=mo_cone_cov_dir,
                 scale_corr=self.scale_corr,
-                vars_req=np.array([p for p in self.pars_in_state if p != "bias"]),
+                vars_req=np.array(
+                    [p for p in self.pars_in_state if p in cme_par_keys_ordered()]
+                ),
                 sd_t_init=self.prior_sd_t_init,
                 sd_v=self.prior_sd_speed,
                 sd_width=self.prior_sd_width,
@@ -749,6 +805,30 @@ class RunDataAssimilationRoutine:
             ] * self.n_members
         else:
             cme_par_dict["bias"] = [0.0] * self.n_members
+
+        # Each member's CME initial radius (where t_init is defined). In the state vector it is drawn
+        #  uniformly within +/- sd_cme_init_rad of the first guess's (the model's cme_init_rad unless
+        #  the twin experiment gives one), independently of the other parameters (drawn last, so the
+        #  other draws are unchanged); otherwise every member uses the first guess's
+        cme_init_rad_rs: float = float(mean_cme_par_dict["mean_cme_init_rad"])
+        if "cme_init_rad" in self.pars_in_state:
+            sd_r: float = float(self.prior_sd_cme_init_rad)
+            r_min_rs: float = float(self.r_min.to(u.solRad).value)
+            if not (1.0 < cme_init_rad_rs - sd_r and cme_init_rad_rs + sd_r < r_min_rs):
+                raise ValueError(
+                    f"cme_init_rad prior {cme_init_rad_rs} +/- {sd_r} Rs must lie between 1 Rs "
+                    f"and r_min = {r_min_rs} Rs"
+                )
+            cme_par_dict["cme_init_rad"] = (
+                list(
+                    rng.uniform(
+                        cme_init_rad_rs - sd_r, cme_init_rad_rs + sd_r, self.n_members
+                    )
+                )
+                * u.solRad
+            )
+        else:
+            cme_par_dict["cme_init_rad"] = [cme_init_rad_rs] * self.n_members * u.solRad
 
         return cme_par_dict
 
@@ -1238,14 +1318,39 @@ class RunDataAssimilationRoutine:
 
     def run_data_assimilation(self, run_start: int = 0) -> None:
         """
-        Function to run the data assimilation routine
+        Function to run the data assimilation routine, with a progress bar over all the observations
+        of all the runs (the observation operator adds one over the model runs of the observation
+        being assimilated). While it runs, print output goes through tqdm.write so it does not break
+        the progress bars.
+        :return: None
+        """
+        stdout = sys.stdout
+        try:
+            with contextlib.redirect_stdout(DummyTqdmFile(stdout)):
+                with tqdm(
+                    total=self.n_runs * len(self.observations),
+                    desc="DA routine",
+                    unit="obs",
+                    file=stdout,
+                    dynamic_ncols=True,
+                ) as self.da_progress:
+                    self._run_data_assimilation(run_start=run_start)
+        finally:
+            self.da_progress = None
+        return None
+
+    def _run_data_assimilation(self, run_start: int = 0) -> None:
+        """
+        The data assimilation runs (see run_data_assimilation)
         :return: None
         """
         # Negative run numbers count downwards (run_start, run_start - 1, ...)
         step: int = -1 if run_start < 0 else 1
 
         for run_no in range(run_start, run_start + step * self.n_runs, step):
-            print(f"run_no = {run_no}")
+            # print(f"run_no = {run_no}")
+            if getattr(self, "da_progress", None) is not None:
+                self.da_progress.set_description(f"DA run {run_no}")
             if run_no < 0:
                 self.fg_sd_cme_t_init: float = 0
                 self.fg_sd_cme_speed: float = 0
@@ -1253,6 +1358,7 @@ class RunDataAssimilationRoutine:
                 self.fg_sd_cme_lon: float = 0
                 self.fg_sd_cme_lat: float = 0
                 self.fg_sd_cme_thick: float = 0
+                self.fg_sd_cme_init_rad: float = 0
 
             # Initialise random generator
             rand_seed: int = self.generate_random_seed(
@@ -1288,6 +1394,13 @@ class RunDataAssimilationRoutine:
                 (self.n_obs + 1, self.n_members)
             )
             bias_saved[0, :] = np.asarray(cme_par_dict.get("bias", 0.0), dtype=float)
+            # Each member's CME initial radius (solar radii), prior (row 0) and after each observation
+            cme_init_rad_saved: npt.NDArray[np.float64] = np.zeros(
+                (self.n_obs + 1, self.n_members)
+            )
+            cme_init_rad_saved[0, :] = ToStateVector(
+                cme_par_dict
+            ).convert_cme_init_rad_dict_to_array()
 
             # Correlation handling: working coordinates fixed from this run's prior ensemble
             state_transform: StateTransform | None = self.make_state_transform(
@@ -1364,9 +1477,9 @@ class RunDataAssimilationRoutine:
                     )
 
             for yi, obs in enumerate(self.observations):
-                print(
-                    f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}"
-                )
+                # print(
+                    # f"run_no = {run_no}/{self.n_runs}, obs = {yi}/{len(self.observations)}"
+                # )
                 # Initial conditions for running the DA, that the observation time is after
                 #  the first-guess of the CME launch and that the observation is in the
                 #  set [elong_min_obs, elong_max_obs]
@@ -1388,6 +1501,8 @@ class RunDataAssimilationRoutine:
                     obs_in_elon_range_cond and obs_above_model_min_cond
                 )
 
+                # What happened to this observation, for the progress bar
+                obs_status: str = "skipped"
                 if fg_cme_init_cond and obs_in_elon_range_cond:
                     aux_pf_class: AuxPF = AuxPF(
                         use_model=self.use_model,
@@ -1448,6 +1563,13 @@ class RunDataAssimilationRoutine:
                     elon_saved["ess_updated"][yi] = getattr(
                         aux_pf_class, "ess_updated", np.nan
                     )
+                    obs_status = (
+                        "not assimilated"
+                        if getattr(aux_pf_class, "update_skipped", False)
+                        else "resampled"
+                        if getattr(aux_pf_class, "resampled", True)
+                        else "weights updated"
+                    )
                     if getattr(aux_pf_class, "update_skipped", False):
                         print(
                             f"Observation {yi} not assimilated: {aux_pf_class.skip_reason}"
@@ -1463,10 +1585,32 @@ class RunDataAssimilationRoutine:
                         "Obs time before CME launch and obs outside permitted elongation range"
                     )
 
+                # Progress through the data assimilation routine as a whole: this observation done,
+                #  with what happened to it and the effective sample size of the weights
+                if getattr(self, "da_progress", None) is not None:
+                    lw: npt.NDArray[np.float64] = np.asarray(
+                        cme_par_dict["log_weight"], dtype=float
+                    )
+                    w: npt.NDArray[np.float64] = np.exp(lw - np.nanmax(lw))
+                    w = np.where(np.isfinite(w), w, 0.0)
+                    ess: float = (
+                        float(w.sum() ** 2 / np.sum(w**2)) if w.sum() > 0 else np.nan
+                    )
+                    self.da_progress.set_postfix(
+                        obs=f"{yi + 1}/{len(self.observations)}",
+                        step=obs_status,
+                        ess=f"{ess:.1f}",
+                        refresh=False,
+                    )
+                    self.da_progress.update()
+
                 cme_saved_pars[yi + 1] = self.saved_cme_pars(cme_par_dict)
                 bias_saved[yi + 1, :] = np.asarray(
                     cme_par_dict.get("bias", 0.0), dtype=float
                 )
+                cme_init_rad_saved[yi + 1, :] = ToStateVector(
+                    cme_par_dict
+                ).convert_cme_init_rad_dict_to_array()
                 corr_saved[yi + 1] = self.state_correlation(cme_par_dict)
 
                 # Write the elongations after every observation, so a run that stops part-way
@@ -1521,18 +1665,20 @@ class RunDataAssimilationRoutine:
                     profiles=profiles,
                 )
 
-            for par_ind in range(7):
-                if par_ind == 6:
-                    print(f"weights_post = {np.exp(cme_saved_pars[-1, :, par_ind])}")
-                print(
-                    f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}"
-                )
+            # for par_ind in range(7):
+                # if par_ind == 6:
+                    # print(f"weights_post = {np.exp(cme_saved_pars[-1, :, par_ind])}")
+                # print(
+                    # f"mean_cme_saved_pars[{par_ind}] = {np.mean(cme_saved_pars[:, :, par_ind], axis=1)}"
+                # )
 
             # Save the CME parameters, bias coefficients and settings to cme_pars.nc
             cme_par_ds: xr.Dataset = self.make_cme_par_dataset(cme_saved_pars)
 
             # Observation-bias coefficients and settings (see obs_bias.py)
             cme_par_ds["bias"] = (["n_obs", "n_ens"], bias_saved)
+            # Per-member CME initial radius (solar radii); the scalar "cme_init_rad" is the model's
+            cme_par_ds["cme_init_rad_ens"] = (["n_obs", "n_ens"], cme_init_rad_saved)
             cme_par_ds.attrs.update(
                 {
                     # The event of events.yaml the run was made for, and its spacecraft
@@ -1557,6 +1703,12 @@ class RunDataAssimilationRoutine:
                     "obs_lat_deg": [
                         value_in_unit(x, u.deg) for x in as_value_list(self.obs_lat)
                     ],
+                    # The parameters in the state vector (whether cme_init_rad was estimated), and
+                    #  the half-widths (solar radii) of cme_init_rad's uniform prior and first-guess
+                    #  perturbation
+                    "prior_sd_cme_init_rad": float(self.prior_sd_cme_init_rad),
+                    "fg_sd_cme_init_rad": float(self.fg_sd_cme_init_rad),
+                    "pars_in_state": ",".join(str(p) for p in self.pars_in_state),
                     "bias_mode": self.bias_settings["mode"],
                     "bias_predictor": self.bias_settings["predictor"]["type"],
                     "bias_e_ref_deg": self.bias_settings["predictor"]["e_ref_deg"],
@@ -1584,6 +1736,12 @@ class RunDataAssimilationRoutine:
                         "true_lon": float(truth["lon"].to(u.deg).value),
                         "true_lat": float(truth["lat"].to(u.deg).value),
                         "true_thick": float(truth["thick"].to(u.solRad).value),
+                        # (the model's cme_init_rad unless the twin experiment gives one)
+                        "true_cme_init_rad": float(
+                            u.Quantity(
+                                truth.get("cme_init_rad", self.cme_init_rad), u.solRad
+                            ).value
+                        ),
                         "obs_cov": float(np.ravel(np.asarray(self.obs_cov, float))[0]),
                         "sample_first_guess": int(self.sample_first_guess),
                         "new_obs_noise_per_run": int(self.new_obs_noise_per_run),
@@ -1602,6 +1760,7 @@ class RunDataAssimilationRoutine:
                             "first_guess_lon": float(fg["mean_cme_lon"]),
                             "first_guess_lat": float(fg["mean_cme_lat"]),
                             "first_guess_thick": float(fg["mean_cme_thick"]),
+                            "first_guess_cme_init_rad": float(fg["mean_cme_init_rad"]),
                         }
                     )
 
@@ -1631,7 +1790,7 @@ class RunDataAssimilationRoutine:
                 }
             )
 
-            print(cme_par_ds)
+            # print(cme_par_ds)
             outParFile: str = os.path.join(output_dir, "cme_pars.nc")
             cme_par_ds.to_netcdf(outParFile, mode="w")
 

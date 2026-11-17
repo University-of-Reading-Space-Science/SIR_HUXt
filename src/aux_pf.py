@@ -18,6 +18,7 @@ from sir_resampling_log_weights import jacobian_log, ResampleParsLogWeights
 from to_state_vector import ToStateVector
 from from_state_vector import FromStateVector
 from sir_observation_operator import (
+    NoElongationError,
     ObservationOperator,
     ObsOpSettings,
     WorkerPool,
@@ -39,7 +40,9 @@ class PFSettings:
     skip_update_if_any_member_nan: If True, an observation is not assimilated (the ensemble and its
         weights are left unchanged) when the CME of any ensemble member does not produce an
         elongation, either for the shrunk particles used to choose the resampling (first stage) or for
-        the resampled particles (second stage). If False, only an observation where no member
+        the resampled particles (second stage). The ensemble's model runs then stop at the first member
+        without an elongation (ObservationOperator.stop_on_no_elongation), and the filter moves on to
+        the next observation without running the remaining members. If False, only an observation where no member
         produces an elongation is skipped, and members without an elongation are given a negligible
         weight.
     adaptive_resampling: Adaptive resampling (Liu & Chen 1995; Kong, Liu & Wong 1994). If True, each
@@ -484,6 +487,11 @@ class AuxPF:
             ),
             observer_tol_deg=self.pf_settings.reuse_observer_tol_deg,
         )
+        # Stop the model runs at the first member without an elongation (NoElongationError) when
+        #  such an observation is not assimilated anyway
+        obs_op_class.stop_on_no_elongation = bool(
+            self.pf_settings.skip_update_if_any_member_nan
+        )
         self.n_model_runs += 1
         if store is None:
             return obs_op_class.make_obs_op()
@@ -593,6 +601,22 @@ class AuxPF:
         self.resampled = False
         return self.cme_par_dict
 
+    def skip_no_elongation(self, err: NoElongationError, stage: str) -> CmeParEns:
+        """
+        Leave this observation unassimilated because a member produced no elongation and its
+        ensemble's model runs were stopped there (NoElongationError; PFSettings.
+        skip_update_if_any_member_nan): no elongations are kept for this observation
+        :param err: The error raised by the observation operator
+        :param stage: Which ensemble ("current", "shrunk" or "resampled")
+        :return: self.cme_par_dict
+        """
+        if getattr(self, "elon_first_stage", None) is None or stage != "resampled":
+            self.elon_first_stage = np.full(self.n_members, np.nan)
+        return self.skip_update(
+            f"{stage} member {err.ens_no} produced no elongation (model runs stopped after "
+            f"{err.n_done}/{err.n_members} members)"
+        )
+
     def aux_pf(self) -> CmeParEns:
         """
         Function to perform the auxillary particle filter routine
@@ -601,7 +625,7 @@ class AuxPF:
         # Effective sample size of the prior weights (diagnostic only). The weights are carried through
         #  unchanged: resetting them without resampling would throw away the information they carry.
         ess_prior: float = self.calc_ess_log_weights(self.log_weights)
-        print(f"ess_prior = {ess_prior}")
+        # print(f"ess_prior = {ess_prior}")
 
         # Keep the ensemble as it is now, so the update can be discarded if a resampled member's CME
         #  does not produce an elongation (see PFSettings.skip_update_if_any_member_nan)
@@ -616,9 +640,12 @@ class AuxPF:
         elon_current: npt.NDArray[np.float64] | None = None
         if self.pf_settings.adaptive_resampling or use_current_first_stage:
             # Elongations and likelihoods of the current (unshrunk, unjittered) particles
-            obs_op_current: npt.NDArray[np.float64] = self.get_observation_operator(
-                self.cme_par_dict
-            )
+            try:
+                obs_op_current: npt.NDArray[np.float64] = (
+                    self.get_observation_operator(self.cme_par_dict)
+                )
+            except NoElongationError as err:
+                return self.skip_no_elongation(err, "current")
             elon_current = np.asarray(obs_op_current, dtype=float)[:, 0].copy()
             log_likelihood_current = np.array(
                 [
@@ -649,10 +676,10 @@ class AuxPF:
             )
             log_weights_upd = log_weights_upd - jacobian_log(log_weights_upd)
             self.ess_updated = float(self.calc_ess_log_weights(log_weights_upd))
-            print(
-                f"ess_updated = {self.ess_updated:.2f} (resampling threshold "
-                f"{self.pf_settings.resample_ess_fraction * self.n_members:.1f})"
-            )
+            # print(
+                # f"ess_updated = {self.ess_updated:.2f} (resampling threshold "
+                # f"{self.pf_settings.resample_ess_fraction * self.n_members:.1f})"
+            # )
 
             if (
                 self.ess_updated
@@ -665,10 +692,10 @@ class AuxPF:
                 self.elon_posterior = elon_current.copy()
                 self.parent_index = np.arange(self.n_members, dtype=int)
                 self.update_skipped = False
-                print("ESS above threshold: weights updated, no resampling")
+                # print("ESS above threshold: weights updated, no resampling")
                 return self.cme_par_dict
 
-            print("ESS below threshold: auxiliary-PF step with resampling")
+            # print("ESS below threshold: auxiliary-PF step with resampling")
         self.resampled = True
 
         if use_current_first_stage:
@@ -681,9 +708,12 @@ class AuxPF:
         else:
             # First stage: likelihoods of the shrunk particles. Their modelled elongations (indexed by
             #  the pre-resampling particle) are kept for the routine to write out.
-            obs_op_shrunk: npt.NDArray[np.float64] = self.get_observation_operator(
-                self.state_vector_shrunk_dict
-            )
+            try:
+                obs_op_shrunk: npt.NDArray[np.float64] = self.get_observation_operator(
+                    self.state_vector_shrunk_dict
+                )
+            except NoElongationError as err:
+                return self.skip_no_elongation(err, "shrunk")
             self.elon_first_stage = np.asarray(obs_op_shrunk, dtype=float)[:, 0].copy()
             log_likelihood_shrunk_ens = [
                 self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
@@ -736,9 +766,15 @@ class AuxPF:
 
         # Second stage: elongations of the resampled (posterior) particles, and which prior particle
         #  each came from
-        obs_op_post: npt.NDArray[np.float64] = self.get_observation_operator(
-            self.cme_par_dict
-        )
+        try:
+            obs_op_post: npt.NDArray[np.float64] = self.get_observation_operator(
+                self.cme_par_dict
+            )
+        except NoElongationError as err:
+            # Discard the update: restore the ensemble and weights from before this observation
+            self.cme_par_dict = cme_par_dict_in
+            self.cme_par_array = cme_par_array_in
+            return self.skip_no_elongation(err, "resampled")
         self.elon_posterior: npt.NDArray[np.float64] = np.asarray(
             obs_op_post, dtype=float
         )[:, 0].copy()
@@ -774,6 +810,6 @@ class AuxPF:
         self.cme_par_dict["weight"] = [np.exp(w) for w in log_weights_post]
         self.cme_par_dict["log_weight"] = log_weights_post
 
-        print(f"ess_post_log = {self.calc_ess_log_weights(log_weights_post)}")
+        # print(f"ess_post_log = {self.calc_ess_log_weights(log_weights_post)}")
 
         return self.cme_par_dict

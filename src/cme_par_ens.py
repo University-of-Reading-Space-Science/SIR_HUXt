@@ -22,6 +22,9 @@ class CmeParEns(TypedDict):
     bias: (
         list[float] | float
     )  # observation-bias coefficient (deg), optional; see obs_bias.py
+    cme_init_rad: (
+        list[Quantity[u.solRad]] | Quantity[u.solRad]
+    )  # radius at which t_init is defined, optional (else the model's cme_init_rad)
     v_transit: list[float] | float
     v_hit: list[float] | float
     likelihood: list[float] | float

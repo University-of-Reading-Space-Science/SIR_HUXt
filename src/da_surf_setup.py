@@ -17,6 +17,7 @@ from astropy.time import Time
 
 import contextlib
 import functools
+import inspect
 from typing import Any
 
 import yaml
@@ -85,10 +86,34 @@ def _load_events_file(path: str) -> dict[str, dict[str, Any]]:
             if key in event:
                 event[key] = [_to_datetime(t) for t in event[key]]
         for key in ("first_guess", "first_guess_other", "truth"):
-            for time_key in ("time_at_21rs", "launch_time"):
+            if key in event:
+                _rename_old_cme_fields(event[key])
+            for time_key in ("time_at_r_min", "launch_time_at_r_min", "launch_time"):
                 if key in event and time_key in event[key]:
                     event[key][time_key] = _to_datetime(event[key][time_key])
     return events
+
+
+# Fields of a first guess or twin truth given at the model's inner boundary r_min
+_AT_R_MIN_FIELDS: tuple[str, ...] = ("speed", "width", "lon", "lat", "thick")
+
+
+def _rename_old_cme_fields(cme: dict[str, Any]) -> None:
+    """
+    Accept the field names of older events.yaml files (e.g. the copies kept in experiment folders):
+    time_at_21rs -> time_at_r_min (their r_min was 21.5 Rs, the default) and speed, width, lon, lat,
+    thick -> <field>_at_r_min
+    """
+    if "time_at_21rs" in cme and "time_at_r_min" not in cme:
+        cme["time_at_r_min"] = cme.pop("time_at_21rs")
+    for field in _AT_R_MIN_FIELDS:
+        if field in cme and f"{field}_at_r_min" not in cme:
+            cme[f"{field}_at_r_min"] = cme.pop(field)
+
+
+def get_event_r_min(code: str, path: str | None = None) -> float:
+    """The model's inner boundary r_min (solar radii) of event `code` in events.yaml (default 21.5)"""
+    return float(get_event(code, path).get("r_min", 21.5))
 
 
 def get_event(code: str, path: str | None = None) -> dict[str, Any]:
@@ -101,15 +126,24 @@ def get_event(code: str, path: str | None = None) -> dict[str, Any]:
     return events[code]
 
 
-def get_twin_cme(code: str, which: str, path: str | None = None) -> dict[str, Any]:
+def get_twin_cme(
+    code: str,
+    which: str,
+    path: str | None = None,
+    cme_init_rad: Quantity[u.solRad] = 12 * u.solRad,
+) -> dict[str, Any]:
     """
     The truth or first-guess CME of twin experiment `code` in events.yaml, with lon or lat "earth"
     replaced by Earth's direction (HEEQ) at the model start
     :param code: Name of the twin experiment in events.yaml (e.g. "twin")
     :param which: "truth" or "first_guess"
     :param path: events.yaml to read (see load_events)
-    :return: {"t_init": time at the model's inner boundary, "speed": km/s, "width": deg, "lon": deg,
-        "lat": deg, "thick": solar radii}
+    :param cme_init_rad: Radius at which t_init is defined, for an entry that does not give its own
+    :return: {"t_init": time the CME is at cme_init_rad, "speed": km/s, "width": deg, "lon": deg,
+        "lat": deg, "thick": solar radii; and "cme_init_rad": solar radii, if the entry gives one}
+        (from launch_time_at_r_min and the <field>_at_r_min fields of the entry; t_init is
+        (r_min - cme_init_rad) / speed earlier than launch_time_at_r_min); and "time_at_r_min": the
+        time the CME is at the event's r_min
     """
     event: dict[str, Any] = get_event(code, path)
     entry: str = (
@@ -117,20 +151,35 @@ def get_twin_cme(code: str, which: str, path: str | None = None) -> dict[str, An
         if which == "first_guess" and event.get("sample_first_guess", False)
         else which
     )
-    if which not in ("truth", "first_guess") or "launch_time" not in event.get(
-        entry, {}
+    if which not in ("truth", "first_guess") or not (
+        {"launch_time_at_r_min", "launch_time"} & set(event.get(entry, {}))
     ):
         raise KeyError(
-            f"Twin experiment {code!r} in events.yaml needs a {which} entry with a launch_time"
+            f"Twin experiment {code!r} in events.yaml needs a {which} entry with a "
+            "launch_time_at_r_min"
         )
     # Runs that draw their first guess from the prior around the truth: the first guess (the centre
     #  of those draws) is the truth
     if which == "first_guess" and event.get("sample_first_guess", False):
         which = "truth"
     cme: dict[str, Any] = event[which]
-    twin_cme: dict[str, Any] = {"t_init": cme["launch_time"]}
-    for key in ("speed", "width", "lon", "lat", "thick"):
-        value: Any = cme[key]
+    # Time to travel from cme_init_rad to the event's r_min at the CME speed
+    r0: float = float(cme.get("cme_init_rad", cme_init_rad.to(u.solRad).value))
+    dist_km: float = ((get_event_r_min(code, path) - r0) * u.solRad).to(u.km).value
+    transit: datetime.timedelta = datetime.timedelta(
+        seconds=dist_km / float(cme["speed_at_r_min"])
+    )
+    if "launch_time_at_r_min" in cme:
+        # Time at the event's r_min: t_init (at cme_init_rad) is the transit time earlier
+        time_at_r_min: datetime.datetime = cme["launch_time_at_r_min"]
+        t_init: datetime.datetime = time_at_r_min - transit
+    else:
+        # Older events.yaml: launch_time is the time at cme_init_rad
+        t_init = cme["launch_time"]
+        time_at_r_min = t_init + transit
+    twin_cme: dict[str, Any] = {"t_init": t_init, "time_at_r_min": time_at_r_min}
+    for key in _AT_R_MIN_FIELDS:
+        value: Any = cme[f"{key}_at_r_min"]
         if (
             key in ("lon", "lat")
             and isinstance(value, str)
@@ -142,6 +191,9 @@ def get_twin_cme(code: str, which: str, path: str | None = None) -> dict[str, An
             twin_cme[key] = getattr(earth, key).to(u.deg).value
         else:
             twin_cme[key] = float(value)
+    # Optional: the radius (solar radii) at which t_init is defined (else the cme_init_rad argument)
+    if cme.get("cme_init_rad") is not None:
+        twin_cme["cme_init_rad"] = float(cme["cme_init_rad"])
     return twin_cme
 
 
@@ -363,7 +415,7 @@ class Setup:
         line (data_assimilation_routine.py --event) replaces this one.
         :return: Event code
         """
-        return "twin_hi_speed"
+        return "twin_base"
 
     def get_ssw_event_craft(self) -> tuple[str, str, str]:
         ssw_event: str = self.get_ssw_event()
@@ -375,6 +427,18 @@ class Setup:
         img: str = "diff"
 
         return ssw_event, craft, img
+
+    def get_r_min(self) -> Quantity[u.solRad]:
+        """
+        The model's inner boundary r_min: the r_min of the run's event in events.yaml (the twin
+        experiment for synthetic observations), 21.5 Rs if the entry has none
+        """
+        ssw_event: str
+        ssw_event, _, _ = self.get_ssw_event_craft()
+        code: str = (
+            self.get_twin_experiment() if self.get_use_synthetic_obs() else ssw_event
+        )
+        return get_event_r_min(code) * u.solRad
 
     def get_surf_init_time(self) -> datetime.datetime:
         ssw_event: str
@@ -455,7 +519,7 @@ class Setup:
         ert: S.Observer = S.Observer("EARTH", surf_init_time_astro)
         earth_lat: Quantity = ert.lat.to(u.deg)
         earth_lon: Quantity = ert.lon.to(u.deg)
-        print(use_model)
+        # print(use_model)
         lon_start: Quantity[u.deg] = -70 * u.deg
         lon_stop: Quantity[u.deg] = 70 * u.deg
         # Latitude range of the SURF3d grid (compress_surf3d): for twin experiments lat_min/lat_max of
@@ -467,8 +531,7 @@ class Setup:
         n_lat_surf: int = 45
         sim_time: Quantity[u.day] = 3 * u.day
         dt_scale: int = 10
-        cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
-        r_min: Quantity[u.solRad] = 21.5 * u.solRad
+        r_min: Quantity[u.solRad] = self.get_r_min()  # the event's r_min in events.yaml
         cme_fixed_duration: bool = True
         fixed_duration: Quantity[u.s] = 12 * 3600 * u.s
 
@@ -512,13 +575,13 @@ class Setup:
                     vr_in, 215 * u.solRad, v_longs, r_min
                 )
             elif use_model in ["surf3d", "compress_surf3d"]:
-                print("Hello")
+                # print("Hello")
                 vr_in, vr_longs, vr_lats, br_in, br_longs, br_lats, cr_num = (
                     Sin.get_WSA_maps(output_path)
                 )
-                print(
-                    f"np.shape(vr_lats) = {np.shape(vr_lats)}, np.shape(vr_longs) = {np.shape(vr_longs)}"
-                )
+                # print(
+                    # f"np.shape(vr_lats) = {np.shape(vr_lats)}, np.shape(vr_longs) = {np.shape(vr_longs)}"
+                # )
                 if np.isfinite(br_in).any():
                     vr_in, br_in = Sin.map_vmap_inwards(
                         v_map=vr_in,
@@ -538,7 +601,7 @@ class Setup:
                         r_new=r_min,
                         gamma=1.5,
                     )
-                print(np.shape(vr_in))
+                # print(np.shape(vr_in))
 
             elif use_model in ["huxt"]:
                 vr_in = Hin.get_WSA_long_profile(output_path, lat=earth_lat)
@@ -578,11 +641,10 @@ class Setup:
             "sim_time": sim_time,
             "dt_scale": dt_scale,
             "r_min": r_min,
-            "cme_init_rad": cme_init_rad,
             "cme_fixed_duration": cme_fixed_duration,
             "fixed_duration": fixed_duration,
         }
-        print(np.shape(vr_in))
+        # print(np.shape(vr_in))
         return out_surf_par
 
     def initialise_true_parameters(self) -> CmeParEns:
@@ -606,7 +668,7 @@ class Setup:
             return true_cme_par_dict
 
         # Initialise true CME parameters: the truth of the twin experiment in events.yaml. The
-        #  launch time is kept relative to the model start (so it is the truth's launch_time in twin
+        #  launch time is kept relative to the model start (so it is the truth's t_init in twin
         #  runs)
         twin_experiment: str = self.get_twin_experiment()
         truth: dict[str, Any] = get_twin_cme(twin_experiment, "truth")
@@ -627,6 +689,10 @@ class Setup:
         true_cme_par_dict["lon"]: Quantity[u.deg] = true_cme_lon * u.deg
         true_cme_par_dict["lat"]: Quantity[u.deg] = true_cme_lat * u.deg
         true_cme_par_dict["thick"]: Quantity[u.solRad] = true_cme_thick * u.solRad
+        # Radius at which the truth's t_init is defined, if the twin experiment gives one (otherwise
+        #  the model's cme_init_rad)
+        if "cme_init_rad" in truth:
+            true_cme_par_dict["cme_init_rad"] = truth["cme_init_rad"] * u.solRad
 
         # Observation bias injected into synthetic (twin) observations (see get_bias_settings)
         true_cme_par_dict["bias"]: float = (
@@ -637,18 +703,41 @@ class Setup:
 
         return true_cme_par_dict
 
-    def initialise_fg_cme_parameters(self) -> dict[str, Any]:
+    def initialise_fg_cme_parameters(
+        self, cme_init_rad: Quantity[u.solRad] = 12 * u.solRad
+    ) -> dict[str, Any]:
+        """
+        First-guess CME parameters, their sds, and the run's default cme_init_rad
+        :param cme_init_rad: Default radius at which a CME's t_init is defined (the run's
+            cme_init_rad): used for real events, and for a twin first guess that does not give its own
+            in events.yaml
+        """
         # Initialise CME parameters
         ssw_event: str
         ssw_event, _, _ = self.get_ssw_event_craft()
         donki_cme: bool = True
 
+        # Radius (solar radii) at which the first guess's t_init is defined, if the twin experiment
+        #  gives one; None = cme_init_rad above
+        fg_cme_init_rad: float | None = None
+
         if self.get_use_synthetic_obs():
+            # The twin truth (initialise_true_parameters) is read with get_twin_cme's default
+            #  cme_init_rad, and the first guess below with this one: they must be the same, or the
+            #  truth and first guess would have their launch times converted to t_init at different radii
+            twin_cme_init_rad: Quantity[u.solRad] = (
+                inspect.signature(get_twin_cme).parameters["cme_init_rad"].default
+            )
+            assert u.isclose(cme_init_rad, twin_cme_init_rad), (
+                f"cme_init_rad of initialise_fg_cme_parameters ({cme_init_rad}) differs from the "
+                f"default cme_init_rad of get_twin_cme ({twin_cme_init_rad}) used for the twin truth"
+            )
             # First guess of the twin experiment in events.yaml
             first_guess: dict[str, Any] = get_twin_cme(
-                self.get_twin_experiment(), "first_guess"
+                self.get_twin_experiment(), "first_guess", cme_init_rad=cme_init_rad
             )
-            cme_at_12rs: datetime.datetime = first_guess["t_init"]
+            cme_at_r_min: datetime.datetime = first_guess["time_at_r_min"]
+            fg_cme_init_rad = first_guess.get("cme_init_rad")
             fg_cme_speed: float = first_guess["speed"]
             fg_cme_width: float = first_guess["width"]
             fg_cme_lon: float = first_guess["lon"]
@@ -663,35 +752,25 @@ class Setup:
                 if donki_cme
                 else event.get("first_guess_other", event["first_guess"])
             )
-            cme_at_21rs: datetime.datetime = first_guess["time_at_21rs"]
-            fg_cme_speed: float = first_guess["speed"]
+            cme_at_r_min: datetime.datetime = first_guess["time_at_r_min"]
+            fg_cme_speed: float = first_guess["speed_at_r_min"]
+            fg_cme_width: float = first_guess["width_at_r_min"]
+            fg_cme_lon: float = first_guess["lon_at_r_min"]
+            fg_cme_lat: float = first_guess["lat_at_r_min"]
+            fg_cme_thick: float = first_guess["thick_at_r_min"]
 
-            # Launch time at 12 Rs (cme_init_rad), 9.5 Rs before 21.5 Rs at the first-guess speed
-            dist_from_12_to_21rs_km: float = (9.5 * u.solRad).to(u.km).value
-            time_from_12_to_21rs: float = dist_from_12_to_21rs_km / fg_cme_speed
-            cme_at_12rs: datetime.datetime = cme_at_21rs - datetime.timedelta(
-                seconds=time_from_12_to_21rs
-            )
-
-            fg_cme_width: float = first_guess["width"]
-            fg_cme_lon: float = first_guess["lon"]
-            fg_cme_lat: float = first_guess["lat"]
-            fg_cme_thick: float = first_guess["thick"]
-
-        # Time taken to get from cme_init_rad to r_min
-        #  (reuse self.surf_par_dict if already built: initialise_surf_parameters re-reads the WSA map)
-        if hasattr(self, "surf_par_dict"):
-            surf_dict: dict[str, Any] = self.surf_par_dict
-        else:
-            surf_dict = self.initialise_surf_parameters()
-        surf_cme_ir: Quantity[u.solRad] = surf_dict["cme_init_rad"]
-        surf_r_min: Quantity[u.solRad] = surf_dict["r_min"]
-
-        dist_in_km: Quantity[u.km] = (surf_r_min - surf_cme_ir).to(u.km)
-        seconds_to_r_min: float = dist_in_km.to(u.km).value / fg_cme_speed
-
-        fg_cme_t_init: datetime.datetime = cme_at_12rs  # (
-        # )
+        # First-guess t_init: ballistically map the first guess's time at r_min (the event's, the
+        #  model's inner boundary) back to its cme_init_rad (fg_cme_init_rad, else cme_init_rad) at
+        #  the first-guess speed
+        fg_init_rad: Quantity[u.solRad] = (
+            fg_cme_init_rad * u.solRad if fg_cme_init_rad is not None else cme_init_rad
+        )
+        dist_init_rad_to_r_min_km: float = (
+            (self.get_r_min() - fg_init_rad).to(u.km).value
+        )
+        fg_cme_t_init: datetime.datetime = cme_at_r_min - datetime.timedelta(
+            seconds=dist_init_rad_to_r_min_km / fg_cme_speed
+        )
 
         if self.get_use_synthetic_obs():
             sd_cme_t_init: float = 0  # In seconds
@@ -700,6 +779,7 @@ class Setup:
             sd_cme_lon: float = 5  # In deg
             sd_cme_lat: float = 0  # In deg
             sd_cme_thick: float = 0  # In solRad
+            sd_cme_init_rad: float = 2 # In solRad
         else:
             sd_cme_t_init: float = 3600  # In seconds
             sd_cme_speed: float = 50  # In km/s
@@ -707,6 +787,7 @@ class Setup:
             sd_cme_lon: float = 5  # In deg
             sd_cme_lat: float = 5  # In deg
             sd_cme_thick: float = 0  # In solRad
+            sd_cme_init_rad: float = 2  # In solRad
 
         fg_cme_par_dict: dict[str, Any] = {
             "fg_cme_t_init": fg_cme_t_init,
@@ -715,12 +796,15 @@ class Setup:
             "fg_cme_lon": fg_cme_lon,
             "fg_cme_lat": fg_cme_lat,
             "fg_cme_thick": fg_cme_thick,
+            "fg_cme_init_rad": fg_cme_init_rad,
+            "cme_init_rad": cme_init_rad,
             "sd_cme_t_init": sd_cme_t_init,
             "sd_cme_speed": sd_cme_speed,
             "sd_cme_width": sd_cme_width,
             "sd_cme_lon": sd_cme_lon,
             "sd_cme_lat": sd_cme_lat,
             "sd_cme_thick": sd_cme_thick,
+            "sd_cme_init_rad": sd_cme_init_rad,
         }
 
         return fg_cme_par_dict
@@ -747,6 +831,7 @@ class Setup:
             sd_lon: float = 5  # In deg
             sd_lat: float = 0  # In deg
             sd_thick: float = 0  # In solRad
+            sd_cme_init_rad: float = 2.0  # In solRad
         else:
             # Initialise CME parameters for uniform distribution
             sd_t_init: float = 3600  # In seconds
@@ -759,6 +844,7 @@ class Setup:
             sd_lon: float = 5  # In deg
             sd_lat: float = 5  # In deg
             sd_thick: float = 0  # In solRad
+            sd_cme_init_rad: float = 2.0  # In solRad
 
         prior_cme_cov_dict: dict[str, Any] = {
             "cme_cov_type": cme_cov_type,
@@ -770,6 +856,9 @@ class Setup:
             "sd_lon": sd_lon,
             "sd_lat": sd_lat,
             "sd_thick": sd_thick,
+            # Half-width (solar radii) of the uniform prior of cme_init_rad around the model's
+            #  cme_init_rad; only used when "cme_init_rad" is in pars_in_state
+            "sd_cme_init_rad": sd_cme_init_rad,
         }
 
         return prior_cme_cov_dict
@@ -848,13 +937,15 @@ class Setup:
         n_members: int = 50
 
         run_start: int = 0
-        n_runs: int = 10
+        n_runs: int = 1
 
         delta_aux_pf: float = 0.98
         if self.get_use_synthetic_obs():
-            pars_in_state_vector: list[str] = ["v", "width", "lon"]
+            pars_in_state_vector: list[str] = ["cme_init_rad", "v", "width", "lon", "lat"]
         else:
-            pars_in_state_vector: list[str] = ["t_init", "v", "width", "lon", "lat"]
+            pars_in_state_vector: list[str] = ["cme_init_rad", "v", "width", "lon", "lat"]
+        # Add "cme_init_rad" to pars_in_state_vector to also estimate the radius at which t_init is
+        #  defined (prior: initialise_prior_cme_cov's sd_cme_init_rad)
         time_tolerance: Quantity[u.day] = 0.5 * u.day
 
         # Estimate the observation-bias coefficient with the CME parameters (see get_bias_settings)

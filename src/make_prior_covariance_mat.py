@@ -157,7 +157,7 @@ def make_uncorrelated_samples(
         sd_lat=sd_lat,
         sd_thick=sd_thick,
     )
-    print(f"uncorr_cov = {uncorr_cov}")
+    # print(f"uncorr_cov = {uncorr_cov}")
 
     # Copy so the caller's list isn't modified in place
     mean_cme_pars = list(mean_cme_pars)
@@ -326,8 +326,8 @@ def make_cov_blair(
             use_log_v=use_log_v,
         )
 
-    print(f"blair_cov={cov_out}")
-    print(f"blair_corr={corr_out}")
+    # print(f"blair_cov={cov_out}")
+    # print(f"blair_corr={corr_out}")
 
     return cov_out, corr_out
 
@@ -390,7 +390,7 @@ def make_blair_samples(
     for m in range(n_ens):
         blair_samples[:, m] = rng.multivariate_normal(mean=mean_cme_pars, cov=blair_cov)
 
-    print(blair_samples)
+    # print(blair_samples)
     return blair_samples
 
 
@@ -464,7 +464,7 @@ def make_donki_cov(
         sys.exit(
             "Unknown use_model name, expected either 'surf', 'compress_surf' or 'huxt'"
         )
-    print(donki_cone_cme_dict)
+    # print(donki_cone_cme_dict)
     ########################################################
     # Put CME parameters into a dataframe
     ########################################################
@@ -473,11 +473,11 @@ def make_donki_cov(
         columns=["v", "width", "lon", "lat"], index=np.arange(len_cme_dict)
     )
     for i in range(len_cme_dict):
-        if np.isnan(donki_cone_cme_dict[i]["vcld"]):
-            print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
+        # if np.isnan(donki_cone_cme_dict[i]["vcld"]):
+            # print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
 
-        if donki_cone_cme_dict[i]["vcld"] < 200:
-            print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
+        # if donki_cone_cme_dict[i]["vcld"] < 200:
+            # print(f"v[{i}] = {donki_cone_cme_dict[i]['vcld']}")
 
         if use_log_v:
             dfCMEpar.loc[i, "v"] = np.log(donki_cone_cme_dict[i]["vcld"])
@@ -508,7 +508,7 @@ def make_donki_cov(
 
     # Assume zero covariance if covariance value is NaN
     donki_cov = donki_cov.fillna(0)
-    print(f"donki_cov={donki_cov}")
+    # print(f"donki_cov={donki_cov}")
 
     #####################################################
     # Calculate correlation matrix from dfCMEpar
@@ -529,7 +529,7 @@ def make_donki_cov(
     donki_corr.loc["thick", "thick"] = 1.0
 
     donki_corr = donki_corr.fillna(0)
-    print(f"donki_corr={donki_corr}")
+    # print(f"donki_corr={donki_corr}")
 
     # Update covariance matrix if we require it to be a scaled correlation matrix
     if scale_corr:
@@ -550,7 +550,7 @@ def make_donki_cov(
 
         # Make matrix with diagonal equal to the standard deviation of the parameters as required
         sd_diag: npt.NDArray[np.float64] = np.diag(sd_diag_elements)
-        print(sd_diag)
+        # print(sd_diag)
         donki_cov = sd_diag.dot(donki_corr).dot(sd_diag)
 
     #################################################
@@ -1005,8 +1005,8 @@ def make_mo_cone_cme_cov(
             file_name_end: str = file_name.split("_")[-1]
             file_name_end5: str = file_name_end[-7:]
 
-            if file_name_end5 == "0100.in":
-                print(f"filename={file_name}")
+            # if file_name_end5 == "0100.in":
+                # print(f"filename={file_name}")
 
             dfCMEpar: pd.DataFrame = pd.DataFrame(
                 columns=["v", "width", "lon", "lat"], index=range(len_mo_dict)
@@ -1189,7 +1189,7 @@ def make_mo_cone_cme_cov(
 
     for m, par_key in enumerate(cme_par_keys_ordered):
         if par_key == "lon":
-            print(type(cov_out))
+            # print(type(cov_out))
             # Remove all non-diagonal entries from longitudinal covariances
             lon_var: float = cov_out[m, m]
 
@@ -1215,8 +1215,8 @@ def make_mo_cone_cme_cov(
 
         plot_pair_plot(mo_cone_cme_df, "MO Cone CME", use_log_v=use_log_v)
 
-    print(f"cov_out={cov_out}")
-    print(f"corr_out={corr_out}")
+    # print(f"cov_out={cov_out}")
+    # print(f"corr_out={corr_out}")
 
     return cov_out, corr_out
 
@@ -1312,7 +1312,7 @@ def make_mo_cone_samples(
             mo_cone_samples[v_index, :]
         )
 
-    print(mo_cone_samples)
+    # print(mo_cone_samples)
 
     return mo_cone_samples
 

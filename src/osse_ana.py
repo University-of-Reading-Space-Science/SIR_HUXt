@@ -3,9 +3,18 @@ import argparse
 import sys
 import traceback
 import json
+import warnings
 
 from astropy.time import Time
 import astropy.units as u
+
+# ERFA's "dubious year" warning (dtf2d) for times outside the range of its leap-second table:
+#  harmless here, so not shown
+try:
+    from erfa import ErfaWarning
+except ImportError:  # older astropy
+    from astropy.utils.exceptions import ErfaWarning
+warnings.filterwarnings("ignore", message=r".*dubious year", category=ErfaWarning)
 import matplotlib.pyplot as plt
 import datetime
 import numpy as np
@@ -233,7 +242,8 @@ def plot_par_values_over_single_run(
 def get_prior_post_cme_pars_from_ds(ds, runNo=0):
     """
     Function to retrieve prior and posterior cme parameters: [t_init, v, width, lon, lat, thick]
-      from dataset (and the posterior logarithm of the weights)
+      from dataset (and the posterior logarithm of the weights), and each member's cme_init_rad for
+      runs that saved it (cme_init_rad_ens)
     :param ds: Dataset containing all CME parameters from data assimilation run
     :param runNo: Run index to extract if ds contains multiple runs
     :return: prior_dict, Dictionary containing the prior CME parameters extracted
@@ -306,20 +316,197 @@ def get_prior_post_cme_pars_from_ds(ds, runNo=0):
         "weights": weights_post,
     }
 
+    # Each member's cme_init_rad (solar radii), for runs that saved it (members without a value:
+    #  the run's cme_init_rad)
+    if has_member_cme_init_rad(ds):
+        prior_dict_out["cme_init_rad"] = [
+            float(r) * u.solRad for r in member_cme_init_rad(ds, 0)
+        ]
+        post_dict_out["cme_init_rad"] = [
+            float(r) * u.solRad for r in member_cme_init_rad(ds, -1)
+        ]
+
     return prior_dict_out, post_dict_out
 
 
-def get_transit_time_to_r_min(ds, cme_speed):
+# Runs already warned about lacking a cme_init_rad (run_cme_init_rad), so the note is printed once
+_NO_CME_INIT_RAD_WARNED = set()
+
+
+def run_cme_init_rad(ds):
+    """
+    The run's single radius (solar radii) at which t_init is defined: cme_pars.nc's "cme_init_rad".
+    The oldest runs do not record it: their t_init is then taken as defined at the inner boundary
+    r_min (no transit), with a note.
+    :param ds: The run's cme_pars.nc (or several runs of one experiment)
+    :return: float
+    """
+    if "cme_init_rad" in ds:
+        values = np.ravel(np.asarray(ds["cme_init_rad"].values, dtype=float))
+        values = values[np.isfinite(values)]
+        if values.size:
+            return float(values[0])
+    r_min = float(np.ravel(ds["r_min"].values)[0])
+    key = (r_min, str(ds.attrs.get("ssw_event") or ds.attrs.get("twin_experiment")))
+    if key not in _NO_CME_INIT_RAD_WARNED:
+        _NO_CME_INIT_RAD_WARNED.add(key)
+        print(
+            f"Note: this run does not record cme_init_rad (older run); t_init is taken as defined "
+            f"at r_min = {r_min:g} solar radii"
+        )
+    return r_min
+
+
+def has_member_cme_init_rad(ds):
+    """
+    True if the run saved each member's cme_init_rad (cme_pars.nc "cme_init_rad_ens", runs since
+    Nov 2026) with at least one value; older runs (or an older run's part of runs concatenated with
+    newer ones, all NaN) used the single cme_init_rad for every member
+    """
+    if "cme_init_rad_ens" not in ds:
+        return False
+    return bool(np.any(np.isfinite(np.asarray(ds["cme_init_rad_ens"].values, dtype=float))))
+
+
+def member_cme_init_rad(ds, stage, fill=True):
+    """
+    Each member's radius (solar radii) at which t_init is defined, at a stage: from cme_pars.nc's
+    "cme_init_rad_ens", with any member without a value (NaN) given the run's single cme_init_rad.
+    For older runs without per-member values: every member the run's cme_init_rad (fill), or None.
+    :param ds: The run's cme_pars.nc (one run)
+    :param stage: Stage (0 = prior, k = after the k-th observation; -1 = the last)
+    :param fill: Give older runs the run's cme_init_rad for every member (else None)
+    :return: (n_ens,) array or None
+    """
+    n_ens = int(ds.sizes["n_ens"]) if "n_ens" in ds.sizes else int(ds.sizes["ens_no"])
+    if not has_member_cme_init_rad(ds):
+        return np.full(n_ens, run_cme_init_rad(ds)) if fill else None
+    values = np.asarray(ds["cme_init_rad_ens"].values[stage], dtype=float).copy()
+    if not np.all(np.isfinite(values)):
+        values[~np.isfinite(values)] = run_cme_init_rad(ds)
+    return values
+
+
+def run_sd_cme_init_rad(ds):
+    """
+    How a run treated cme_init_rad: whether each member's was estimated (in the state vector) and the
+    half-widths (solar radii) of its uniform prior (sd_cme_init_rad of initialise_prior_cme_cov) and
+    first-guess perturbation (of initialise_fg_cme_parameters).
+    Whether it was estimated: from the parameters in the state vector, cme_pars.nc's "pars_in_state"
+    attribute (runs since 17 Nov 2026) or "state_par" coordinate (runs that saved their state
+    correlations); for older runs without either, from the members' cme_init_rad_ens (estimated if
+    the prior members differ; not if they are all equal or the run did not save them).
+    The half-widths: cme_pars.nc's "prior_sd_cme_init_rad" and "fg_sd_cme_init_rad" (runs since
+    17 Nov 2026); for older runs that estimated it, the prior half-width is taken as half the prior
+    members' range (a slight underestimate of the half-width they were drawn from) and the first-guess
+    half-width is unknown (NaN). Both are 0 for a run that did not estimate it.
+    :param ds: The run's cme_pars.nc (one run)
+    :return: dict with "in_state" (bool), "prior_sd" (float), "fg_sd" (float), "source"
+        ("recorded" if the run recorded what is needed: its state parameters, and its half-widths
+        if it estimated cme_init_rad; else "inferred")
+    """
+    attrs = ds.attrs
+    # The parameters in the state vector, if the run saved them
+    if "pars_in_state" in attrs:
+        # Comma-separated list
+        pars = [p.strip() for p in str(attrs["pars_in_state"]).split(",")]
+    elif "state_par" in ds.coords:
+        pars = [str(p) for p in np.ravel(ds["state_par"].values)]
+    else:
+        pars = None
+    if pars is not None:
+        in_state = "cme_init_rad" in pars
+    else:
+        # Older runs: estimated if the prior members' cme_init_rad differ
+        in_state = has_member_cme_init_rad(ds) and bool(
+            np.ptp(member_cme_init_rad(ds, 0)) > 1e-9
+        )
+    if not in_state:
+        return {
+            "in_state": False,
+            "prior_sd": 0.0,
+            "fg_sd": 0.0,
+            "source": "recorded" if pars is not None else "inferred",
+        }
+    if "prior_sd_cme_init_rad" in attrs:
+        return {
+            "in_state": True,
+            "prior_sd": float(np.ravel(attrs["prior_sd_cme_init_rad"])[0]),
+            "fg_sd": float(np.ravel(attrs.get("fg_sd_cme_init_rad", np.nan))[0]),
+            "source": "recorded",
+        }
+    prior_sd = (
+        float(np.ptp(member_cme_init_rad(ds, 0))) / 2.0
+        if has_member_cme_init_rad(ds)
+        else 0.0
+    )
+    return {"in_state": True, "prior_sd": prior_sd, "fg_sd": np.nan, "source": "inferred"}
+
+
+def with_member_cme_init_rad(ds):
+    """
+    A run's cme_pars.nc with "cme_init_rad_ens" (n_obs, n_ens) added if it has none (older runs:
+    the run's single cme_init_rad for every member, which is what such a run used), so runs with
+    and without it can be concatenated
+    """
+    if "cme_init_rad_ens" in ds:
+        return ds
+    n_obs = int(ds.sizes["n_obs"])
+    n_ens = int(ds.sizes["n_ens"]) if "n_ens" in ds.sizes else int(ds.sizes["ens_no"])
+    ens_dim = "n_ens" if "n_ens" in ds.sizes else "ens_no"
+    ds = ds.copy()
+    if "run" in ds.dims:
+        # Several runs already concatenated: each run's own cme_init_rad
+        radii = [run_cme_init_rad(ds.isel(run=i)) for i in range(int(ds.sizes["run"]))]
+        ds["cme_init_rad_ens"] = (
+            ["run", "n_obs", ens_dim],
+            np.broadcast_to(
+                np.asarray(radii, dtype=float)[:, None, None], (len(radii), n_obs, n_ens)
+            ).copy(),
+        )
+    else:
+        ds["cme_init_rad_ens"] = (
+            ["n_obs", ens_dim],
+            np.full((n_obs, n_ens), run_cme_init_rad(ds)),
+        )
+    ds["cme_init_rad_ens"].attrs["note"] = (
+        "added by osse_ana.py: the run's single cme_init_rad (the run did not save each member's)"
+    )
+    return ds
+
+
+def get_transit_time_to_r_min(ds, cme_speed, cme_init_rad=None):
     """
     Time for a CME to travel from cme_init_rad (where t_init is defined) to the model's inner
-    boundary r_min, matching ObservationOperator.extract_cme_launch_time_and_speed
+    boundary r_min, matching ObservationOperator.extract_cme_launch_time
     :param ds: Dataset from the DA run (contains r_min and cme_init_rad in solar radii)
     :param cme_speed: CME speed(s) with velocity units
+    :param cme_init_rad: Each member's radius where t_init is defined (solar radii, e.g. from
+        stage_cme_init_rad); None = the run's single cme_init_rad (run_cme_init_rad), which is also
+        used for any member without a value (NaN)
     :return: Transit time(s) in seconds
     """
     r_min = float(np.ravel(ds["r_min"].values)[0]) * u.solRad
-    cme_init_rad = float(np.ravel(ds["cme_init_rad"].values)[0]) * u.solRad
-    return ((r_min - cme_init_rad) / cme_speed).to(u.s)
+    if cme_init_rad is None:
+        cme_init_rad = run_cme_init_rad(ds)
+    cme_init_rad = np.asarray(cme_init_rad, dtype=float)
+    if not np.all(np.isfinite(cme_init_rad)):
+        cme_init_rad = np.where(
+            np.isfinite(cme_init_rad), cme_init_rad, run_cme_init_rad(ds)
+        )
+    return ((r_min - cme_init_rad * u.solRad) / cme_speed).to(u.s)
+
+
+def stage_cme_init_rad(ds, stage):
+    """
+    Each member's radius where t_init is defined (solar radii) at a stage, from cme_pars.nc's
+    "cme_init_rad_ens" (members without a value: the run's cme_init_rad); None for older runs
+    without it, which used the single cme_init_rad for every member
+    :param ds: The run's cme_pars.nc
+    :param stage: Stage (0 = prior, k = after the k-th observation)
+    :return: (n_ens,) array or None
+    """
+    return member_cme_init_rad(ds, stage, fill=False)
 
 
 def get_true_cme_arrival_time(
@@ -333,6 +520,7 @@ def get_true_cme_arrival_time(
     true_cme_thick,
     cme_hit_object="EARTH",
     sim_time=5.0 * u.day,
+    true_cme_init_rad=None,
 ):
     """
     Arrival time and speed at cme_hit_object of the true CME of a twin experiment, from a model set up
@@ -345,6 +533,8 @@ def get_true_cme_arrival_time(
         deg, deg, deg, solar radii)
     :param cme_hit_object: Body to compute the arrival at
     :param sim_time: Model run length (a CME arriving later counts as a miss)
+    :param true_cme_init_rad: Radius (solar radii) at which true_cme_t_init is defined; None = the
+        run's cme_init_rad
     :return: (arrival datetime or NaN, arrival speed km/s or NaN)
     """
     if use_model not in ["surf", "compress_surf", "compress_surf3d", "huxt"]:
@@ -362,7 +552,7 @@ def get_true_cme_arrival_time(
     # Launch at r_min, not at cme_init_rad (see get_transit_time_to_r_min)
     sec_to_cme_true = float(
         (true_cme_t_init - start_time).total_seconds()
-    ) * u.s + get_transit_time_to_r_min(ds_run, v_true)
+    ) * u.s + get_transit_time_to_r_min(ds_run, v_true, true_cme_init_rad)
     width_true = float(true_cme_width) * u.deg
     lon_true = float(true_cme_lon) * u.deg
     lat_true = float(true_cme_lat) * u.deg
@@ -1392,7 +1582,8 @@ def read_twin_truth(ds, base_file_path, fallback, fallback_from_run=False):
     :param fallback: Truth from events.yaml (get_twin_cme), plus "model_start"
     :param fallback_from_run: The fallback comes from the experiment's own copy of events.yaml
         (experiment_events_file), so it is used before the folder name
-    :return: (truth: dict with t_init, speed, width, lon, lat, thick; where it came from)
+    :return: (truth: dict with t_init, speed, width, lon, lat, thick, cme_init_rad (None = the run's);
+        where it came from)
     """
     attrs = ds.attrs
     if "true_v" in attrs:
@@ -1403,11 +1594,17 @@ def read_twin_truth(ds, base_file_path, fallback, fallback_from_run=False):
             "lon": float(attrs["true_lon"]),
             "lat": float(attrs["true_lat"]),
             "thick": float(attrs["true_thick"]),
+            "cme_init_rad": (
+                float(attrs["true_cme_init_rad"])
+                if "true_cme_init_rad" in attrs
+                else None
+            ),
         }
         return truth, "cme_pars.nc"
     if fallback_from_run:
         return {
-            k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")
+            **{k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")},
+            "cme_init_rad": fallback.get("cme_init_rad"),
         }, "the experiment's copy of events.yaml"
 
     for part in reversed(
@@ -1415,9 +1612,12 @@ def read_twin_truth(ds, base_file_path, fallback, fallback_from_run=False):
     ):
         if not part.startswith("truth_"):
             continue
+        fields = part[len("truth_") :].split("_")
         try:
-            speed, width, lon, lat, thick = (
-                float(x) for x in part[len("truth_") :].split("_")[:5]
+            speed, width, lon, lat, thick = (float(x) for x in fields[:5])
+            # "_r0_<cme_init_rad>" if the twin experiment gave the truth's cme_init_rad
+            cme_init_rad = (
+                float(fields[6]) if len(fields) > 6 and fields[5] == "r0" else None
             )
         except ValueError:
             break
@@ -1429,11 +1629,13 @@ def read_twin_truth(ds, base_file_path, fallback, fallback_from_run=False):
             "lon": lon,
             "lat": lat,
             "thick": thick,
+            "cme_init_rad": cme_init_rad,
         }
         return truth, f"folder name {part} (launch time from events.yaml)"
 
     return {
-        k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")
+        **{k: fallback[k] for k in ("t_init", "speed", "width", "lon", "lat", "thick")},
+        "cme_init_rad": fallback.get("cme_init_rad"),
     }, "events.yaml"
 
 
@@ -1976,13 +2178,16 @@ def _separate_arrivals(
     """
     Arrival times (s after the model start) and speeds of some members of an ensemble from separate
     model runs (make_arrival_model), for members whose observation-operator run gave none
-    :param pars: (6, n_ens) parameters of the ensemble: t_init (s), v, width, lon, lat, thick
+    :param pars: (6, n_ens) parameters of the ensemble: t_init (s), v, width, lon, lat, thick; and
+        cme_init_rad (solar radii) as a 7th row if the run saved it
     :param members: Indices of the members to run
     :return: dict member -> (arrival seconds after the model start or NaN, speed km/s or NaN)
     """
     model_obj, start_time = model
     v = pars[1] * u.km / u.s
-    t_launch = (pars[0] * u.s) + get_transit_time_to_r_min(par_ds, v)
+    t_launch = (pars[0] * u.s) + get_transit_time_to_r_min(
+        par_ds, v, pars[6] if len(pars) > 6 else None
+    )
     cme_cls = H.ConeCME if use_model in ["huxt"] else S.ConeCME
     cmes = {
         i: cme_cls(
@@ -2018,6 +2223,42 @@ def _separate_arrivals(
     }
 
 
+# Model set-up (Setup.initialise_surf_parameters: the ambient solar wind map, e.g. WSA from ISWA,
+#  mapped to r_min, and the model grid) of the runs analysed in this session, keyed by everything it
+#  depends on, so runs sharing a model start (e.g. the runs of a twin experiment) load the ambient
+#  wind once rather than once per run. clear_surf_parameter_cache() empties it.
+_SURF_PARAMETER_CACHE: dict = {}
+
+
+def clear_surf_parameter_cache():
+    """Forget the cached model set-ups of run_routine (e.g. after changing the WSA files)"""
+    _SURF_PARAMETER_CACHE.clear()
+
+
+def _surf_parameter_key(setup):
+    """
+    Cache key of Setup.initialise_surf_parameters for a set-up: ambient wind source, model start,
+    model, inner boundary and latitude range (what that function's result depends on)
+    """
+
+    def value(q):
+        q = q.value if hasattr(q, "value") else q
+        try:
+            return "nan" if not np.isfinite(float(q)) else round(float(q), 6)
+        except (TypeError, ValueError):
+            return str(q)
+
+    lat_min, lat_max = setup.get_twin_latitude_range()
+    return (
+        str(setup.get_mas_wsa_const()).lower(),
+        pd.Timestamp(setup.get_surf_init_time()).isoformat(),
+        str(setup.get_use_model()).lower(),
+        value(setup.get_r_min().to(u.solRad)),
+        value(lat_min),
+        value(lat_max),
+    )
+
+
 def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=None):
     """
     A RunDataAssimilationRoutine set up as the run in base_file_path/run_<run_no> was made, for
@@ -2032,6 +2273,8 @@ def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=N
       - the model grid and observer (cme_pars.nc model_* and obs_* attributes, runs since 8 Nov 2026)
     Anything the run does not record (older runs: the model grid; and the model's fixed constants) is
     taken from da_surf_setup.Setup.
+    The ambient solar wind and model set-up are loaded once per distinct set-up in a session
+    (_SURF_PARAMETER_CACHE), not once per run.
     :param par_ds: The run's cme_pars.nc
     :param elon_ds: The run's ens_elongations.nc, or None
     :param base_file_path: Directory containing the run_<run_no> folders
@@ -2087,6 +2330,18 @@ def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=N
     with use_events_file(events_copy):
         twin: bool = bool(attrs.get("twin_experiment")) or is_twin_experiment(event)
 
+    # How the run treated cme_init_rad (estimated or not, and its prior half-width)
+    init_rad = run_sd_cme_init_rad(par_ds)
+    print(
+        f"Run {run_no}: cme_init_rad "
+        + (
+            f"estimated, prior +/- {init_rad['prior_sd']:.2f} solar radii"
+            if init_rad["in_state"]
+            else "fixed (not in the state vector)"
+        )
+        + f" ({init_rad['source']})"
+    )
+
     class RunSetup(Setup):
         def get_ssw_event(self):
             return event
@@ -2103,6 +2358,18 @@ def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=N
         def initialise_da_parameters(self):
             d = super().initialise_da_parameters()
             d.update(n_members=n_ens, run_start=-1, n_runs=1)
+            # cme_init_rad in the state vector as in the run (older runs: inferred), whatever
+            #  da_surf_setup.py is set to now
+            pars = [p for p in d.get("pars_in_state", []) if p != "cme_init_rad"]
+            if init_rad["in_state"]:
+                pars = ["cme_init_rad"] + pars
+            d["pars_in_state"] = pars
+            return d
+
+        def initialise_prior_cme_cov(self):
+            d = super().initialise_prior_cme_cov()
+            # The run's half-width of the cme_init_rad prior (0 if it was not estimated)
+            d["sd_cme_init_rad"] = float(init_rad["prior_sd"])
             return d
 
         def get_twin_latitude_range(self):
@@ -2114,7 +2381,19 @@ def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=N
             return super().get_twin_latitude_range()
 
         def initialise_surf_parameters(self):
-            d = super().initialise_surf_parameters()
+            # Loading the ambient wind (e.g. WSA from ISWA) is the same for every run with this
+            #  set-up: reuse it within the session
+            cache_key = _surf_parameter_key(self)
+            if cache_key in _SURF_PARAMETER_CACHE:
+                print(
+                    f"Reusing the ambient solar wind and model set-up loaded earlier "
+                    f"({cache_key[0].upper()}, model start {cache_key[1]})"
+                )
+            else:
+                _SURF_PARAMETER_CACHE[cache_key] = dict(
+                    super().initialise_surf_parameters()
+                )
+            d = dict(_SURF_PARAMETER_CACHE[cache_key])
             for key, attr, unit in (
                 ("n_lat_surf", "model_n_lat_surf", None),
                 ("lon_start", "model_lon_start_deg", u.deg),
@@ -2127,6 +2406,22 @@ def run_routine(par_ds, elon_ds, base_file_path, run_no, event=None, use_model=N
                     d[key] = (
                         float(value) * unit if unit is not None else type(d[key])(value)
                     )
+            return d
+
+        def initialise_fg_cme_parameters(self):
+            d = super().initialise_fg_cme_parameters()
+            # The radius at which the run defined t_init (cme_pars.nc), whatever da_surf_setup.py
+            #  is set to now
+            if "cme_init_rad" in par_ds:
+                d["cme_init_rad"] = (
+                    float(np.ravel(par_ds["cme_init_rad"].values)[0]) * u.solRad
+                )
+            # The run's first-guess half-width of cme_init_rad (0 if it was not estimated; older
+            #  runs that estimated it: da_surf_setup.py's, as the run's is not known)
+            if not init_rad["in_state"]:
+                d["sd_cme_init_rad"] = 0.0
+            elif np.isfinite(init_rad["fg_sd"]):
+                d["sd_cme_init_rad"] = float(init_rad["fg_sd"])
             return d
 
         def initialise_observation_parameters(self):
@@ -2256,11 +2551,15 @@ def compute_profiles_and_arrivals_per_obs(
     ).to_pydatetime()
     log_weight = np.asarray(par_ds["log_weight"].values, dtype=float)
     par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
+    # Each member's cme_init_rad as a 7th row, for runs that saved it (see member_cme_init_rad;
+    #  older runs use the run's single cme_init_rad, run_da.cme_init_rad)
+    with_init_rad = has_member_cme_init_rad(par_ds)
 
     def stage_pars(st):
-        return np.array(
-            [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
-        )
+        rows = [np.asarray(par_ds[p].values[st], dtype=float) for p in par_names]
+        if with_init_rad:
+            rows.append(member_cme_init_rad(par_ds, st))
+        return np.array(rows)
 
     keys = {st: np.round(stage_pars(st), 6).tobytes() for st in range(n_stage)}
 
@@ -2514,6 +2813,8 @@ def compute_profiles_and_arrivals_per_obs(
                 cme_par_dict["lon"] = list(pars[3]) * u.deg
                 cme_par_dict["lat"] = list(pars[4]) * u.deg
                 cme_par_dict["thick"] = list(pars[5]) * u.solRad
+                if len(pars) > 6:
+                    cme_par_dict["cme_init_rad"] = list(pars[6]) * u.solRad
                 # The profiles are the tracked CME flank, without the bias term (added when plotting),
                 #  so they do not depend on the bias coefficients (and the stage keys ignore them)
                 if "bias" in par_ds:
@@ -3168,6 +3469,17 @@ def _animation_cme(par_ds, use_model, stage, member):
         np.ravel(par_ds["model_init_time"].values)[0]
     ).to_pydatetime()
     par_names = ["t_init", "v", "width", "lon", "lat", "thick"]
+    # Each member's cme_init_rad, for runs that saved it (the truth's: true_cme_init_rad below);
+    #  members without a value get the run's cme_init_rad
+    with_init_rad = has_member_cme_init_rad(par_ds) and member != "truth"
+
+    def stage_values(p):
+        if p == "cme_init_rad_ens":
+            return member_cme_init_rad(par_ds, stage)
+        return np.asarray(par_ds[p].values[stage], dtype=float)
+
+    if with_init_rad:
+        par_names = par_names + ["cme_init_rad_ens"]
     if member == "truth":
         attrs = par_ds.attrs
         if "true_v" not in attrs:
@@ -3186,6 +3498,8 @@ def _animation_cme(par_ds, use_model, stage, member):
             float(attrs["true_lat"]),
             float(attrs["true_thick"]),
         ]
+        if "true_cme_init_rad" in attrs:
+            values.append(float(attrs["true_cme_init_rad"]))
         label = "truth"
     elif member == "mean":
         lw = np.asarray(par_ds["log_weight"].values[stage], dtype=float)
@@ -3194,7 +3508,7 @@ def _animation_cme(par_ds, use_model, stage, member):
         w = w / w.sum()
         values = []
         for p in par_names:
-            x = np.asarray(par_ds[p].values[stage], dtype=float)
+            x = stage_values(p)
             if p == "lon":
                 rad = np.deg2rad(x)
                 values.append(
@@ -3208,14 +3522,12 @@ def _animation_cme(par_ds, use_model, stage, member):
                 values.append(float(np.sum(w * x)))
         label = f"stage{stage:02d}_mean"
     else:
-        values = [
-            float(np.asarray(par_ds[p].values[stage], dtype=float)[member])
-            for p in par_names
-        ]
+        values = [float(stage_values(p)[member]) for p in par_names]
         label = f"stage{stage:02d}_member{member:03d}"
     v = values[1] * u.km / u.s
     cme = cme_cls(
-        t_launch=values[0] * u.s + get_transit_time_to_r_min(par_ds, v),
+        t_launch=values[0] * u.s
+        + get_transit_time_to_r_min(par_ds, v, values[6] if len(values) > 6 else None),
         v=v,
         width=values[2] * u.deg,
         longitude=values[3] * u.deg,
@@ -4097,12 +4409,13 @@ def main(argv: list[str] | None = None):
     args = parse_args(argv)
     load_environment()
     nRuns = 1
-    start_run = -1
+    start_run = 0
     t_initTruth = None
     vTruth = None
     widthTruth = None
     lonTruth = None
     latTruth = None
+    cme_init_radTruth = None
 
     obs_dir = os.getenv("OBS_DIR")
     # indep_cov\truth_20080101 - 0000_495_37.4_0_0_0\prior_20080101 - 0100_495_37.4_0_0_0\nEns - 5_8_300.0 deg_0.0 deg
@@ -4110,7 +4423,7 @@ def main(argv: list[str] | None = None):
     # Events and twin experiments of events.yaml to analyse, one after another (or give them on the
     #  command line: python osse_ana.py --event 09A 12A 13B). Each event's spacecraft comes from its
     #  code (09A -> STEREO-A, 13B -> STEREO-B, ssw_ -> STEREO-A, twin experiments -> twin).
-    event_list = ["14B"]
+    event_list = ["twin_base"]
     """
         "09A",
         "03A",
@@ -4161,6 +4474,20 @@ def main(argv: list[str] | None = None):
     #  The truth plotted is the run's own (read_twin_truth), not necessarily the current events.yaml.
     #  None = the folder a run made with the current settings would be in: OUT_BASE_DIR (.env), the
     #  twin's entry in events.yaml and the da_surf_setup.Setup settings below
+    # twin_results_dir = os.path.join(
+    #     "C:\\",
+    #     "Users",
+    #     "ss905122",
+    #     "PycharmProjects",
+    #     "SIR_HUXt",
+    #     "output",
+    #     "comp_surf",
+    #     "parallel",
+    #     f"ens_{n_ens}_uncorr",
+    #     f"model_{use_model.upper()}",
+    #     "truth_495.0_37.4_0.0_0.0_0.0",
+    #     f"ob_est_lin_0.00_2.00_fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
+    # )
     twin_results_dir = os.path.join(
         "C:\\",
         "Users",
@@ -4170,12 +4497,12 @@ def main(argv: list[str] | None = None):
         "output",
         "comp_surf",
         "bias_WSA_v",
+        "test",
         f"ens_{n_ens}_uncorr",
         f"model_{use_model.upper()}",
         "truth_495.0_37.4_0.0_0.0_0.0",
-        f"ob_est_lin_0.00_2.00_fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
+        f"fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
     )
-
     # Observation-bias term (get_bias_settings: mode, predictor_type, prior_mean, prior_sd);
     #  None for runs with bias mode "off"
     twin_bias_folder = bias_dir_name("estimate", "linear", 0.0, 2.0)
@@ -4233,7 +4560,7 @@ def main(argv: list[str] | None = None):
         craft_name = {"sta": "STEREO-A", "stb": "STEREO-B"}.get(craft, "twin")
         print(f"\nevent: {event}, craft: {craft}, img: {img}")
         # (no truth carried over from a previous event)
-        t_initTruth = vTruth = widthTruth = lonTruth = latTruth = None
+        t_initTruth = vTruth = widthTruth = lonTruth = latTruth = cme_init_radTruth = None
         try:
 
             if is_twin_experiment(event):
@@ -4247,14 +4574,20 @@ def main(argv: list[str] | None = None):
                 true_cme_lon = truth["lon"]
                 true_cme_lat = truth["lat"]
                 true_cme_thick = truth["thick"]
+                true_cme_init_rad = truth.get("cme_init_rad")
                 truth_dir = (
                     f"truth_{true_cme_speed}_{true_cme_width}_{true_cme_lon}_{true_cme_lat}"
                     f"_{true_cme_thick}"
                 )
+                # Twin experiments that give the truth's cme_init_rad (as data_assimilation_routine.py)
+                if true_cme_init_rad is not None:
+                    truth_dir = f"{truth_dir}_r0_{true_cme_init_rad}"
                 prior_dir = (
                     f"prior_{fg['speed']:.1f}_{fg['width']:.1f}_{fg['lon']:.1f}_{fg['lat']:.1f}"
                     f"_{fg['thick']:.1f}"
                 )
+                if fg.get("cme_init_rad") is not None:
+                    prior_dir = f"{prior_dir}_r0_{fg['cme_init_rad']:.1f}"
                 # Synthetic observations: the run folder is named from the truth
                 obs_dir_name = truth_dir
 
@@ -4287,8 +4620,9 @@ def main(argv: list[str] | None = None):
                         else event_info["first_guess"]
                     )
                     prior_dir = (
-                        f"prior_{float(fg['speed']):.1f}_{float(fg['width']):.1f}"
-                        f"_{float(fg['lon']):.1f}_{float(fg['lat']):.1f}_{float(fg['thick']):.1f}"
+                        f"prior_{float(fg['speed_at_r_min']):.1f}_{float(fg['width_at_r_min']):.1f}"
+                        f"_{float(fg['lon_at_r_min']):.1f}_{float(fg['lat_at_r_min']):.1f}"
+                        f"_{float(fg['thick_at_r_min']):.1f}"
                     )
 
                 if f"obs_times_{craft}" in event_info:
@@ -4356,7 +4690,8 @@ def main(argv: list[str] | None = None):
                     f"ens_{n_ens}_mo_cone",
                     f"model_{use_model.upper()}",
                     obs_dir_name,
-                    f"ob_est_lin_0.00_2.00_{prior_dir}_0.98",  # "New folder",
+                    f"{prior_dir}_0.98"
+                    #f"ob_est_lin_0.00_2.00_{prior_dir}_0.98",  # "New folder",
                 )
 
             # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
@@ -4393,6 +4728,11 @@ def main(argv: list[str] | None = None):
 
                 filePath = os.path.join(baseFilePath, f"run_{runNo:03d}", "cme_pars.nc")
                 with xr.load_dataset(filePath) as dsTemp:
+                    # Older runs without each member's cme_init_rad: the run's single value for
+                    #  every member, so they concatenate with newer runs
+                    if ir > 0 and ("cme_init_rad_ens" in ds) != ("cme_init_rad_ens" in dsTemp):
+                        ds = with_member_cme_init_rad(ds)
+                        dsTemp = with_member_cme_init_rad(dsTemp)
                     dsTemp.expand_dims(dim={"run": 1})
                     dsTemp["run"] = (("run",), [runNo])
 
@@ -4439,9 +4779,15 @@ def main(argv: list[str] | None = None):
                 true_cme_lon = run_truth["lon"]
                 true_cme_lat = run_truth["lat"]
                 true_cme_thick = run_truth["thick"]
+                true_cme_init_rad = run_truth.get("cme_init_rad")
                 vTruth = true_cme_speed
                 widthTruth = true_cme_width
                 lonTruth = true_cme_lon
+                # The truth's cme_init_rad: its own if the twin experiment gives one, else the run's
+                if true_cme_init_rad is not None:
+                    cme_init_radTruth = float(true_cme_init_rad)
+                elif "cme_init_rad" in ds:
+                    cme_init_radTruth = float(np.ravel(ds["cme_init_rad"].values)[0])
 
             print(ds)
 
@@ -4485,6 +4831,13 @@ def main(argv: list[str] | None = None):
             print(
                 f"Mean CME lat = Prior: {cme_lat_mean[0]:.2f} - Post: {cme_lat_mean[-1]:.2f}"
             )
+            if "cme_init_rad_ens" in ds:
+                cme_init_rad_mean = stage_mean("cme_init_rad_ens")
+                print(
+                    f"Mean CME initial radius = Prior: {cme_init_rad_mean[0]:.2f} - "
+                    f"Post: {cme_init_rad_mean[-1]:.2f} Rs"
+                    + (f" (truth {cme_init_radTruth:.2f})" if cme_init_radTruth is not None else "")
+                )
             print("=========================================================")
 
             if is_twin_experiment(event):
@@ -4498,6 +4851,7 @@ def main(argv: list[str] | None = None):
                     true_cme_lon=true_cme_lon,
                     true_cme_thick=true_cme_thick,
                     cme_hit_object="EARTH",
+                    true_cme_init_rad=true_cme_init_rad,
                 )
             print(f"real_arrival_time = {real_arrival_time}")
             print(f"real_arrival_speed = {real_arrival_speed}")
@@ -4605,6 +4959,24 @@ def main(argv: list[str] | None = None):
                     base_file_path=baseFilePath,
                     craft=craft,
                 )
+                # Each member's cme_init_rad (runs that saved it)
+                if "cme_init_rad_ens" in ds:
+                    plot_par_values_over_single_run(
+                        ds,
+                        xVarName="obs_no",
+                        yVarName="cme_init_rad_ens",
+                        xLabel="Time",
+                        fig_title=fig_title,
+                        parNameLegend="CME initial radius",
+                        obs_times=obs_times,
+                        tick_cadence=3,
+                        yTruth=cme_init_radTruth,
+                        runNo=runNo,
+                        parUnits=r"R$_\odot$",
+                        n_obs=n_obs,
+                        base_file_path=baseFilePath,
+                        craft=craft,
+                    )
 
                 # Observation-bias coefficient through the assimilation window
                 if make_bias_plot:

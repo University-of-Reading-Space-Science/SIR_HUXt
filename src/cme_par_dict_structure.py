@@ -16,8 +16,10 @@ def required_dict_keys() -> set[str]:
 def state_par_keys() -> set[str]:
     """
     Keys that can be in the particle filter's state vector (pars_in_state): the CME parameters of
-    required_dict_keys plus the optional observation-bias coefficient "bias" (see obs_bias.py).
+    required_dict_keys plus the optional observation-bias coefficient "bias" (see obs_bias.py) and
+    the optional CME initial radius "cme_init_rad" (solar radii; the radius at which t_init is defined).
     "bias" is not a required key, so dictionaries without it still work (it is then taken as 0).
+    Nor is "cme_init_rad": without it every member uses the model's single cme_init_rad.
     :return: Set of allowed state-vector keys
     """
     return set(cme_par_key_to_index().keys())
@@ -40,7 +42,16 @@ def cme_par_key_to_index() -> dict[str, int]:
     :return: A dictionary mapping dictionary keys of cme_par_dict to the
      parameter index of cme_par_array
     """
-    return {"t_init": 0, "v": 1, "width": 2, "lon": 3, "lat": 4, "thick": 5, "bias": 6}
+    return {
+        "t_init": 0,
+        "v": 1,
+        "width": 2,
+        "lon": 3,
+        "lat": 4,
+        "thick": 5,
+        "bias": 6,
+        "cme_init_rad": 7,
+    }
 
 
 def cme_par_get_indices(cme_par_dict_key: str) -> int:
@@ -71,7 +82,7 @@ def cme_par_get_keys(cme_par_array_index: int) -> str:
     Function to retrieve the appropriate cme_par_dict key based on the parameter
       index of cme_par_array
     :param cme_par_array_index: Parameter index of cme_par_array.
-      Must be one of the column indices of cme_par_key_to_index (0-6).
+      Must be one of the column indices of cme_par_key_to_index (0-7).
     :return keyReq: Key name from cme_par_dict_key corresponding to
       cme_par_array parameter index
     """

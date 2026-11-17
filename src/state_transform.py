@@ -20,6 +20,7 @@ module changes the coordinates in which the Liu-West step is done, and regularis
                   and ln v is smallest for r_ref near the front distance at the early-to-middle
                   observations (~50-60 Rs for HI elongations 8-30 deg in the 09A twin geometry;
                   see the notes). (If t_init is not in the state, this is the same as "log_v".)
+                  If cme_init_rad is in the state, each particle's own cme_init_rad is used here.
   2. Whitening ("whiten"): z = L^-1 (u - mu), with mu and L L^T the mean and (regularised)
      covariance of the PRIOR ensemble in the reparametrised variables u. Fixed for the whole run.
      It puts all parameters on a common, unit-free scale and makes "independent in z" mean
@@ -178,6 +179,9 @@ class StateTransform:
         self.i_t: int | None = (
             self.pars.index("t_init") if "t_init" in self.pars else None
         )
+        self.i_r: int | None = (
+            self.pars.index("cme_init_rad") if "cme_init_rad" in self.pars else None
+        )
         self.use_log_v: bool = (
             self.reparam in ("log_v", "tref_logv") and self.i_v is not None
         )
@@ -208,10 +212,16 @@ class StateTransform:
         return lab
 
     # ---------------------------------------------------------------- reparametrisation
+    def _dist_km(self, x: npt.NDArray[np.float64]) -> float | npt.NDArray[np.float64]:
+        """Distance (km) from cme_init_rad to r_ref: per particle if cme_init_rad is in the state"""
+        if self.i_r is None:
+            return self.dt_dist_km
+        return (self.r_ref_rs - x[:, self.i_r]) * self.RS_KM
+
     def _reparam(self, x: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         u: npt.NDArray[np.float64] = np.array(x, dtype=float, copy=True)
         if self.use_tb:
-            u[:, self.i_t] = x[:, self.i_t] + self.dt_dist_km / x[:, self.i_v]
+            u[:, self.i_t] = x[:, self.i_t] + self._dist_km(x) / x[:, self.i_v]
         if self.use_log_v:
             if np.any(x[:, self.i_v] <= 0):
                 raise ValueError(
@@ -225,7 +235,8 @@ class StateTransform:
         if self.use_log_v:
             x[:, self.i_v] = np.exp(u[:, self.i_v])
         if self.use_tb:
-            x[:, self.i_t] = u[:, self.i_t] - self.dt_dist_km / x[:, self.i_v]
+            # (cme_init_rad is not reparametrised, so x[:, i_r] is already in natural units)
+            x[:, self.i_t] = u[:, self.i_t] - self._dist_km(x) / x[:, self.i_v]
         return x
 
     # ---------------------------------------------------------------- whitening

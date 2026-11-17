@@ -166,6 +166,18 @@ class FromStateVector:
             return [0.0] * self.cme_par_array.shape[0]
         return [float(b) for b in self.cme_par_array[:, ind_req]]
 
+    def convert_cme_init_rad_array_to_dict(self) -> Quantity[u.solRad]:
+        """
+        Convert the CME initial radii (solar radii, where t_init is defined) to a Quantity for
+         cme_par_dict
+        :return: cme_init_rad_dict: CME initial radii (solar radii; NaN if cme_par_array has no
+            cme_init_rad column, or the dictionary it came from had no "cme_init_rad")
+        """
+        ind_req: int = cme_par_get_indices("cme_init_rad")
+        if self.cme_par_array.shape[1] <= ind_req:
+            return np.full(self.cme_par_array.shape[0], np.nan) * u.solRad
+        return list(self.cme_par_array[:, ind_req]) * u.solRad
+
     def cme_par_array_to_cme_par_dict(self) -> CmeParEns:
         """
         Extract the relevant cme parameters from the cme parameter array, add the units back
@@ -179,6 +191,7 @@ class FromStateVector:
                 cme_par_array[:, 4] = cme_par_dict["lat"] in deg
                 cme_par_array[:, 5] = cme_par_dict["thick"] in solar radii
                 cme_par_array[:, 6] = cme_par_dict["bias"] (observation-bias coefficient, deg)
+                cme_par_array[:, 7] = cme_par_dict["cme_init_rad"] in solar radii (NaN if not used)
         :param cme_par_dict: Dictionary that contains all CME parameters required
         :return: cme_par_dict: Dictionary of CME parameters (with units added back in)
         """
@@ -205,5 +218,10 @@ class FromStateVector:
             Quantity[u.solRad]
         ] = self.convert_thick_array_to_dict()
         self.cme_par_dict["bias"]: list[float] = self.convert_bias_array_to_dict()
+        # cme_init_rad is optional: only set when every member has one (otherwise the model's single
+        #  cme_init_rad is used, as for a dictionary without it)
+        cme_init_rad: Quantity[u.solRad] = self.convert_cme_init_rad_array_to_dict()
+        if np.all(np.isfinite(cme_init_rad.value)):
+            self.cme_par_dict["cme_init_rad"] = cme_init_rad
 
         return self.cme_par_dict

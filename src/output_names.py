@@ -45,6 +45,7 @@ class _Codes:
         "lat": "la",
         "thick": "h",
         "bias": "b",
+        "cme_init_rad": "r0",
     }
 
 
