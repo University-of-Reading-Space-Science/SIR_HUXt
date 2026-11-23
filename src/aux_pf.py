@@ -7,9 +7,12 @@ import copy
 import datetime
 import warnings
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
+from scipy.special import log_ndtr
 import astropy.units as u
 from astropy.units import Quantity
 from astropy.time import Time
@@ -77,6 +80,27 @@ class PFSettings:
         earlier run's observer are read from it. For surf and huxt, whose runs otherwise stop
         time_tolerance after each observation, every run then lasts until time_tolerance after the
         run's last observation (compress_surf and compress_surf3d always run for a fixed time).
+    censor_below_r_min: Treat a member whose CME has not yet reached the model's inner boundary r_min
+        at the observation time as censored, rather than as having no elongation (see
+        "Members that have not reached r_min", censored_likelihood_note.pdf). Whether it has reached
+        r_min uses the constant speed from cme_init_rad assumed in
+        ObservationOperator.extract_cme_launch_time: t_obs < t_init + (r_min - cme_init_rad) / v.
+        Such a member's elongation is only known to lie between e_low = arcsin(cme_init_rad / r_obs)
+        and e_lim = arcsin(r_min / r_obs), the model's minimum elongation; its likelihood is the
+        Gaussian observation density averaged over that interval,
+            [Phi((e_lim - y) / sigma) - Phi((e_low - y) / sigma)] / (e_lim - e_low),
+        a density like the Gaussian likelihood of the other members (with the bias term applied to
+        both bounds). Censored members do not count as members without an elongation
+        (skip_update_if_any_member_nan) and do not stop the model runs. A member without an
+        elongation whose CME should already be in the model (see censor_pickup_margin_hours) is
+        handled as before. False = as before.
+    censor_pickup_margin_hours: With censor_below_r_min, a member without an elongation whose CME
+        reached r_min less than this long before the observation is also censored: the J-map tracker
+        needs a little time to pick up a CME that has just entered the model (in the runs to
+        18 Nov 2026, 95% of members were picked up within 2.1 h of reaching r_min and 97% within
+        3 h). For such a member e_lim is the elongation of its estimated front radius,
+        arcsin((cme_init_rad + v (t_obs - t_init)) / r_obs), instead of that of r_min. 0 = only
+        members below r_min.
     reuse_observer_tol_deg: Largest change in the observer's longitude and latitude (deg) between an
         earlier run's observation and a later one for the later one to be read from the earlier run
         (0 = the same position only, so the results do not change; a real spacecraft then reuses
@@ -89,6 +113,8 @@ class PFSettings:
     first_stage: str = "shrunk"
     reuse_model_runs: bool = False
     reuse_observer_tol_deg: float = 0.0
+    censor_below_r_min: bool = False
+    censor_pickup_margin_hours: float = 3.0
 
     def __post_init__(self) -> None:
         if self.first_stage not in ("shrunk", "current"):
@@ -97,6 +123,8 @@ class PFSettings:
             )
         if self.reuse_observer_tol_deg < 0:
             raise ValueError("PFSettings.reuse_observer_tol_deg must not be negative")
+        if self.censor_pickup_margin_hours < 0:
+            raise ValueError("PFSettings.censor_pickup_margin_hours must not be negative")
 
 
 def n_members_without_elongation(obs_op: npt.NDArray[np.float64]) -> int:
@@ -147,6 +175,7 @@ class AuxPF:
         obs_index: int | None = None,
         later_obs: list[dict] | None = None,
         run_until: datetime.datetime | None = None,
+        model_min_elong_deg: float | None = None,
     ) -> None:
         """
         Set up the auxiliary PF for one observation (the other parameters are described where they are used)
@@ -166,6 +195,9 @@ class AuxPF:
             elon_store: dicts with "index", "time", "radius", "lon" and "lat" (the observer position)
         :param run_until: With elon_store, the surf and huxt runs last until time_tolerance after this
             time (the run's last observation), so that they cover the later observations
+        :param model_min_elong_deg: The model's minimum elongation at this observation,
+            arcsin(r_min / r_observer) (deg), the upper bound of a censored member's elongation
+            (PFSettings.censor_below_r_min; None = from obs_radius)
         """
         self.pf_settings: PFSettings = (
             PFSettings() if pf_settings is None else pf_settings
@@ -176,6 +208,15 @@ class AuxPF:
         self.obs_index: int | None = obs_index
         self.later_obs: list[dict] = list(later_obs or [])
         self.run_until: datetime.datetime | None = run_until
+        self.model_min_elong_deg: float | None = model_min_elong_deg
+        # Members treated as censored (CME below r_min, no elongation; PFSettings.censor_below_r_min)
+        #  in the first-stage and the posterior ensembles
+        self.censored_first_stage: npt.NDArray[np.bool_] = np.zeros(
+            int(cme_par_dict["n_members"]), dtype=bool
+        )
+        self.censored_posterior: npt.NDArray[np.bool_] = np.zeros(
+            int(cme_par_dict["n_members"]), dtype=bool
+        )
         if self.elon_store is not None and self.obs_index is None:
             raise ValueError("AuxPF: elon_store needs obs_index")
         # Ensembles of model runs made for this observation, and ensembles read from earlier runs
@@ -492,6 +533,11 @@ class AuxPF:
         obs_op_class.stop_on_no_elongation = bool(
             self.pf_settings.skip_update_if_any_member_nan
         )
+        # ... except at members whose CME has not yet reached r_min (censored, see
+        #  PFSettings.censor_below_r_min)
+        obs_op_class.censored_members = frozenset(
+            int(i) for i in np.flatnonzero(self.below_r_min(state_dict_in))
+        )
         self.n_model_runs += 1
         if store is None:
             return obs_op_class.make_obs_op()
@@ -506,6 +552,177 @@ class AuxPF:
             ]
         store.add(state_dict_in, to_store)
         return add_obs_bias(hx, state_dict_in, obs_op_settings, self.n_members)
+
+    def member_values(self, state_dict: CmeParEns, key: str) -> list:
+        """state_dict[key] as a list with one entry per member (a single value is repeated)"""
+        try:
+            values: list = list(state_dict[key])
+        except TypeError:
+            values = [state_dict[key]]
+        return values * self.n_members if len(values) == 1 else values
+
+    def member_cme_init_rad(self, state_dict: CmeParEns) -> npt.NDArray[np.float64]:
+        """
+        Radius (solar radii) at which each member's t_init is defined: state_dict["cme_init_rad"] when
+        given (e.g. in the state vector), otherwise self.cme_init_rad (also for non-finite values), as
+        in ObservationOperator.extract_cme_init_rad
+        """
+        default: float = float(self.cme_init_rad.to(u.solRad).value)
+        if "cme_init_rad" not in state_dict:
+            return np.full(self.n_members, default)
+        r0: npt.NDArray[np.float64] = np.array(
+            [
+                u.Quantity(r, u.solRad).value
+                for r in self.member_values(state_dict, "cme_init_rad")
+            ],
+            dtype=float,
+        )
+        return np.where(np.isfinite(r0), r0, default)
+
+    def member_kinematics(
+        self, state_dict: CmeParEns
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """
+        Each member's position at the observation time at the constant speed from cme_init_rad
+        assumed in ObservationOperator.extract_cme_launch_time
+        :return: cme_init_rad (solar radii); time since reaching r_min (s; negative = not yet there);
+            estimated front radius (solar radii)
+        """
+        km_per_rs: float = float((1.0 * u.solRad).to(u.km).value)
+        r0: npt.NDArray[np.float64] = self.member_cme_init_rad(state_dict)
+        v: npt.NDArray[np.float64] = np.array(
+            [
+                u.Quantity(x, u.km / u.s).value
+                for x in self.member_values(state_dict, "v")
+            ],
+            dtype=float,
+        )
+        since_t_init: npt.NDArray[np.float64] = np.array(
+            [
+                (pd.Timestamp(self.obs_time) - pd.Timestamp(t)).total_seconds()
+                for t in self.member_values(state_dict, "t_init")
+            ],
+            dtype=float,
+        )
+        transit: npt.NDArray[np.float64] = (
+            (self.r_min.to(u.solRad).value - r0) * km_per_rs / v
+        )
+        r_front: npt.NDArray[np.float64] = r0 + v * since_t_init / km_per_rs
+        return r0, since_t_init - transit, r_front
+
+    def below_r_min(self, state_dict: CmeParEns) -> npt.NDArray[np.bool_]:
+        """
+        Members whose CME has not yet reached the model's inner boundary r_min at the observation time,
+        or reached it less than PFSettings.censor_pickup_margin_hours before (not yet picked up by the
+        J-map tracker), at the constant speed from cme_init_rad assumed in
+        ObservationOperator.extract_cme_launch_time: t_obs < t_init + (r_min - cme_init_rad) / v +
+        margin. All False unless PFSettings.censor_below_r_min.
+        :return: (n_members) boolean array
+        """
+        if not self.pf_settings.censor_below_r_min:
+            return np.zeros(self.n_members, dtype=bool)
+        since_r_min: npt.NDArray[np.float64] = self.member_kinematics(state_dict)[1]
+        return since_r_min < 3600.0 * float(self.pf_settings.censor_pickup_margin_hours)
+
+    def censoring_bounds(
+        self, state_dict: CmeParEns
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """
+        Bounds (deg) of the elongation of a censored member: e_low = arcsin(cme_init_rad / r_obs) and
+        e_lim = arcsin(r / r_obs), the largest elongation a point at those radii can have from the
+        observer, with r = r_min for a member whose CME is below r_min and its estimated front radius
+        for one that has just passed it (PFSettings.censor_pickup_margin_hours), and each member's
+        bias term applied
+        :return: e_low, e_lim, each (n_members)
+        """
+        r_min_rs: float = float(self.r_min.to(u.solRad).value)
+        e_lim_deg: float = (
+            np.nan
+            if self.model_min_elong_deg is None
+            else float(self.model_min_elong_deg)
+        )
+        if np.isfinite(e_lim_deg) and e_lim_deg > 0:
+            r_obs_rs: float = r_min_rs / np.sin(np.deg2rad(e_lim_deg))
+        else:
+            radius: Any = self.obs_radius
+            if isinstance(radius, (list, tuple)):
+                radius = radius[0]
+            r_obs_rs = float(u.Quantity(radius, u.AU).to(u.solRad).value)
+            e_lim_deg = float(np.rad2deg(np.arcsin(min(1.0, r_min_rs / r_obs_rs))))
+        r0: npt.NDArray[np.float64]
+        r_front: npt.NDArray[np.float64]
+        r0, _, r_front = self.member_kinematics(state_dict)
+        e_low: npt.NDArray[np.float64] = np.rad2deg(
+            np.arcsin(np.clip(r0 / r_obs_rs, 0.0, 1.0))
+        )
+        # Below r_min: the model's minimum elongation; just past it: the estimated front's
+        e_lim: npt.NDArray[np.float64] = np.where(
+            r_front > r_min_rs,
+            np.rad2deg(np.arcsin(np.clip(r_front / r_obs_rs, 0.0, 1.0))),
+            e_lim_deg,
+        )
+        obs_op_settings: ObsOpSettings = (
+            ObsOpSettings() if self.obs_op_settings is None else self.obs_op_settings
+        )
+        bounds: list[npt.NDArray[np.float64]] = [
+            np.asarray(
+                add_obs_bias(b[:, None], state_dict, obs_op_settings, self.n_members),
+                dtype=float,
+            )[:, 0]
+            for b in (e_low, e_lim)
+        ]
+        return np.minimum(*bounds), np.maximum(*bounds)
+
+    def censored_log_likelihood(self, e_low: float, e_lim: float) -> float:
+        """
+        Log-likelihood of the observation for a member whose elongation is only known to be between
+        e_low and e_lim: the Gaussian observation density averaged over [e_low, e_lim],
+            log{ [Phi((e_lim - y) / sigma) - Phi((e_low - y) / sigma)] / (e_lim - e_low) },
+        computed in log space so that it stays finite far from the interval
+        """
+        y: float = float(np.ravel(np.asarray(self.obs, dtype=float))[0])
+        sigma: float = float(np.sqrt(np.ravel(np.asarray(self.obs_cov, dtype=float))[0]))
+        if not e_lim - e_low > 1e-9:
+            # Degenerate interval: the Gaussian density at e_lim
+            return float(
+                -0.5 * ((y - e_lim) / sigma) ** 2 - np.log(sigma * np.sqrt(2.0 * np.pi))
+            )
+        log_hi: float = float(log_ndtr((e_lim - y) / sigma))
+        log_lo: float = float(log_ndtr((e_low - y) / sigma))
+        # log(Phi(a) - Phi(b)) = log Phi(a) + log(1 - exp(log Phi(b) - log Phi(a))), a > b
+        log_diff: float = log_hi + float(np.log1p(-np.exp(min(log_lo - log_hi, 0.0)) + 1e-300))
+        return log_diff - float(np.log(e_lim - e_low))
+
+    def stage_log_likelihoods(
+        self, state_dict: CmeParEns, obs_op: npt.NDArray[np.float64], stage: str
+    ) -> tuple[npt.NDArray[np.float64], int, npt.NDArray[np.bool_]]:
+        """
+        Log-likelihoods of an ensemble's members, with the censored likelihood for members without an
+        elongation whose CME has not yet reached r_min (PFSettings.censor_below_r_min)
+        :param state_dict: The ensemble evaluated
+        :param obs_op: Its elongations (n_members, n_times)
+        :param stage: Which ensemble ("current", "shrunk" or "resampled"), for the log message
+        :return: log-likelihoods (n_members); the number of members without an elongation that are
+            not censored; which members are censored
+        """
+        hx: npt.NDArray[np.float64] = np.asarray(obs_op, dtype=float)
+        has_elon: npt.NDArray[np.bool_] = np.all(np.isfinite(hx), axis=1)
+        log_lik: npt.NDArray[np.float64] = np.array(
+            [self.calculate_log_likelihood_single_ens(hx[i, :]) for i in range(self.n_members)],
+            dtype=float,
+        )
+        censored: npt.NDArray[np.bool_] = self.below_r_min(state_dict) & ~has_elon
+        if np.any(censored):
+            e_low, e_lim = self.censoring_bounds(state_dict)
+            for i in np.flatnonzero(censored):
+                log_lik[i] = self.censored_log_likelihood(e_low[i], e_lim[i])
+            print(
+                f"Observation at {self.obs_time}: {int(censored.sum())}/{self.n_members} {stage} "
+                f"members censored (CME below r_min or just past it; elongation between "
+                f"{np.min(e_low[censored]):.2f} and {np.max(e_lim[censored]):.2f} deg)"
+            )
+        n_no_elon: int = int(np.sum(~has_elon & ~censored))
+        return log_lik, n_no_elon, censored
 
     def calculate_likelihood_single_ens(self, hx: npt.NDArray[np.float64]) -> float:
         """
@@ -596,6 +813,7 @@ class AuxPF:
             f"Observation at {self.obs_time} not assimilated: {reason}{note}."
         )
         self.elon_posterior = np.full(self.n_members, np.nan)
+        self.censored_posterior = np.zeros(self.n_members, dtype=bool)
         self.parent_index = np.arange(self.n_members, dtype=int)
         self.update_skipped: bool = True
         self.resampled = False
@@ -647,16 +865,13 @@ class AuxPF:
             except NoElongationError as err:
                 return self.skip_no_elongation(err, "current")
             elon_current = np.asarray(obs_op_current, dtype=float)[:, 0].copy()
-            log_likelihood_current = np.array(
-                [
-                    self.calculate_log_likelihood_single_ens(obs_op_current[i, :])
-                    for i in range(self.n_members)
-                ],
-                dtype=float,
+            # (members whose CME is below r_min are censored, see PFSettings.censor_below_r_min)
+            n_no_elon: int
+            log_likelihood_current, n_no_elon, self.censored_first_stage = (
+                self.stage_log_likelihoods(self.cme_par_dict, obs_op_current, "current")
             )
 
             # Skip this observation (as below) if a member produced no elongation, or none did
-            n_no_elon: int = n_members_without_elongation(obs_op_current)
             if (
                 self.pf_settings.skip_update_if_any_member_nan and n_no_elon > 0
             ) or not np.any(np.isfinite(log_likelihood_current)):
@@ -690,6 +905,7 @@ class AuxPF:
                 self.cme_par_dict["weight"] = list(np.exp(log_weights_upd))
                 self.elon_first_stage = elon_current
                 self.elon_posterior = elon_current.copy()
+                self.censored_posterior = self.censored_first_stage.copy()
                 self.parent_index = np.arange(self.n_members, dtype=int)
                 self.update_skipped = False
                 # print("ESS above threshold: weights updated, no resampling")
@@ -715,17 +931,19 @@ class AuxPF:
             except NoElongationError as err:
                 return self.skip_no_elongation(err, "shrunk")
             self.elon_first_stage = np.asarray(obs_op_shrunk, dtype=float)[:, 0].copy()
-            log_likelihood_shrunk_ens = [
-                self.calculate_log_likelihood_single_ens(obs_op_shrunk[i, :])
-                for i in range(self.n_members)
-            ]
+            log_lik_shrunk: npt.NDArray[np.float64]
+            log_lik_shrunk, n_no_elon, self.censored_first_stage = (
+                self.stage_log_likelihoods(
+                    self.state_vector_shrunk_dict, obs_op_shrunk, "shrunk"
+                )
+            )
+            log_likelihood_shrunk_ens = list(log_lik_shrunk)
 
             # Skip the update, returning the ensemble and its weights unchanged, if
             #  - any member's CME produced no elongation and PFSettings.skip_update_if_any_member_nan is set, or
             #  - no member produced a finite likelihood (e.g. every modelled CME is outside the imager's
             #    field of view): the observation then carries no information, and resampling with the
             #    resulting uniform weights would only destroy ensemble diversity.
-            n_no_elon = n_members_without_elongation(obs_op_shrunk)
             no_finite_lik: bool = not np.any(
                 np.isfinite(np.asarray(log_likelihood_shrunk_ens, dtype=float))
             )
@@ -782,7 +1000,11 @@ class AuxPF:
 
         # If a resampled member's CME produced no elongation, discard the update: restore the
         #  ensemble and weights from before this observation (see PFSettings.skip_update_if_any_member_nan)
-        n_no_elon_post: int = n_members_without_elongation(obs_op_post)
+        log_lik_post: npt.NDArray[np.float64]
+        n_no_elon_post: int
+        log_lik_post, n_no_elon_post, self.censored_posterior = (
+            self.stage_log_likelihoods(self.cme_par_dict, obs_op_post, "resampled")
+        )
         if self.pf_settings.skip_update_if_any_member_nan and n_no_elon_post > 0:
             self.cme_par_dict = cme_par_dict_in
             self.cme_par_array = cme_par_array_in
@@ -794,10 +1016,7 @@ class AuxPF:
         # Second-stage weights p(y | theta_i) / p(y | mu_parent(i)). A member whose posterior likelihood
         #  is NaN (model CME not visible) is given a negligible weight, so that no NaN weight reaches the
         #  output or the ESS/weighted statistics.
-        log_likelihood_post: list[float] = [
-            self.calculate_log_likelihood_single_ens(obs_op_post[i, :])
-            for i in range(self.n_members)
-        ]
+        log_likelihood_post: list[float] = list(log_lik_post)
         log_weights_post: list[float] = [
             log_likelihood_post[i] - log_likelihood_shrunk_ens[resample_ind[i]]
             for i in range(len(resample_ind))

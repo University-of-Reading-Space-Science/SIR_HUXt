@@ -359,7 +359,7 @@ class Setup:
             return PFSettings(reuse_model_runs=True, first_stage="current")
         :return: PFSettings
         """
-        return PFSettings(reuse_model_runs=True)
+        return PFSettings(reuse_model_runs=True, censor_below_r_min=True)
 
     def get_obs_op_settings(self) -> ObsOpSettings:
         """
@@ -369,7 +369,7 @@ class Setup:
         get_bias_settings.
         :return: ObsOpSettings
         """
-        return ObsOpSettings()
+        return ObsOpSettings(imager_elon_res=0.15)
 
     def get_correlation_settings(self) -> dict[str, Any]:
         """
@@ -415,7 +415,7 @@ class Setup:
         line (data_assimilation_routine.py --event) replaces this one.
         :return: Event code
         """
-        return "twin_base"
+        return "15B"
 
     def get_ssw_event_craft(self) -> tuple[str, str, str]:
         ssw_event: str = self.get_ssw_event()

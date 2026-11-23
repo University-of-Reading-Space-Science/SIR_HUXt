@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 import os
 import traceback
+import inspect
 import warnings
 
 import surf.surf as S
@@ -163,11 +164,16 @@ class ObsOpSettings:
     Setup.get_obs_op_settings says otherwise).
 
     imager_elon_min, imager_elon_max: Elongation range (deg) of the synthetic heliospheric imager.
-        The upper limit is deliberately wider than the largest elongation assimilated
-        (elong_max_obs = 30 deg in da_surf_setup) so that a member whose CME runs slightly ahead of
-        the real CME is still tracked at the last observations, rather than having already left the
-        imager's field of view (-> NaN). The same limits set the SURF3d latitude range (from the
-        imager field of view), so they must match.
+        The upper limit (70 deg; 35 deg before 18 Nov 2026) is set well beyond the largest elongation
+        assimilated (elong_max_obs = 30 deg in da_surf_setup) so that a member whose CME runs ahead of
+        the real CME is still tracked, rather than having already left the imager's field of view
+        (-> NaN), and so the elongation profiles follow the CME out to large elongations. The same
+        limits set the SURF3d latitude range (from the imager field of view), so they must match: a
+        wider field of view means more SURF3d latitudes and longer model runs.
+    imager_elon_res: Elongation resolution (deg) of the synthetic heliospheric imager's grid, i.e.
+        of its J-maps (SURF's imagers' elon_res; 0.1 deg is SURF's default). The number of
+        elongations, and so the cost of each J-map, scales as (imager_elon_max - imager_elon_min) /
+        imager_elon_res.
 
     write_diagnostics: Write per-member diagnostics from ObserverSynthHI (tracked CME features,
         observation times and, when a member's elongation is NaN, its J-map) to
@@ -210,7 +216,8 @@ class ObsOpSettings:
     """
 
     imager_elon_min: float = 4.0
-    imager_elon_max: float = 35.0
+    imager_elon_max: float = 50.0
+    imager_elon_res: float = 0.15
 
     write_diagnostics: bool = True
 
@@ -446,6 +453,26 @@ def sse_flank_elongation(
         eps: npt.NDArray[np.float64] = eps_c + delta
     bad: npt.NDArray[np.bool_] = (rho2 <= 0) | (ell <= rho) | ~np.isfinite(eps)
     return np.where(bad, np.nan, eps)
+
+
+def imager_res_kwargs(imager_class: type, elon_res: float) -> dict[str, float]:
+    """
+    Keyword argument giving a SURF synthetic imager its elongation resolution (elon_res, deg).
+    SURF's imagers take elon_res since 18 Nov 2026; with an older SURF installed, the default 0.1 deg
+    is left implicit (no argument) and any other value is an error rather than silently ignored.
+    :param imager_class: SURF imager class (e.g. Sim.SyntheticImager3DOrig)
+    :param elon_res: Elongation resolution (deg)
+    :return: {"elon_res": elon_res}, or {} for an older SURF with elon_res = 0.1
+    """
+    if "elon_res" in inspect.signature(imager_class.__init__).parameters:
+        return {"elon_res": float(elon_res)}
+    if not np.isclose(float(elon_res), 0.1):
+        raise ValueError(
+            f"The installed SURF's {imager_class.__name__} does not take elon_res, so the elongation "
+            f"resolution can only be SURF's 0.1 deg (ObsOpSettings.imager_elon_res = {elon_res}); "
+            f"update SURF in the Python environment"
+        )
+    return {}
 
 
 class WideBandSyntheticImager3D(Sim.SyntheticImager3DOrig):
@@ -817,6 +844,7 @@ class ObserverSynthHI:
         obs_latitude: Quantity[u.deg] = 0.0 * u.deg,
         el_min: float = 4.0,
         el_max: float = 30.0,
+        el_res: float = 0.1,
         hi_resolution: Quantity[u.s] | Quantity[u.hour] | Quantity[u.day] = 1.0
         * u.hour,
         diag_info: dict | None = None,
@@ -834,6 +862,7 @@ class ObserverSynthHI:
         :param obs_latitude: Observation latitude
         :param el_min: Minimum elongation
         :param el_max: Maximum elongation
+        :param el_res: Elongation resolution (deg) of the synthetic imager (its J-map)
         :param hi_resolution: Temporal resolution to model the HI data in
         :param diag_info: Member information for the diagnostics (None = no diagnostics)
         :param settings: ObsOpSettings (search band, extrapolation, diagnostics; None = the defaults)
@@ -875,6 +904,7 @@ class ObserverSynthHI:
         self.n_obs: int = len(self.obs_time)
         self.el_min: float = el_min
         self.el_max: float = el_max
+        self.el_res: float = el_res
         self.psi_ert_avg: float = psi_ert_avg
 
         # Get Heliospheric Imager resolution required
@@ -945,7 +975,10 @@ class ObserverSynthHI:
         # Calculate the j-maps and delta j-maps and track the CME
         if use_model == "compress_surf":
             synth_imager_class: Sim.SyntheticImager2D | Sim.SyntheticImager3DOrig = (
-                Sim.SyntheticImager2D(synth_obs_class)
+                Sim.SyntheticImager2D(
+                    synth_obs_class,
+                    **imager_res_kwargs(Sim.SyntheticImager2D, self.el_res),
+                )
             )
             djmap: npt.NDArray[np.float64]
             jmap: npt.NDArray[np.float64]
@@ -962,6 +995,7 @@ class ObserverSynthHI:
                 pa=self.psi_ert_avg,
                 elon_min=self.el_min,
                 elon_max=self.el_max,
+                **imager_res_kwargs(Sim.SyntheticImager3DOrig, self.el_res),
             )
             if self.settings.use_wide_search_band:
                 synth_imager_class = WideBandSyntheticImager3D(
@@ -1357,6 +1391,10 @@ class ObservationOperator:
     #  at the first member whose CME produces no elongation at the observation time(s) and raises
     #  NoElongationError: the observation will not be assimilated, so the remaining runs are not made
     stop_on_no_elongation: bool = False
+    # Members whose CME has not yet reached r_min at the observation time (set by AuxPF with
+    #  PFSettings.censor_below_r_min): their missing elongation is expected (censored), so it does not
+    #  stop the model runs
+    censored_members: frozenset = frozenset()
 
     def __init__(
         self,
@@ -1649,6 +1687,9 @@ class ObservationOperator:
                     #  latitude range is taken from this field of view
                     elon_min=self.settings.imager_elon_min,
                     elon_max=self.settings.imager_elon_max,
+                    **imager_res_kwargs(
+                        Sim.SyntheticImager3DOrig, self.settings.imager_elon_res
+                    ),
                 )
                 buff_lat: Quantity = 2.0 * u.deg
                 imgr._compute_fov_geometry(0)
@@ -2062,6 +2103,7 @@ class ObservationOperator:
                 obs_latitude=obs_latitude,
                 el_min=self.settings.imager_elon_min,
                 el_max=self.settings.imager_elon_max,
+                el_res=self.settings.imager_elon_res,
                 settings=self.settings,
                 n_diag_times=self.n_main_times if self.extra_obs_times_used else None,
                 # (no diagnostics for e.g. full elongation profiles, where NaNs before the CME
@@ -2288,7 +2330,10 @@ class ObservationOperator:
                                 continue
                             progressed = True
                             results[i] = res.get()
-                            if not self.member_has_elongation(results[i]):
+                            if (
+                                i not in self.censored_members
+                                and not self.member_has_elongation(results[i])
+                            ):
                                 cancel.set()
                                 member_bar.close()
                                 raise NoElongationError(
@@ -2330,8 +2375,10 @@ class ObservationOperator:
                 )
                 member_bar.update()
                 # Stop at the first member without an elongation (see stop_on_no_elongation)
-                if self.stop_on_no_elongation and not self.member_has_elongation(
-                    cme_flanks[-1]
+                if (
+                    self.stop_on_no_elongation
+                    and i not in self.censored_members
+                    and not self.member_has_elongation(cme_flanks[-1])
                 ):
                     member_bar.close()
                     raise NoElongationError(i, i + 1, len(cme_objects))

@@ -386,6 +386,12 @@ class RunDataAssimilationRoutine:
         #  needs no folder of its own.
         if self.pf_settings.first_stage != "shrunk":
             prior_dir = f"fsc_{prior_dir}"
+        # ... and for runs that give members whose CME is below r_min the censored likelihood
+        #  (PFSettings.censor_below_r_min), tagged with the pickup margin (cen3h_ = 3 hours)
+        if self.pf_settings.censor_below_r_min:
+            prior_dir = (
+                f"cen{float(self.pf_settings.censor_pickup_margin_hours):g}h_{prior_dir}"
+            )
 
         # Separate folders for runs with an observation-bias term (and, in twins, the injected bias).
         #  Short names (output_names.py): Windows limits a full path to 259 characters, and netCDF
@@ -859,6 +865,9 @@ class RunDataAssimilationRoutine:
             n_model_runs (n_obs): ensembles of model runs made for the observation
             n_reused_runs (n_obs): ensembles whose elongations were read from earlier model runs
                 instead (PFSettings.reuse_model_runs)
+            censored_first_stage, censored_posterior (n_obs x n_ens): 1 where the member had no
+                elongation because its CME had not yet reached r_min, and was given the censored
+                likelihood (PFSettings.censor_below_r_min), in the first-stage and posterior ensembles
         Full elongation profiles (dimensions n_ens x n_profile, on the profile_time grid), written once
          they have been computed (see calculate_elongation_profiles):
             prior_profile_elon: elongation (deg) of the prior ensemble, i.e. the ensemble passed to the
@@ -903,6 +912,23 @@ class RunDataAssimilationRoutine:
                     np.asarray(
                         elon_saved.get("n_reused_runs", np.zeros(n_obs_run)), dtype=int
                     ),
+                ),
+                censored_first_stage=(
+                    ["n_obs", "n_ens"],
+                    np.asarray(
+                        elon_saved.get(
+                            "censored_first_stage",
+                            np.zeros((n_obs_run, self.n_members)),
+                        )
+                    ).astype(np.int8),
+                ),
+                censored_posterior=(
+                    ["n_obs", "n_ens"],
+                    np.asarray(
+                        elon_saved.get(
+                            "censored_posterior", np.zeros((n_obs_run, self.n_members))
+                        )
+                    ).astype(np.int8),
                 ),
             ),
             coords=dict(
@@ -1427,6 +1453,9 @@ class RunDataAssimilationRoutine:
                 #  runs instead (PFSettings.reuse_model_runs)
                 "n_model_runs": np.zeros(n_obs_run, dtype=int),
                 "n_reused_runs": np.zeros(n_obs_run, dtype=int),
+                # Members treated as censored (CME below r_min, PFSettings.censor_below_r_min)
+                "censored_first_stage": np.zeros((n_obs_run, self.n_members), dtype=bool),
+                "censored_posterior": np.zeros((n_obs_run, self.n_members), dtype=bool),
             }
 
             # Elongations of this run's model runs, for reuse (PFSettings.reuse_model_runs)
@@ -1540,11 +1569,19 @@ class RunDataAssimilationRoutine:
                         obs_index=yi,
                         later_obs=self.later_observations(yi) if elon_store else None,
                         run_until=self.obs_times[n_obs_run - 1] if elon_store else None,
+                        model_min_elong_deg=float(elong_min_model[yi]),
                     )
 
                     cme_par_dict = aux_pf_class.aux_pf()
                     elon_saved["n_model_runs"][yi] = aux_pf_class.n_model_runs
                     elon_saved["n_reused_runs"][yi] = aux_pf_class.n_reused_runs
+                    # Members censored (CME below r_min; PFSettings.censor_below_r_min)
+                    elon_saved["censored_first_stage"][yi, :] = (
+                        aux_pf_class.censored_first_stage
+                    )
+                    elon_saved["censored_posterior"][yi, :] = (
+                        aux_pf_class.censored_posterior
+                    )
 
                     # Record each member's modelled elongation at this observation
                     elon_saved["elon_first_stage"][

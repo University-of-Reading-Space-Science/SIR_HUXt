@@ -4348,6 +4348,600 @@ class SkipEvent(Exception):
     """An event that cannot be analysed (e.g. no results folder); main() reports it and goes on"""
 
 
+# ---------------------------------------------------------------- summary over the runs of a twin experiment
+#  (plots like Section 3.1 of Barnard et al. 2023, Space Weather, doi:10.1029/2023SW003487)
+
+# Parameters summarised: (key, label, units). "t_rmin" is each member's time at r_min relative to the
+#  truth's (h): t_init is defined at cme_init_rad, which may differ between members
+TWIN_SUMMARY_PARAMETERS = [
+    ("t_rmin", "Time at $r_{min}$ - truth", "h"),
+    ("v", "Speed", "km/s"),
+    ("width", "Width", "deg"),
+    ("lon", "Longitude", "deg"),
+    ("lat", "Latitude", "deg"),
+    ("cme_init_rad_ens", "Initial radius", "$R_\\odot$"),
+]
+
+
+def _norm_weights(log_w):
+    """Normalised weights from log-weights (non-finite = 0; equal weights if none are finite)"""
+    log_w = np.asarray(log_w, dtype=float)
+    ok = np.isfinite(log_w)
+    if not ok.any():
+        return np.full(log_w.shape, 1.0 / log_w.size)
+    w = np.where(ok, np.exp(log_w - np.max(log_w[ok])), 0.0)
+    return w / w.sum()
+
+
+def _weighted_sd(x, w):
+    """Weighted standard deviation of x (NaN values and their weights dropped)"""
+    x = np.asarray(x, dtype=float)
+    w = np.asarray(w, dtype=float)
+    ok = np.isfinite(x) & (w > 0)
+    if ok.sum() < 2:
+        return np.nan
+    w = w[ok] / w[ok].sum()
+    m = np.sum(w * x[ok])
+    return float(np.sqrt(np.sum(w * (x[ok] - m) ** 2)))
+
+
+def collect_twin_runs(base_file_path, run_nos, truth, cme_init_rad_truth=None):
+    """
+    Prior and posterior ensembles of the runs of a twin experiment, for plot_twin_runs_summary
+    :param base_file_path: Folder of the run_NNN folders
+    :param run_nos: Run numbers
+    :param truth: Truth CME: t_init (datetime, at cme_init_rad), speed, width, lon, lat
+    :param cme_init_rad_truth: The truth's cme_init_rad (solar radii); None = each run's cme_init_rad
+    :return: dict: "prior" and "post", each {parameter: (n_runs, n_members) array, "w": weights
+        normalised within each run}; "truth": {parameter: value}; "n_members"; "run_nos"
+    """
+    km_per_rs = float((1.0 * u.solRad).to(u.km).value)
+    stages = {"prior": {}, "post": {}}
+    truth_values = {}
+    used_runs = []
+    for run_no in run_nos:
+        path = os.path.join(base_file_path, f"run_{run_no:03d}", "cme_pars.nc")
+        if not os.path.isfile(path):
+            print(f"collect_twin_runs: no {path}; run {run_no} left out")
+            continue
+        ds = xr.load_dataset(path)
+        model_init = pd.to_datetime(np.ravel(ds["model_init_time"].values)[0]).to_pydatetime()
+        r_min = float(np.ravel(ds["r_min"].values)[0])
+        r0_truth = (
+            float(cme_init_rad_truth)
+            if cme_init_rad_truth is not None
+            else run_cme_init_rad(ds)
+        )
+        t_truth_rmin_s = (truth["t_init"] - model_init).total_seconds() + (
+            r_min - r0_truth
+        ) * km_per_rs / float(truth["speed"])
+        truth_values.update(
+            v=float(truth["speed"]),
+            width=float(truth["width"]),
+            lon=float(truth["lon"]),
+            lat=float(truth["lat"]),
+            t_rmin=0.0,
+            cme_init_rad_ens=r0_truth,
+        )
+        for name, k in (("prior", 0), ("post", int(ds.sizes["n_obs"]) - 1)):
+            v = np.asarray(ds["v"].values[k], dtype=float)
+            r0 = member_cme_init_rad(ds, k)
+            t_rmin_s = np.asarray(ds["t_init"].values[k], dtype=float) + (
+                r_min - r0
+            ) * km_per_rs / v
+            row = {
+                "t_rmin": (t_rmin_s - t_truth_rmin_s) / 3600.0,
+                "v": v,
+                "width": np.asarray(ds["width"].values[k], dtype=float),
+                "lon": np.asarray(ds["lon"].values[k], dtype=float),
+                "lat": np.asarray(ds["lat"].values[k], dtype=float),
+                "cme_init_rad_ens": r0,
+                "w": _norm_weights(ds["log_weight"].values[k]),
+            }
+            for key, val in row.items():
+                stages[name].setdefault(key, []).append(val)
+        used_runs.append(run_no)
+    out = {
+        name: {key: np.array(vals) for key, vals in d.items()}
+        for name, d in stages.items()
+    }
+    out["truth"] = truth_values
+    out["run_nos"] = used_runs
+    out["n_members"] = int(out["prior"]["v"].shape[1]) if used_runs else 0
+    return out
+
+
+def collect_twin_arrivals(base_file_path, run_nos, real_arrival_time):
+    """
+    Prior and posterior arrival-time errors (h) and arrival speeds (km/s) of each run's members, from
+    the arrival times cached in each run's arr_obs.nc (get_cme_arrival_time)
+    :return: dict "prior"/"post": {"err_h", "speed", "w"} (n_runs, n_members) arrays, NaN = no
+        arrival; None if no run has arrival times
+    """
+    out = {"prior": {"err_h": [], "speed": [], "w": []}, "post": {"err_h": [], "speed": [], "w": []}}
+    for run_no in run_nos:
+        run_dir = os.path.join(base_file_path, f"run_{run_no:03d}")
+        arr_path = read_path(run_dir, "arrivals_per_obs")
+        par_path = os.path.join(run_dir, "cme_pars.nc")
+        if not (os.path.isfile(arr_path) and os.path.isfile(par_path)):
+            continue
+        par_ds = xr.load_dataset(par_path)
+        final = int(par_ds.sizes["n_obs"]) - 1
+        with xr.load_dataset(arr_path) as arr_ds:
+            times = arr_ds["arrival_time"].values
+            speeds = np.asarray(arr_ds["arrival_speed"].values, dtype=float)
+            computed = (
+                np.asarray(arr_ds["computed"].values, dtype=bool)
+                if "computed" in arr_ds
+                else np.ones(times.shape[0], dtype=bool)
+            )
+        if final >= times.shape[0] or not (computed[0] and computed[final]):
+            print(f"collect_twin_arrivals: run {run_no} has no prior/posterior arrivals; left out")
+            continue
+        for name, k in (("prior", 0), ("post", final)):
+            err = np.array(
+                [
+                    np.nan
+                    if np.isnat(t)
+                    else (pd.Timestamp(t).to_pydatetime() - real_arrival_time).total_seconds() / 3600.0
+                    for t in times[k]
+                ]
+            )
+            out[name]["err_h"].append(err)
+            out[name]["speed"].append(np.where(np.isfinite(err), speeds[k], np.nan))
+            out[name]["w"].append(_norm_weights(par_ds["log_weight"].values[k]))
+    if not out["prior"]["err_h"]:
+        return None
+    return {n: {k: np.array(v) for k, v in d.items()} for n, d in out.items()}
+
+
+def _pooled(x, w):
+    """Flatten (n_runs, n_members) values and weights, each run's weights summing to 1 / n_runs"""
+    x = np.asarray(x, dtype=float)
+    w = np.asarray(w, dtype=float)
+    ok = np.isfinite(x)
+    w = np.where(ok, w, 0.0)
+    w = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-300) / x.shape[0]
+    return x[ok], w[ok]
+
+
+# Hexbin plots in the format of Barnard et al. (2023, Space Weather, doi:10.1029/2023SW003487), Figs. 6
+# and 7, as made by plot_particle_distribution and plot_average_particle_distribution in
+# https://github.com/LukeBarnard/SIR_HUXt/blob/master/code/osse_analysis.ipynb. The paper's colour
+# scales (viridis, BoundaryNorm from 0 to zmax in n_levels steps) were for n_samples values per panel
+# (100 runs x 50 members pooled; 100 run means); here zmax is scaled by the number of values in each
+# panel relative to that, keeping the number of steps
+TWIN_HEXBIN_PAPER = {
+    "pooled": {"gridsize": 15, "zmax": 150, "n_levels": 15, "n_samples": 5000},
+    "means": {"gridsize": 10, "zmax": 10, "n_levels": 10, "n_samples": 100},
+}
+# Padding of the axis ranges beyond the prior's range (paper: 25 km/s for speed, 5 deg for angles)
+TWIN_HEXBIN_PAD = {"v": 25.0, "width": 5.0, "lon": 5.0, "lat": 5.0, "t_rmin": 1.0, "cme_init_rad_ens": 0.5}
+# The paper's pairs, in its order, are drawn first
+TWIN_HEXBIN_PAPER_PAIRS = [("v", "width"), ("v", "lon"), ("width", "lon")]
+
+
+def _hexbin_figure(stages, truth, pairs, label, extent_of, gridsize, zmax, n_levels, out_path, title=""):
+    """
+    One figure in the paper's layout: 2 x 3 hexbin panels (prior top, posterior bottom; one column per
+    pair), truth as red dashed lines, white panel letters and stage names, one vertical "Count"
+    colourbar on the right, shared by all panels: the paper's, viridis from 0 to zmax in n_levels steps
+    :param stages: [(name, x_values_by_key, counts_weights)]: for each of prior and posterior, a dict of
+        1-D arrays by parameter and the weight of each sample as a count (None = 1 each)
+    :param pairs: Up to three (x key, y key) pairs
+    :param extent_of: Function key -> (lo, hi)
+    """
+    import matplotlib as mpl
+
+    cmap = mpl.colormaps["viridis"] if hasattr(mpl, "colormaps") else plt.get_cmap("viridis")
+    bounds = np.linspace(0.0, zmax, n_levels + 1)
+    norm = mpl.colors.BoundaryNorm(bounds, ncolors=cmap.N, clip=True)
+    fig, ax = plt.subplots(2, 3, figsize=(19, 12))
+    hbs = []
+    for j in range(3):
+        if j >= len(pairs):
+            ax[0, j].set_visible(False)
+            ax[1, j].set_visible(False)
+            continue
+        a, b = pairs[j]
+        lims = (*extent_of(a), *extent_of(b))
+        for i, (_, vals, cw) in enumerate(stages):
+            x, y = vals[a], vals[b]
+            c = np.ones(x.shape) if cw is None else cw
+            ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(c)
+            # C = each sample's count weight, summed per hexagon (= counts for equal weights);
+            # mincnt=0 colours empty hexagons as 0, as hexbin does with no weights
+            hbs.append(
+                ax[i, j].hexbin(
+                    x[ok], y[ok], C=c[ok], reduce_C_function=np.sum, mincnt=0,
+                    gridsize=gridsize, extent=lims, norm=norm, cmap=cmap,
+                )
+            )
+            ax[i, j].vlines(truth[a], lims[2], lims[3], zorder=9, linestyle="--", colors="r", linewidth=3)
+            ax[i, j].hlines(truth[b], lims[0], lims[1], zorder=9, linestyle="--", colors="r", linewidth=3)
+            ax[i, j].set_xlim(lims[0], lims[1])
+            ax[i, j].set_ylim(lims[2], lims[3])
+            ax[i, j].set_xlabel(label[a])
+            ax[i, j].set_ylabel(label[b])
+    for i, (name, _, _) in enumerate(stages):
+        for j in range(len(pairs)):
+            ax[i, j].text(0.98, 0.925, name, fontsize=20, color="w", ha="right", transform=ax[i, j].transAxes)
+    for k, lab in enumerate(["A)", "B)", "C)", "D)", "E)", "F)"]):
+        i, j = divmod(k, 3)
+        if j < len(pairs):
+            ax[i, j].text(0.015, 0.925, lab, fontsize=20, color="w", transform=ax[i, j].transAxes)
+    top_title = 0.99
+    if title:
+        fig.suptitle(title, fontsize=14)
+        top_title = 0.95
+    fig.subplots_adjust(left=0.06, bottom=0.06, right=0.93, top=top_title, wspace=0.2, hspace=0.125)
+    pos1 = ax[0, 2].get_position()
+    pos2 = ax[1, 2].get_position()
+    cbaxes = fig.add_axes([pos1.x1 + pos1.width / 20, pos2.y0, pos1.width / 20, pos1.y1 - pos2.y0])
+    cbar = fig.colorbar(hbs[-1], cax=cbaxes, orientation="vertical")
+    cbar.set_label("Count")
+    safe_savefig(fig, out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_twin_runs_hexbin(data, means, keys, label, out_dir, title=""):
+    """
+    Hexbin plots of the prior and posterior over the runs of a twin experiment, in the format of
+    Barnard et al. (2023) Figs. 6 and 7:
+      twin_runs_hexbin_pooled[_N].png - all members of all runs (gridsize 15)
+      twin_runs_hexbin_means[_N].png  - each run's ensemble mean (gridsize 10)
+    Colour scales: the paper's (viridis, 15 steps from 0 to 150 for 5000 pooled values; 10 steps from 0
+    to 10 for 100 run means), with the top scaled by the number of values in each panel relative to the
+    paper's, the step and top rounded to whole numbers (e.g. 75 runs x 50 members: 0-112 in steps of 8
+    pooled, 0-8 in steps of 1 for the run means); prior and posterior share it.
+    The paper's pairs (speed-width, speed-longitude, width-longitude) come first; any others
+    (e.g. with the time at r_min, latitude or initial radius) follow in further figures, three per
+    figure (_2, _3, ...). Axis ranges are the prior's range plus the paper's padding (and the truth).
+    The paper's posterior was resampled; here each posterior member counts as n_members x its weight
+    (weights normalised within each run), so the total count is n_runs x n_members as in the prior.
+    :param data: collect_twin_runs output
+    :param means: {"prior"/"post": {key: (n_runs,) run means}}
+    :param keys: Estimated parameters
+    :param label: {key: axis label}
+    :param out_dir: Output folder
+    :param title: Figure title
+    :return: List of the saved files
+    """
+    prior, post, tv = data["prior"], data["post"], data["truth"]
+    n_runs, n_members = len(data["run_nos"]), data["n_members"]
+    pairs = [p for p in TWIN_HEXBIN_PAPER_PAIRS if p[0] in keys and p[1] in keys]
+    pairs += [(a, b) for i, a in enumerate(keys) for b in keys[i + 1 :] if (a, b) not in pairs]
+    groups = [pairs[i : i + 3] for i in range(0, len(pairs), 3)]
+
+    def pooled(d):
+        vals = {k: np.ravel(d[k]).astype(float) for k in keys}
+        w = np.asarray(d["w"], dtype=float)
+        w = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-300) * n_members
+        return vals, np.ravel(w)
+
+    def extent_from(source):
+        def extent_of(k):
+            x = np.concatenate([np.ravel(source[k]), [tv[k]]])
+            x = x[np.isfinite(x)]
+            pad = TWIN_HEXBIN_PAD.get(k, 0.05 * (np.ptp(x) or 1.0))
+            return float(x.min() - pad), float(x.max() + pad)
+
+        return extent_of
+
+    kinds = {
+        "pooled": (
+            [("Prior", *pooled(prior)), ("Posterior", *pooled(post))],
+            extent_from(prior),
+            n_runs * n_members,
+            "all members of all runs (posterior: count x weight)",
+        ),
+        "means": (
+            [("Prior", means["prior"], None), ("Posterior", means["post"], None)],
+            extent_from(means["prior"]),
+            n_runs,
+            "ensemble mean of each run",
+        ),
+    }
+    saved = []
+    for kind, (stages, extent_of, n_samples, what) in kinds.items():
+        cfg = TWIN_HEXBIN_PAPER[kind]
+        # Paper's step and top scaled by the number of values, each rounded to the nearest whole
+        # number (halves up; step at least 1, top a multiple of the step, at least one step)
+        ratio = n_samples / cfg["n_samples"]
+        dz = max(1, int(np.floor(cfg["zmax"] / cfg["n_levels"] * ratio + 0.5)))
+        zmax_scaled = int(np.floor(cfg["zmax"] * ratio + 0.5))
+        n_levels = max(1, int(np.floor(zmax_scaled / dz + 0.5)))
+        zmax = dz * n_levels
+        for g, group in enumerate(groups):
+            name = f"twin_runs_hexbin_{kind}{'' if g == 0 else f'_{g + 1}'}.png"
+            saved.append(
+                _hexbin_figure(
+                    stages, tv, group, label, extent_of, cfg["gridsize"], zmax, n_levels,
+                    os.path.join(out_dir, name),
+                    title=f"{title}: {what}; Barnard et al. (2023) colour scale x {n_samples}/{cfg['n_samples']} (rounded)",
+                )
+            )
+    return saved
+
+
+def plot_twin_runs_summary(
+    base_file_path,
+    run_nos,
+    truth,
+    cme_init_rad_truth=None,
+    real_arrival_time=None,
+    real_arrival_speed=None,
+    fig_title="",
+    out_dir=None,
+):
+    """
+    Summary of the prior and posterior ensembles over the runs of a twin experiment (same truth,
+    different first guess, ensemble and observation noise in each run), like Section 3.1 of
+    Barnard et al. (2023, Space Weather, doi:10.1029/2023SW003487):
+      twin_runs_pairs_pooled.png  - 2-D histograms of each pair of estimated parameters, all members
+                                    of all runs (posterior weighted), prior (top) and posterior (bottom)
+      twin_runs_pairs_means.png   - the same with one point per run (the ensemble's weighted mean)
+      twin_runs_hexbin_*.png      - hexbin versions of the two above, in the paper's format, colour
+                                    scales scaled by the number of values (plot_twin_runs_hexbin)
+      twin_runs_rank_truth.png    - rank of the truth within each run's ensemble, prior and posterior
+      twin_runs_arrival.png       - arrival-time error and arrival speed at Earth, prior and posterior
+      twin_runs_summary.json      - spreads of the pooled samples and of the run means, prior and
+                                    posterior, and their reductions
+    Parameters that do not vary in the prior (e.g. latitude when not estimated) are left out.
+    :param base_file_path: Folder of the run_NNN folders
+    :param run_nos: Run numbers to include
+    :param truth: Truth CME: t_init (datetime, at cme_init_rad), speed, width, lon, lat
+    :param cme_init_rad_truth: The truth's cme_init_rad (solar radii); None = each run's
+    :param real_arrival_time: The truth's arrival time at Earth (datetime), for the arrival figure
+    :param real_arrival_speed: The truth's arrival speed (km/s)
+    :param fig_title: Title prefix
+    :param out_dir: Output folder (default: summary_runs_<first>-<last> in base_file_path)
+    :return: Path of the summary JSON, or None
+    """
+    data = collect_twin_runs(base_file_path, run_nos, truth, cme_init_rad_truth)
+    used = data["run_nos"]
+    if len(used) < 2:
+        print("plot_twin_runs_summary: fewer than two runs; no summary")
+        return None
+    if out_dir is None:
+        out_dir = os.path.join(base_file_path, f"summary_runs_{used[0]:03d}-{used[-1]:03d}")
+    os.makedirs(out_dir, exist_ok=True)
+    n_runs, n_members = len(used), data["n_members"]
+    prior, post, tv = data["prior"], data["post"], data["truth"]
+
+    # Estimated parameters: those that vary in the prior
+    pars = [
+        p
+        for p in TWIN_SUMMARY_PARAMETERS
+        if p[0] in prior and np.nanstd(prior[p[0]]) > 1e-9
+    ]
+    label = {p[0]: f"{p[1]} ({p[2]})" for p in pars}
+    keys = [p[0] for p in pars]
+    pairs = [(a, b) for i, a in enumerate(keys) for b in keys[i + 1 :]]
+    title = (fig_title + ": " if fig_title else "") + f"{n_runs} runs x {n_members} members"
+    c_prior, c_post, c_truth = "#6b7280", "#2563eb", "#d9480f"
+
+    # Run means (posterior: weighted)
+    means = {
+        name: {
+            k: np.array(
+                [np.average(d[k][r], weights=d["w"][r]) for r in range(n_runs)]
+            )
+            for k in keys
+        }
+        for name, d in (("prior", prior), ("post", post))
+    }
+
+    # Statistics: spreads of the pooled samples and of the run means
+    summary = {"runs": used, "n_members": n_members, "truth": tv, "parameters": {}}
+    for k in keys:
+        s = {}
+        for name, d in (("prior", prior), ("post", post)):
+            x, w = _pooled(d[k], d["w"])
+            s[f"{name}_sd_pooled"] = _weighted_sd(x, w)
+            s[f"{name}_mean_error_pooled"] = float(np.sum(w * x) / np.sum(w) - tv[k])
+            s[f"{name}_sd_of_run_means"] = float(np.std(means[name][k]))
+            s[f"{name}_rmse_of_run_means"] = float(
+                np.sqrt(np.mean((means[name][k] - tv[k]) ** 2))
+            )
+        s["sd_pooled_reduction_pct"] = float(
+            100 * (1 - s["post_sd_pooled"] / s["prior_sd_pooled"])
+        )
+        summary["parameters"][k] = s
+
+    def ranges(k):
+        vals = np.concatenate([np.ravel(prior[k]), np.ravel(post[k]), [tv[k]]])
+        vals = vals[np.isfinite(vals)]
+        lo, hi = np.percentile(vals, [0.5, 99.5])
+        pad = 0.05 * (hi - lo if hi > lo else 1.0)
+        return lo - pad, hi + pad
+
+    # 1. pooled 2-D histograms (paper Fig. 6)
+    if pairs:
+        fig, axs = plt.subplots(
+            2, len(pairs), figsize=(3.6 * len(pairs), 6.6), squeeze=False, layout="constrained"
+        )
+        for j, (a, b) in enumerate(pairs):
+            xr_, yr_ = ranges(a), ranges(b)
+            for i, (name, d) in enumerate((("Prior", prior), ("Posterior", post))):
+                ax = axs[i, j]
+                x, wx = _pooled(d[a], d["w"])
+                y, _ = _pooled(d[b], d["w"])
+                ok = np.isfinite(y)
+                ax.hist2d(
+                    x[ok], y[ok], bins=30, range=[xr_, yr_], weights=wx[ok], cmap="Blues", cmin=1e-12
+                )
+                ax.axvline(tv[a], color=c_truth, ls="--", lw=1)
+                ax.axhline(tv[b], color=c_truth, ls="--", lw=1)
+                sa = summary["parameters"][a][f"{'prior' if i == 0 else 'post'}_sd_pooled"]
+                sb = summary["parameters"][b][f"{'prior' if i == 0 else 'post'}_sd_pooled"]
+                ax.set_title(f"{name}: sd {sa:.3g}, {sb:.3g}", fontsize=9)
+                ax.set_xlabel(label[a])
+                ax.set_ylabel(label[b])
+        fig.suptitle(f"{title}: all members (posterior weighted); truth dashed")
+        safe_savefig(fig, os.path.join(out_dir, "twin_runs_pairs_pooled.png"))
+        plt.close(fig)
+
+        # 2. run means (paper Fig. 7)
+        fig, axs = plt.subplots(
+            2, len(pairs), figsize=(3.6 * len(pairs), 6.6), squeeze=False, layout="constrained"
+        )
+        for j, (a, b) in enumerate(pairs):
+            xr_, yr_ = ranges(a), ranges(b)
+            for i, name in enumerate(("prior", "post")):
+                ax = axs[i, j]
+                ax.scatter(
+                    means[name][a], means[name][b], s=14,
+                    color=c_prior if name == "prior" else c_post, alpha=0.8,
+                )
+                ax.axvline(tv[a], color=c_truth, ls="--", lw=1)
+                ax.axhline(tv[b], color=c_truth, ls="--", lw=1)
+                ax.set_xlim(xr_)
+                ax.set_ylim(yr_)
+                ax.set_title(
+                    f"{'Prior' if name == 'prior' else 'Posterior'}: sd of means "
+                    f"{summary['parameters'][a][name + '_sd_of_run_means']:.3g}, "
+                    f"{summary['parameters'][b][name + '_sd_of_run_means']:.3g}",
+                    fontsize=9,
+                )
+                ax.set_xlabel(label[a])
+                ax.set_ylabel(label[b])
+        fig.suptitle(f"{title}: ensemble mean of each run; truth dashed")
+        safe_savefig(fig, os.path.join(out_dir, "twin_runs_pairs_means.png"))
+        plt.close(fig)
+
+        # Hexbin plots in the format and colour scales of the paper (Figs. 6 and 7)
+        plot_twin_runs_hexbin(data, means, keys, label, out_dir, title=title)
+
+    # 3. rank of the truth in each run's ensemble (paper Fig. 8)
+    n_bins = int(min(n_members + 1, max(4, n_runs // 4)))
+    fig, axs = plt.subplots(
+        2, len(keys), figsize=(3.0 * len(keys), 5.4), squeeze=False, sharey=True, layout="constrained"
+    )
+    for j, k in enumerate(keys):
+        for i, (name, d) in enumerate((("Prior", prior), ("Posterior", post))):
+            pit = np.array(
+                [
+                    np.sum(d["w"][r] * (d[k][r] < tv[k]))
+                    + 0.5 * np.sum(d["w"][r] * (d[k][r] == tv[k]))
+                    for r in range(n_runs)
+                ]
+            )
+            ranks = pit_to_rank(pit, n_members)
+            edges = np.linspace(-0.5, n_members + 0.5, n_bins + 1)
+            counts, _ = np.histogram(ranks[np.isfinite(ranks)], bins=edges)
+            ax = axs[i, j]
+            ax.bar(
+                0.5 * (edges[:-1] + edges[1:]), counts, width=np.diff(edges) * 0.9,
+                color=c_prior if i == 0 else c_post,
+            )
+            ax.axhline(n_runs / n_bins, color=c_truth, ls="--", lw=1)
+            ax.set_title(f"{name}: {label[k]}", fontsize=9)
+            ax.set_xlabel(f"rank of the truth (0-{n_members})")
+            summary["parameters"][k][f"{name.lower()}_rank_counts"] = counts.tolist()
+        axs[0, 0].set_ylabel("runs")
+        axs[1, 0].set_ylabel("runs")
+    fig.suptitle(f"{title}: rank of the truth in each run's ensemble (flat = calibrated; dashed: expected)")
+    safe_savefig(fig, os.path.join(out_dir, "twin_runs_rank_truth.png"))
+    plt.close(fig)
+
+    # 4. arrival time and speed at Earth (paper Fig. 9)
+    arr = (
+        collect_twin_arrivals(base_file_path, used, real_arrival_time)
+        if real_arrival_time is not None
+        else None
+    )
+    if arr is not None:
+        true_speed = (
+            float(getattr(real_arrival_speed, "value", real_arrival_speed))
+            if real_arrival_speed is not None
+            else np.nan
+        )
+        fig, axs = plt.subplots(1, 3, figsize=(13, 4), layout="constrained")
+        a_stats = {}
+
+        def shared_bins(key):
+            vals = np.concatenate([np.ravel(arr[n][key]) for n in ("prior", "post")])
+            vals = vals[np.isfinite(vals)]
+            return np.linspace(vals.min(), vals.max(), 41) if vals.size > 1 else 30
+
+        bins_err, bins_speed = shared_bins("err_h"), shared_bins("speed")
+        for name, col, lab in (("prior", c_prior, "Prior"), ("post", c_post, "Posterior")):
+            e, we = _pooled(arr[name]["err_h"], arr[name]["w"])
+            sp, ws = _pooled(arr[name]["speed"], arr[name]["w"])
+            a_stats[name] = {
+                "sd_arrival_h": _weighted_sd(e, we),
+                "mean_arrival_error_h": float(np.sum(we * e) / np.sum(we)) if we.sum() > 0 else np.nan,
+                "sd_arrival_speed": _weighted_sd(sp, ws),
+                "hit_rate": float(np.mean(np.isfinite(arr[name]["err_h"]))),
+            }
+            axs[0].hist(e, bins=bins_err, weights=we, histtype="step", lw=2, color=col,
+                        label=f"{lab}: sd {a_stats[name]['sd_arrival_h']:.2f} h")
+            axs[1].hist(sp, bins=bins_speed, weights=ws, histtype="step", lw=2, color=col,
+                        label=f"{lab}: sd {a_stats[name]['sd_arrival_speed']:.1f} km/s")
+            axs[2].scatter(
+                np.ravel(arr[name]["err_h"]), np.ravel(arr[name]["speed"]), s=4, alpha=0.4, color=col, label=lab
+            )
+        for ax in axs[:2]:
+            ax.set_ylabel("fraction of samples")
+            ax.legend(fontsize=8)
+        axs[0].axvline(0.0, color=c_truth, ls="--")
+        axs[0].set_xlabel("arrival time - true arrival (h)")
+        axs[1].axvline(true_speed, color=c_truth, ls="--")
+        axs[1].set_xlabel("arrival speed (km/s)")
+        axs[2].axvline(0.0, color=c_truth, ls="--")
+        axs[2].axhline(true_speed, color=c_truth, ls="--")
+        axs[2].set_xlabel("arrival time - true arrival (h)")
+        axs[2].set_ylabel("arrival speed (km/s)")
+        axs[2].legend(fontsize=8, markerscale=3)
+        fig.suptitle(
+            f"{title}: CME arrival at Earth (true arrival {real_arrival_time:%Y-%m-%d %H:%M}, {true_speed:.0f} km/s)"
+        )
+        safe_savefig(fig, os.path.join(out_dir, "twin_runs_arrival.png"))
+        plt.close(fig)
+        summary["arrival"] = a_stats
+        if a_stats["prior"]["sd_arrival_h"] > 0:
+            summary["arrival"]["sd_arrival_reduction_pct"] = float(
+                100 * (1 - a_stats["post"]["sd_arrival_h"] / a_stats["prior"]["sd_arrival_h"])
+            )
+
+    # Print and save the statistics
+    print(f"\nTwin-run summary ({title}) in {out_dir}")
+    for k in keys:
+        s = summary["parameters"][k]
+        print(
+            f"  {label[k]:28s} pooled sd {s['prior_sd_pooled']:8.3g} -> {s['post_sd_pooled']:8.3g}"
+            f" ({s['sd_pooled_reduction_pct']:5.1f}% less); sd of run means "
+            f"{s['prior_sd_of_run_means']:7.3g} -> {s['post_sd_of_run_means']:7.3g}"
+        )
+    if "arrival" in summary:
+        a = summary["arrival"]
+        print(
+            f"  arrival time sd {a['prior']['sd_arrival_h']:.2f} h -> {a['post']['sd_arrival_h']:.2f} h; "
+            f"arrival speed sd {a['prior']['sd_arrival_speed']:.1f} -> {a['post']['sd_arrival_speed']:.1f} km/s"
+        )
+    json_path = os.path.join(out_dir, "twin_runs_summary.json")
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=1, default=lambda o: float(o) if np.isscalar(o) else str(o))
+    return json_path
+
+
+def censor_dir_tag(margin_hours):
+    """
+    Folder tag data_assimilation_routine.make_output_dir gives runs made with the censored likelihood
+    (PFSettings.censor_below_r_min): "cen<margin>h_" (e.g. "cen3h_" for the 3-hour pickup margin,
+    PFSettings.censor_pickup_margin_hours). In the folder name it comes after any observation-bias
+    tag and before any twin sampling tag and the prior: e.g.
+    ob_est_lin_0.00_2.00_cen3h_fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_0.98
+    :param margin_hours: The runs' pickup margin in hours, or None for runs without censoring
+    :return: The tag ("" for None)
+    """
+    if margin_hours is None:
+        return ""
+    return f"cen{float(margin_hours):g}h_"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Command-line options of osse_ana.py (any left out keep the values set in main())"""
     parser = argparse.ArgumentParser(
@@ -4399,16 +4993,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not make the SURF animations (make_surf_animation in main())",
     )
+    censor = parser.add_mutually_exclusive_group()
+    censor.add_argument(
+        "--censor-margin",
+        type=float,
+        metavar="HOURS",
+        help="Analyse runs made with the censored likelihood and this pickup margin in hours "
+        "(folders cen<HOURS>h_...; default: censor_pickup_margin_hours in main())",
+    )
+    censor.add_argument(
+        "--no-censor",
+        action="store_true",
+        help="Analyse runs made without the censored likelihood",
+    )
     args = parser.parse_args(argv)
     if args.n_runs is not None and args.n_runs < 1:
         parser.error("--n-runs must be 1 or more")
+    if args.censor_margin is not None and args.censor_margin < 0:
+        parser.error("--censor-margin must not be negative")
     return args
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
     load_environment()
-    nRuns = 1
+    nRuns = 100
     start_run = 0
     t_initTruth = None
     vTruth = None
@@ -4440,20 +5049,24 @@ def main(argv: list[str] | None = None):
     use_model = "compress_surf3d"
     # Compute and plot the ensemble's full elongation profiles at every observation (one extra
     #  ensemble of model runs per distinct ensemble, i.e. per resampling step)
-    make_profiles_per_obs = True
+    make_profiles_per_obs = False
     # Compute every member's CME arrival time for the ensemble at every observation and plot the
     #  distributions as histograms. The model runs for arrival_sim_time_days from its start time; CMEs
     #  arriving later count as misses (4 days covers arrivals up to ~4 days after the model start).
-    make_arrivals_per_obs = True
+    make_arrivals_per_obs = False
     arrival_sim_time_days = 4.0
     # Fill in the prior/posterior elongation profiles a data assimilation run could not compute
     #  (backfill_da_profiles: from elon_prof_obs.nc, computing that ensemble first if needed)
-    backfill_missing_profiles = True
+    backfill_missing_profiles = False
     # Rank (Talagrand) histograms of the observations within the forecast ensemble
     make_rank_histograms = False
     # Evolution of the observation-bias coefficient through the assimilation window (runs with an
     #  estimated bias term only)
-    make_bias_plot = True
+    make_bias_plot = False
+    # Twin experiments with several runs: prior/posterior summaries over the runs (2-D histograms of
+    #  the parameter pairs, run means, rank of the truth, arrival time and speed), like Section 3.1 of
+    #  Barnard et al. (2023, doi:10.1029/2023SW003487); see plot_twin_runs_summary
+    make_twin_runs_summary = True
     # Animations of the SURF solution (animate_surf_solution, using SURF's own animate_3d and
     #  animate_with_ts): by default the ensemble-mean CME of the prior and of the final (posterior)
     #  ensemble, each as a 3-D slice movie and as a slice with the time series at Earth. One model
@@ -4468,6 +5081,14 @@ def main(argv: list[str] | None = None):
     animation_fps = 20
     n_ens = 50
     delta_aux_pf = 0.98  # initialise_da_parameters: delta_aux_pf
+
+    # Runs made with the censored likelihood for members whose CME has not reached r_min
+    #  (PFSettings.censor_below_r_min) are in their own folders, tagged cen<margin>h_ (cen3h_ for the
+    #  default 3-hour pickup margin, PFSettings.censor_pickup_margin_hours): the margin of the runs to
+    #  analyse, or None for runs without censoring (or --censor-margin / --no-censor). Not applied to
+    #  a folder given in full in twin_results_dir.
+    censor_pickup_margin_hours = 3.0
+
     # Twin experiments: folder with the run_NNN folders of the run to analyse (a folder, used when
     #  event_list holds one twin experiment, or {twin experiment: folder} for several), e.g.
     #  r"C:\Users\ss905122\PycharmProjects\SIR_HUXt\output\comp_surf\bias_cl3_WSA_v\ens_50_uncorr\model_COMPRESS_SURF3D\truth_495.0_37.4_0.0_0.0_0.0\ob_est_lin_0.00_2.00_prior_525.0_37.4_0.0_0.0_0.0_0.98"
@@ -4496,12 +5117,11 @@ def main(argv: list[str] | None = None):
         "SIR_HUXt",
         "output",
         "comp_surf",
-        "bias_WSA_v",
-        "test",
+        "variable_cme_init_rad",
         f"ens_{n_ens}_uncorr",
         f"model_{use_model.upper()}",
         "truth_495.0_37.4_0.0_0.0_0.0",
-        f"fgs_ons_prior_495.0_37.4_0.0_0.0_0.0_{delta_aux_pf}",
+        f"ob_est_lin_0.00_2.00_prior_600.0_37.4_0.0_0.0_0.0_0.98",
     )
     # Observation-bias term (get_bias_settings: mode, predictor_type, prior_mean, prior_sd);
     #  None for runs with bias mode "off"
@@ -4518,6 +5138,19 @@ def main(argv: list[str] | None = None):
         start_run = args.start_run
     if args.n_runs is not None:
         nRuns = args.n_runs
+    if args.no_censor:
+        censor_pickup_margin_hours = None
+    elif args.censor_margin is not None:
+        censor_pickup_margin_hours = args.censor_margin
+    print(
+        "Analysing runs "
+        + (
+            f"made with the censored likelihood ({censor_pickup_margin_hours:g} h pickup margin, "
+            f"folders {censor_dir_tag(censor_pickup_margin_hours)}...)"
+            if censor_pickup_margin_hours is not None
+            else "made without the censored likelihood"
+        )
+    )
     if args.animate:
         make_surf_animation = True
     if args.no_animate:
@@ -4665,6 +5298,10 @@ def main(argv: list[str] | None = None):
                 twin_prior_dir = (
                     f"{sampling_tag}_{prior_dir}" if sampling_tag else prior_dir
                 )
+                # Runs with the censored likelihood (as data_assimilation_routine.make_output_dir)
+                twin_prior_dir = (
+                    f"{censor_dir_tag(censor_pickup_margin_hours)}{twin_prior_dir}"
+                )
                 twin_prior_dir = (
                     f"{twin_bias_folder}_{twin_prior_dir}"
                     if twin_bias_folder
@@ -4687,11 +5324,14 @@ def main(argv: list[str] | None = None):
                     "output",
                     "comp_surf",
                     "bias_WSA_v",
+                    "test",
                     f"ens_{n_ens}_mo_cone",
                     f"model_{use_model.upper()}",
                     obs_dir_name,
-                    f"{prior_dir}_0.98"
-                    #f"ob_est_lin_0.00_2.00_{prior_dir}_0.98",  # "New folder",
+                    # (runs with the censored likelihood: cen<margin>h_ before the prior folder name,
+                    #  after the observation-bias tag if there is one)
+                    #f"{censor_dir_tag(censor_pickup_margin_hours)}{prior_dir}_0.98"
+                    f"ob_est_lin_0.00_2.00_{censor_dir_tag(censor_pickup_margin_hours)}{prior_dir}_0.98",  # "New folder",
                 )
 
             # The observation-bias folder may be written with its short name (ob_est_const_0.00_2.00, used
@@ -4699,6 +5339,7 @@ def main(argv: list[str] | None = None):
             #  whichever exists is used. Leave it out for runs without a bias term.
             baseFilePath = resolve_output_path(baseFilePath)
             print(f"baseFilePath = {baseFilePath}")
+
             if not os.path.isdir(baseFilePath):
                 raise SkipEvent(f"results folder not found: {baseFilePath}")
             missing_runs = [
@@ -5071,6 +5712,28 @@ def main(argv: list[str] | None = None):
                         fig_title=fig_title,
                         craft=craft,
                     )
+
+            # Summary over the runs of a twin experiment (Barnard et al. 2023, Section 3.1)
+            if is_twin_experiment(event) and make_twin_runs_summary and nRuns > 1:
+                plot_twin_runs_summary(
+                    base_file_path=baseFilePath,
+                    run_nos=list(range(start_run, start_run + nRuns)),
+                    truth={
+                        "t_init": true_cme_t_init,
+                        "speed": true_cme_speed,
+                        "width": true_cme_width,
+                        "lon": true_cme_lon,
+                        "lat": true_cme_lat,
+                    },
+                    cme_init_rad_truth=true_cme_init_rad,
+                    real_arrival_time=(
+                        real_arrival_time
+                        if isinstance(real_arrival_time, datetime.datetime)
+                        else None
+                    ),
+                    real_arrival_speed=real_arrival_speed,
+                    fig_title=f"Twin experiment {event}",
+                )
 
             # Rank histograms of the observations within the forecast ensemble, at each observation time
             #  (over all runs) and pooled
